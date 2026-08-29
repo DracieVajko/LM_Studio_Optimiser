@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ["3.11", "3.12"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Lint with ruff
+        run: ruff check lm_optimizer
+      - name: Format check with ruff
+        run: ruff format --check lm_optimizer
+      - name: Type check with mypy
+        run: mypy lm_optimizer --ignore-missing-imports || true
+      - name: Compile check
+        run: python -m compileall lm_optimizer
+      - name: Run tests (no GPU required)
+        run: pytest -v
+        env:
+          PYTHONPATH: .
+
+  gpu-optional:
+    runs-on: ubuntu-latest
+    if: false  # manual only, requires GPU
+    steps:
+      - uses: actions/checkout@v4
+      - name: GPU integration tests (optional)
+        run: echo "GPU tests would run here with --gpu flag"

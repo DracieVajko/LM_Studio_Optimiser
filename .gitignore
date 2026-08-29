@@ -1,0 +1,57 @@
+# Environment
+.env
+
+# Data directories (user-specific, do not commit)
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# Legacy data dirs (kept for backward compat but ignored)
+config/optimizer.db
+logs/
+results/
+profiles/
+checkpoints/
+reports/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+pip-wheel-metadata/
+man
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.venv/
+venv/
+ENV/
+env/
+
+# Node
+node_modules/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
