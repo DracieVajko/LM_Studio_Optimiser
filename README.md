@@ -395,3 +395,7 @@ MIT — see `LICENSE`.
 ## Acknowledgments
 
 Built for LM Studio users who want to automate tuning without manual trial-and-error. See `CONTRIBUTING.md` for development guidelines and `SECURITY.md` for threat model.
+
+---
+
+*Is it vibe coded? Yes, yes it is. — built with a lot of iteration, care, and a little help from AI.*
