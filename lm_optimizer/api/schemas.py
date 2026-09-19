@@ -80,6 +80,8 @@ class GenerationParametersSchema(BaseModel):
     mirostat_eta: float | None = Field(default=None, ge=0.0, le=1.0)
     seed: int | None = None
     stop_sequences: list[str] | None = None
+    reasoning: str | None = None
+    max_output_tokens: int | None = None
 
 
 class LoadConfigSchema(BaseModel):
@@ -91,7 +93,6 @@ class LoadConfigSchema(BaseModel):
     num_experts: int | None = None
     rope_freq_base: float | None = None
     rope_freq_scale: float | None = None
-    generation: GenerationParametersSchema | None = None
 
 
 class AdvancedSettingsSchema(BaseModel):

@@ -30,7 +30,7 @@ class ModelStatus(str, Enum):
 
 
 class GenerationParameters(BaseModel):
-    """Generation/inference parameters."""
+    """Generation/inference parameters (per-request, not part of load config)."""
 
     temperature: float | None = Field(default=None, ge=0.0, le=2.0, description="Sampling temperature")
     top_p: float | None = Field(default=None, ge=0.0, le=1.0, description="Nucleus sampling top-p")
@@ -45,16 +45,42 @@ class GenerationParameters(BaseModel):
     mirostat_eta: float | None = Field(default=None, ge=0.0, le=1.0, description="Mirostat eta")
     seed: int | None = Field(default=None, description="Random seed")
     stop_sequences: list[str] | None = Field(default=None, description="Stop sequences")
+    # LM Studio native API specific
+    reasoning: str | None = Field(default=None, description="Reasoning level: off, low, medium, high, on")
+    max_output_tokens: int | None = Field(default=None, ge=1, description="Max output tokens")
 
     def to_dict(self) -> dict[str, Any]:
         return {k: v for k, v in self.model_dump().items() if v is not None and v != []}
 
     def to_api_params(self) -> dict[str, Any]:
-        return self.to_dict()
+        """Convert to native LM Studio API parameters (/api/v1/chat)."""
+        params = self.to_dict()
+        # Native API uses repeat_penalty, max_output_tokens
+        if "repetition_penalty" in params:
+            params["repeat_penalty"] = params.pop("repetition_penalty")
+        if "max_output_tokens" in params and "max_tokens" in params:
+            # Prefer max_output_tokens for native API
+            params.pop("max_tokens", None)
+        return params
+
+    def to_openai_params(self) -> dict[str, Any]:
+        """Convert to OpenAI-compatible API parameters (/v1/chat/completions)."""
+        params = self.to_dict()
+        # OpenAI uses repetition_penalty, max_tokens
+        if "repeat_penalty" in params:
+            params["repetition_penalty"] = params.pop("repeat_penalty")
+        if "max_output_tokens" in params:
+            params["max_tokens"] = params.pop("max_output_tokens")
+        # Remove native-only params
+        params.pop("reasoning", None)
+        params.pop("mirostat_mode", None)
+        params.pop("mirostat_tau", None)
+        params.pop("mirostat_eta", None)
+        return params
 
 
 class LoadConfig(BaseModel):
-    """Model load configuration parameters."""
+    """Model load configuration parameters (only for /api/v1/models/load)."""
 
     context_length: int | None = Field(default=None, description="Context window size")
     gpu_ratio: float | None = Field(
@@ -70,17 +96,10 @@ class LoadConfig(BaseModel):
     )
     rope_freq_base: float | None = Field(default=None, description="RoPE frequency base")
     rope_freq_scale: float | None = Field(default=None, description="RoPE frequency scale")
-    # Generation parameters
-    generation: GenerationParameters | None = Field(default=None, description="Generation parameters")
 
     def to_api_params(self) -> dict[str, Any]:
         """Convert to API parameters, excluding None values."""
-        params = {k: v for k, v in self.model_dump(exclude={"generation"}).items() if v is not None}
-        if self.generation:
-            gen_params = self.generation.to_api_params()
-            if gen_params:
-                params["generation"] = gen_params
-        return params
+        return {k: v for k, v in self.model_dump().items() if v is not None}
 
 
 class ModelInfo(BaseModel):
@@ -143,7 +162,10 @@ class ChatCompletionRequest(BaseModel):
 
     model: str
     messages: list[ChatMessage]
-    temperature: float = Field(default=0.7, ge=0.0, le=2.0)
+    # Use GenerationParameters for all generation params
+    generation: GenerationParameters | None = Field(default=None, description="Generation parameters")
+    # Backward compat: allow individual fields (merged with generation)
+    temperature: float | None = Field(default=None, ge=0.0, le=2.0)
     top_p: float | None = Field(default=None, ge=0.0, le=1.0)
     top_k: int | None = Field(default=None, ge=1)
     repetition_penalty: float | None = Field(default=None, ge=0.0, le=2.0)
@@ -154,14 +176,36 @@ class ChatCompletionRequest(BaseModel):
     mirostat_mode: int | None = Field(default=None, ge=0, le=2)
     mirostat_tau: float | None = Field(default=None, ge=0.0, le=10.0)
     mirostat_eta: float | None = Field(default=None, ge=0.0, le=1.0)
-    max_tokens: int = Field(default=512, ge=1)
+    max_tokens: int | None = Field(default=None, ge=1)
     stream: bool = False
     seed: int | None = None
     stop: list[str] | None = None
 
     def to_api_params(self) -> dict[str, Any]:
         """Convert to API parameters, excluding None values."""
-        return {k: v for k, v in self.model_dump().items() if v is not None and v != []}
+        # Merge generation params with individual fields (individual fields take precedence)
+        params = {}
+        if self.generation:
+            params.update(self.generation.to_dict())
+        # Add individual fields (overrides generation)
+        individual = {k: v for k, v in self.model_dump(exclude={"generation"}).items() if v is not None and v != []}
+        params.update(individual)
+        return params
+
+    def to_openai_params(self) -> dict[str, Any]:
+        """Convert to OpenAI-compatible API parameters."""
+        params = self.to_api_params()
+        # OpenAI uses repetition_penalty, max_tokens
+        if "repeat_penalty" in params:
+            params["repetition_penalty"] = params.pop("repeat_penalty")
+        if "max_output_tokens" in params:
+            params["max_tokens"] = params.pop("max_output_tokens")
+        # Remove native-only params
+        params.pop("reasoning", None)
+        params.pop("mirostat_mode", None)
+        params.pop("mirostat_tau", None)
+        params.pop("mirostat_eta", None)
+        return params
 
 
 class ChatCompletionChoice(BaseModel):
@@ -342,11 +386,19 @@ class LMStudioClient:
         try:
             response = await self._request_with_retry("GET", "/api/v1/models")
             data = response.json()
-            if isinstance(data, dict) and "data" in data:
-                self._api_base_path = "/api/v1"
-                self._is_openai_compatible = False
-                return
+            if isinstance(data, dict):
+                if "data" in data:
+                    # OpenAI format at /api/v1 (unlikely but possible)
+                    self._api_base_path = "/api/v1"
+                    self._is_openai_compatible = False
+                    return
+                elif "models" in data:
+                    # Native LM Studio format: { "models": [...] }
+                    self._api_base_path = "/api/v1"
+                    self._is_openai_compatible = False
+                    return
             elif isinstance(data, list):
+                # Direct array format
                 self._api_base_path = "/api/v1"
                 self._is_openai_compatible = False
                 return
@@ -466,26 +518,58 @@ class LMStudioClient:
         data = response.json()
 
         models = []
-        if isinstance(data, dict) and "data" in data:
-            items = data["data"]
+        items = []
+
+        # Parse different response formats
+        if isinstance(data, dict):
+            if "data" in data:
+                # OpenAI-compatible format: { "data": [...] }
+                items = data["data"]
+            elif "models" in data:
+                # Native LM Studio format: { "models": [...] }
+                items = data["models"]
+            else:
+                items = []
         elif isinstance(data, list):
+            # Direct array format
             items = data
         else:
             items = []
 
         for item in items:
+            # Handle different field names between formats
+            model_id = item.get("id") or item.get("key") or ""
+            model_name = item.get("name") or item.get("display_name") or model_id
+            
+            # Extract quantization name if it's an object
+            quant = item.get("quantization")
+            if isinstance(quant, dict):
+                quantization = quant.get("name")
+            else:
+                quantization = quant
+
+            # Extract parameter count from params_string if available
+            param_count = item.get("parameter_count")
+            if not param_count:
+                params_str = item.get("params_string")
+                if params_str and params_str.endswith("B"):
+                    try:
+                        param_count = int(float(params_str.rstrip("B")) * 1_000_000_000)
+                    except ValueError:
+                        pass
+
             model = ModelInfo(
-                id=item.get("id", ""),
-                name=item.get("name", item.get("id", "")),
+                id=model_id,
+                name=model_name,
                 description=item.get("description"),
                 architecture=item.get("architecture"),
-                context_length=item.get("context_length"),
+                context_length=item.get("context_length") or item.get("max_context_length"),
                 max_context_length=item.get("max_context_length"),
                 model_type=item.get("type") or item.get("model_type"),
-                quantization=item.get("quantization"),
+                quantization=quantization,
                 size_bytes=item.get("size_bytes"),
-                parameter_count=item.get("parameter_count"),
-                loaded=item.get("loaded", False),
+                parameter_count=param_count,
+                loaded=len(item.get("loaded_instances", [])) > 0,
             )
             models.append(model)
 
@@ -499,6 +583,10 @@ class LMStudioClient:
             if model.id == model_id:
                 return model
         return None
+
+    def get_loaded_model(self, model_id: str) -> str | None:
+        """Get loaded model identifier."""
+        return self._loaded_models.get(model_id)
 
     async def load_model(
         self, model_id: str, load_config: LoadConfig | None = None
@@ -590,11 +678,19 @@ class LMStudioClient:
         mirostat_mode: int | None = None,
         mirostat_tau: float | None = None,
         mirostat_eta: float | None = None,
+        # LM Studio native API specific
+        reasoning: str | None = None,
+        max_output_tokens: int | None = None,
+        # GenerationParameters object (alternative to individual params)
+        generation: GenerationParameters | None = None,
     ) -> ChatCompletionResponse:
-        """Generate chat completion with full generation parameters."""
-        request = ChatCompletionRequest(
-            model=model,
-            messages=messages,
+        """Generate chat completion with full generation parameters.
+
+        Uses native LM Studio API (/api/v1/chat) when available,
+        otherwise falls back to OpenAI-compatible API (/v1/chat/completions).
+        """
+        # Build generation params object
+        gen_params = generation or GenerationParameters(
             temperature=temperature,
             top_p=top_p,
             top_k=top_k,
@@ -606,15 +702,30 @@ class LMStudioClient:
             mirostat_mode=mirostat_mode,
             mirostat_tau=mirostat_tau,
             mirostat_eta=mirostat_eta,
-            max_tokens=max_tokens,
-            stream=stream,
             seed=seed,
-            stop=stop,
+            stop_sequences=stop,
+            reasoning=reasoning,
+            max_output_tokens=max_output_tokens,
         )
 
-        response = await self._request_with_retry(
-            "POST", self._api_path("/chat/completions"), json_data=request.to_api_params()
+        request = ChatCompletionRequest(
+            model=model,
+            messages=messages,
+            generation=gen_params,
+            stream=stream,
         )
+
+        # Use correct endpoint and parameter format based on API type
+        if self._is_openai_compatible:
+            # OpenAI-compatible API
+            response = await self._request_with_retry(
+                "POST", self._api_path("/chat/completions"), json_data=request.to_openai_params()
+            )
+        else:
+            # Native LM Studio API
+            response = await self._request_with_retry(
+                "POST", self._api_path("/chat"), json_data=request.to_api_params()
+            )
         return ChatCompletionResponse(**response.json())
 
     async def get_embeddings(self, model: str, input_text: str | list[str]) -> EmbeddingResponse:

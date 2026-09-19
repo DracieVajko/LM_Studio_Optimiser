@@ -120,7 +120,7 @@ class BenchmarkCase:
 
 @dataclass
 class GenerationParameters:
-    """Generation/inference parameters."""
+    """Generation/inference parameters (per-request, not part of load config)."""
 
     temperature: float | None = None
     top_p: float | None = None
@@ -135,6 +135,9 @@ class GenerationParameters:
     mirostat_eta: float | None = None
     seed: int | None = None
     stop_sequences: list[str] = field(default_factory=list)
+    # LM Studio native API specific
+    reasoning: str | None = None  # "off" | "low" | "medium" | "high" | "on"
+    max_output_tokens: int | None = None
 
     def to_dict(self) -> dict:
         return {k: v for k, v in self.__dict__.items() if v is not None and v != []}
@@ -142,10 +145,25 @@ class GenerationParameters:
     def to_api_params(self) -> dict:
         return self.to_dict()
 
+    def to_openai_params(self) -> dict:
+        """Convert to OpenAI-compatible API parameters."""
+        params = self.to_dict()
+        # Map LM Studio native params to OpenAI params
+        if "repeat_penalty" in params and "repetition_penalty" not in params:
+            params["repetition_penalty"] = params.pop("repeat_penalty")
+        if "max_output_tokens" in params and "max_tokens" not in params:
+            params["max_tokens"] = params.pop("max_output_tokens")
+        # Remove LM Studio-specific params not in OpenAI API
+        params.pop("reasoning", None)
+        params.pop("mirostat_mode", None)
+        params.pop("mirostat_tau", None)
+        params.pop("mirostat_eta", None)
+        return params
+
 
 @dataclass
 class LoadConfiguration:
-    """Model load configuration parameters."""
+    """Model load configuration parameters (only for /api/v1/models/load)."""
 
     context_length: int | None = None
     gpu_ratio: float | None = None
@@ -155,8 +173,6 @@ class LoadConfiguration:
     num_experts: int | None = None
     rope_freq_base: float | None = None
     rope_freq_scale: float | None = None
-    # Generation parameters
-    generation: GenerationParameters = field(default_factory=GenerationParameters)
 
     def to_dict(self) -> dict:
         """Convert to dict, excluding None values."""

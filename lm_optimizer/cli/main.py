@@ -18,6 +18,7 @@ from lm_optimizer.database.repositories import (
 )
 from lm_optimizer.domain.models import (
     ConfigurationStatus,
+    GenerationParameters,
     LoadConfiguration,
     OptimizationProfile,
 )
@@ -134,12 +135,16 @@ def status(
 
 
 @app.command()
-def models():
+def models(
+    url: str | None = typer.Option(
+        None, "--url", help="LM Studio API URL (overrides .env, not persisted)"
+    ),
+):
     """List all available models."""
     setup_logging()
 
     async def _models():
-        client = get_client()
+        client = get_client(base_url=url)
         try:
             await client.connect()
             models = await client.list_models()
@@ -181,12 +186,17 @@ def models():
 
 
 @app.command()
-def inspect(model: str = typer.Argument(..., help="Model ID to inspect")):
+def inspect(
+    model: str = typer.Argument(..., help="Model ID to inspect"),
+    url: str | None = typer.Option(
+        None, "--url", help="LM Studio API URL (overrides .env, not persisted)"
+    ),
+):
     """Inspect a model's capabilities in detail."""
     setup_logging()
 
     async def _inspect():
-        client = get_client()
+        client = get_client(base_url=url)
         try:
             await client.connect()
 
@@ -241,12 +251,15 @@ def recommend(
     task: str = typer.Option(
         "chat", "--task", "-t", help="Task type: chat, coding, reasoning, creative, factual, json"
     ),
+    url: str | None = typer.Option(
+        None, "--url", help="LM Studio API URL (overrides .env, not persisted)"
+    ),
 ):
     """Get recommended generation parameters for a model from Hugging Face or heuristics."""
     setup_logging()
 
     async def _recommend():
-        client = get_client()
+        client = get_client(base_url=url)
         try:
             await client.connect()
 
@@ -343,12 +356,15 @@ def benchmark(
     top_k: int = typer.Option(40, "--top-k", help="Top-k sampling (1+)"),
     repetition_penalty: float = typer.Option(1.1, "--rep-penalty", help="Repetition penalty (0-2)"),
     min_p: float = typer.Option(0.05, "--min-p", help="Min-p sampling (0-1)"),
+    url: str | None = typer.Option(
+        None, "--url", help="LM Studio API URL (overrides .env, not persisted)"
+    ),
 ):
     """Run benchmark with specific configuration."""
     setup_logging()
 
     async def _benchmark():
-        client = get_client()
+        client = get_client(base_url=url)
         try:
             await client.connect()
 
@@ -365,7 +381,6 @@ def benchmark(
                 flash_attention=flash,
                 offload_kv_cache_to_gpu=kv_gpu,
                 eval_batch_size=batch,
-                generation=gen_params,
             )
 
             benchmark_service = BenchmarkService(
@@ -384,7 +399,7 @@ def benchmark(
             )
 
             with console.status("Running benchmark..."):
-                result = await benchmark_service.run_benchmark(model, load_config, context)
+                result = await benchmark_service.run_benchmark(model, load_config, context, gen_params)
 
             _display_benchmark_result(result)
 

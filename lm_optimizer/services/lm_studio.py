@@ -1,36 +1,45 @@
-"""LM Studio service with capability discovery."""
+"""LM Studio service with capability discovery.
 
-import uuid
+This is a wrapper around the authoritative API client in lm_optimizer.api.client
+to maintain compatibility with existing service interfaces.
+"""
 
-import httpx
-from tenacity import (
-    AsyncRetrying,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential,
+from dataclasses import dataclass
+
+from lm_optimizer.api.client import (
+    LMStudioClient as _LMStudioClient,
+    LoadModelResponse as _LoadModelResponse,
+    ChatCompletionResponse as _ChatCompletionResponse,
+    LoadConfig,
+    GenerationParameters as APIGenParams,
+    ChatMessage,
 )
-
 from lm_optimizer.config import config
 from lm_optimizer.domain.models import (
     LMStudioCapabilities,
     LoadConfiguration,
     ModelIdentity,
+    GenerationParameters,
 )
 from lm_optimizer.logging_config import get_logger
 
 logger = get_logger(__name__)
 
 
+@dataclass
+class LoadModelResult:
+    """Result of loading a model (wrapper for compatibility)."""
+    success: bool
+    identifier: str | None = None
+    error: str | None = None
+    loaded_config: LoadConfiguration | None = None
+
+
 class LMStudioClient:
-    """LM Studio API client with capability discovery."""
+    """LM Studio API client with capability discovery (compatibility wrapper)."""
 
     def __init__(self, base_url: str | None = None, timeout: float | None = None):
-        self.base_url = (base_url or config.lm_studio.base_url).rstrip("/")
-        self.timeout = timeout or config.lm_studio.timeout
-        self._client: httpx.AsyncClient | None = None
-        self._capabilities: LMStudioCapabilities | None = None
-        self._models_cache: list[ModelIdentity] = []
-        self._loaded_models: dict[str, str] = {}
+        self._inner = _LMStudioClient(base_url=base_url, timeout=timeout)
 
     async def __aenter__(self) -> "LMStudioClient":
         await self.connect()
@@ -41,242 +50,121 @@ class LMStudioClient:
 
     async def connect(self) -> None:
         """Establish connection and detect capabilities."""
-        if self._client is not None:
-            return
-
-        self._client = httpx.AsyncClient(
-            base_url=self.base_url,
-            timeout=httpx.Timeout(self.timeout),
-            limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
-        )
-
-        await self._detect_capabilities()
-        await self.list_models(force_refresh=True)
-        logger.info(
-            "Connected to LM Studio", base_url=self.base_url, version=self._capabilities.version
-        )
+        await self._inner.connect()
 
     async def close(self) -> None:
         """Close the client connection."""
-        if self._client:
-            await self._client.aclose()
-            self._client = None
+        await self._inner.close()
 
     @property
-    def client(self) -> httpx.AsyncClient:
-        """Get the HTTP client."""
-        if self._client is None:
-            raise RuntimeError("Client not connected. Call connect() first.")
-        return self._client
+    def client(self):
+        """Get the inner HTTP client."""
+        return self._inner.client
 
     @property
     def capabilities(self) -> LMStudioCapabilities:
         """Get detected API capabilities."""
-        if self._capabilities is None:
-            raise RuntimeError("Capabilities not detected. Call connect() first.")
-        return self._capabilities
-
-    async def _detect_capabilities(self) -> None:
-        """Detect LM Studio API version and capabilities."""
-        try:
-            response = await self._request_with_retry("GET", "/api/v1/models")
-            models_data = response.json()
-
-            self._capabilities = LMStudioCapabilities()
-
-            # Detect version from response structure
-            if isinstance(models_data, dict) and "data" in models_data:
-                self._capabilities.version = "v1"
-            elif isinstance(models_data, list):
-                self._capabilities.version = "v0"
-
-            # Probe supported parameters
-            await self._probe_load_parameters()
-
-        except Exception as e:
-            logger.warning("Failed to detect capabilities, using defaults", error=str(e))
-            self._capabilities = LMStudioCapabilities(version="v1")
-
-    async def _probe_load_parameters(self) -> None:
-        """Probe which load parameters are supported."""
-        if not self._capabilities:
-            return
-
-        try:
-            models = await self.list_models()
-            if models:
-                test_model = models[0].id
-                test_config = LoadConfiguration(context_length=512)
-                result = await self.load_model(test_model, test_config)
-                if result.success and result.loaded_config:
-                    accepted = set(result.loaded_config.to_dict().keys())
-                    self._capabilities.load_parameters = list(accepted)
-                    # Update capability flags based on accepted params
-                    self._capabilities.supports_context_length = "context_length" in accepted
-                    self._capabilities.supports_gpu_ratio = "gpu_ratio" in accepted
-                    self._capabilities.supports_flash_attention = "flash_attention" in accepted
-                    self._capabilities.supports_kv_cache_placement = (
-                        "offload_kv_cache_to_gpu" in accepted
-                    )
-                    self._capabilities.supports_eval_batch_size = "eval_batch_size" in accepted
-                    self._capabilities.supports_num_experts = "num_experts" in accepted
-                    self._capabilities.supports_rope_scaling = "rope_freq_base" in accepted
-        except Exception:
-            pass
-
-    async def _request_with_retry(
-        self,
-        method: str,
-        path: str,
-        *,
-        json_data: dict | None = None,
-        params: dict | None = None,
-    ) -> httpx.Response:
-        """Make HTTP request with retry logic."""
-        retry_config = AsyncRetrying(
-            stop=stop_after_attempt(config.lm_studio.max_retries),
-            wait=wait_exponential(multiplier=config.lm_studio.retry_delay, min=1, max=10),
-            retry=retry_if_exception_type(
-                (httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError)
-            ),
-            reraise=True,
+        caps = self._inner.capabilities
+        # Convert APICapabilities to LMStudioCapabilities
+        return LMStudioCapabilities(
+            version=caps.version,
+            supports_context_length=caps.supports_context_length,
+            supports_gpu_ratio=caps.supports_gpu_ratio,
+            supports_flash_attention=caps.supports_flash_attention,
+            supports_kv_cache_placement=caps.supports_kv_cache_offload,
+            supports_eval_batch_size=caps.supports_eval_batch_size,
+            supports_num_experts=caps.supports_num_experts,
+            supports_rope_scaling=caps.supports_rope_scaling,
+            load_parameters=caps.load_parameters,
         )
-
-        async for attempt in retry_config:
-            with attempt:
-                response = await self.client.request(method, path, json=json_data, params=params)
-                response.raise_for_status()
-                return response
-
-        raise RuntimeError("Retry logic failed unexpectedly")
 
     async def list_models(self, force_refresh: bool = False) -> list[ModelIdentity]:
         """List all available models."""
-        if self._models_cache and not force_refresh:
-            return self._models_cache
-
-        response = await self._request_with_retry("GET", "/api/v1/models")
-        data = response.json()
-
-        models = []
-        if isinstance(data, dict) and "data" in data:
-            items = data["data"]
-        elif isinstance(data, list):
-            items = data
-        else:
-            items = []
-
-        for item in items:
-            model = ModelIdentity(
-                id=item.get("id", ""),
-                name=item.get("name", item.get("id", "")),
-                architecture=item.get("architecture"),
-                parameter_count=item.get("parameter_count"),
-                quantization=item.get("quantization"),
-                context_limit=item.get("max_context_length") or item.get("context_length"),
-                is_moe=self._detect_moe(item),
-                num_experts=item.get("num_experts"),
-                size_bytes=item.get("size_bytes"),
+        models = await self._inner.list_models(force_refresh=force_refresh)
+        return [
+            ModelIdentity(
+                id=m.id,
+                name=m.name,
+                architecture=m.architecture,
+                parameter_count=m.parameter_count,
+                quantization=m.quantization,
+                context_limit=m.context_length or m.max_context_length,
+                is_moe=False,  # Not provided by API
+                num_experts=None,
+                size_bytes=m.size_bytes,
             )
-            models.append(model)
-
-        self._models_cache = models
-        return models
-
-    def _detect_moe(self, item: dict) -> bool:
-        """Detect if model is Mixture of Experts."""
-        arch = (item.get("architecture") or "").lower()
-        model_type = (item.get("type") or "").lower()
-        name = (item.get("name") or "").lower()
-
-        moe_indicators = ["moe", "mixtral", "grok", "deepseek-moe", "qwen-moe", "phi-moe"]
-        return any(
-            indicator in arch or indicator in model_type or indicator in name
-            for indicator in moe_indicators
-        )
+            for m in models
+        ]
 
     async def get_model(self, model_id: str) -> ModelIdentity | None:
         """Get specific model information."""
-        models = await self.list_models()
-        for model in models:
-            if model.id == model_id:
-                return model
-        return None
+        model = await self._inner.get_model(model_id)
+        if not model:
+            return None
+        return ModelIdentity(
+            id=model.id,
+            name=model.name,
+            architecture=model.architecture,
+            parameter_count=model.parameter_count,
+            quantization=model.quantization,
+            context_limit=model.context_length or model.max_context_length,
+            is_moe=False,
+            num_experts=None,
+            size_bytes=model.size_bytes,
+        )
 
     async def load_model(
         self,
         model_id: str,
         load_config: LoadConfiguration,
-    ) -> "LoadModelResult":
+    ) -> LoadModelResult:
         """Load a model with specified configuration."""
-        identifier = str(uuid.uuid4())[:8]
-
-        # Filter config to only supported parameters
-        supported = set(self._capabilities.get_supported_load_params())
-        filtered_config = LoadConfiguration(
-            **{k: v for k, v in load_config.to_dict().items() if k in supported and v is not None}
+        # Convert LoadConfiguration to LoadConfig
+        api_load_config = LoadConfig(
+            context_length=load_config.context_length,
+            gpu_ratio=load_config.gpu_ratio,
+            flash_attention=load_config.flash_attention,
+            offload_kv_cache_to_gpu=load_config.offload_kv_cache_to_gpu,
+            eval_batch_size=load_config.eval_batch_size,
+            num_experts=load_config.num_experts,
+            rope_freq_base=load_config.rope_freq_base,
+            rope_freq_scale=load_config.rope_freq_scale,
         )
 
-        request = {
-            "model": model_id,
-            "config": filtered_config.to_api_params(),
-            "identifier": identifier,
-        }
-
-        response = await self._request_with_retry("POST", "/api/v1/models/load", json_data=request)
-        result_data = response.json()
-
-        from dataclasses import dataclass
-
-        @dataclass
-        class LoadModelResult:
-            success: bool
-            identifier: str | None = None
-            error: str | None = None
-            loaded_config: LoadConfiguration | None = None
-
-        result = LoadModelResult(
-            success=result_data.get("success", False),
-            identifier=result_data.get("identifier"),
-            error=result_data.get("error"),
+        result = await self._inner.load_model(model_id, api_load_config)
+        
+        loaded_config = None
+        if result.loaded_config:
+            loaded_config = LoadConfiguration(
+                context_length=result.loaded_config.context_length,
+                gpu_ratio=result.loaded_config.gpu_ratio,
+                flash_attention=result.loaded_config.flash_attention,
+                offload_kv_cache_to_gpu=result.loaded_config.offload_kv_cache_to_gpu,
+                eval_batch_size=result.loaded_config.eval_batch_size,
+                num_experts=result.loaded_config.num_experts,
+                rope_freq_base=result.loaded_config.rope_freq_base,
+                rope_freq_scale=result.loaded_config.rope_freq_scale,
+            )
+        return LoadModelResult(
+            success=result.success,
+            identifier=result.identifier,
+            error=result.error,
+            loaded_config=loaded_config,
         )
-
-        if result.success and result.identifier:
-            self._loaded_models[model_id] = result.identifier
-            # Parse loaded config if returned
-            if "config" in result_data:
-                result.loaded_config = LoadConfiguration(**result_data["config"])
-
-        return result
 
     async def unload_model(
         self, model_id: str | None = None, identifier: str | None = None
     ) -> bool:
         """Unload a model."""
-        if identifier is None and model_id is not None:
-            identifier = self._loaded_models.get(model_id)
-
-        if identifier is None:
-            return False
-
-        request = {"identifier": identifier}
-        try:
-            response = await self._request_with_retry(
-                "POST", "/api/v1/models/unload", json_data=request
-            )
-            result = response.json()
-            if result.get("success") and model_id and model_id in self._loaded_models:
-                del self._loaded_models[model_id]
-            return result.get("success", False)
-        except Exception:
-            return False
+        return await self._inner.unload_model(model_id=model_id, identifier=identifier)
 
     async def unload_all(self) -> dict[str, bool]:
         """Unload all currently loaded models."""
-        results = {}
-        for model_id, identifier in list(self._loaded_models.items()):
-            results[model_id] = await self.unload_model(identifier=identifier)
-        return results
+        return await self._inner.unload_all()
+
+    def get_loaded_model(self, model_id: str) -> str | None:
+        """Get loaded model identifier."""
+        return self._inner.get_loaded_model(model_id)
 
     async def chat_completion(
         self,
@@ -287,34 +175,72 @@ class LMStudioClient:
         stream: bool = False,
         seed: int | None = None,
         stop: list[str] | None = None,
+        top_p: float | None = None,
+        top_k: int | None = None,
+        repetition_penalty: float | None = None,
+        min_p: float | None = None,
+        presence_penalty: float | None = None,
+        frequency_penalty: float | None = None,
+        typical_p: float | None = None,
+        mirostat_mode: int | None = None,
+        mirostat_tau: float | None = None,
+        mirostat_eta: float | None = None,
+        reasoning: str | None = None,
+        max_output_tokens: int | None = None,
+        generation: GenerationParameters | None = None,
     ) -> dict:
         """Generate chat completion."""
-        request = {
-            "model": model,
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-            "stream": stream,
-            "seed": seed,
-            "stop": stop,
-        }
-
-        response = await self._request_with_retry(
-            "POST", "/api/v1/chat/completions", json_data=request
+        gen_params = generation or GenerationParameters(
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            repetition_penalty=repetition_penalty,
+            min_p=min_p,
+            presence_penalty=presence_penalty,
+            frequency_penalty=frequency_penalty,
+            typical_p=typical_p,
+            mirostat_mode=mirostat_mode,
+            mirostat_tau=mirostat_tau,
+            mirostat_eta=mirostat_eta,
+            seed=seed,
+            stop_sequences=stop,
+            reasoning=reasoning,
+            max_output_tokens=max_output_tokens,
         )
-        return response.json()
+        
+        # Convert messages format
+        from lm_optimizer.api.client import ChatMessage
+        chat_messages = [ChatMessage(role=m["role"], content=m["content"]) for m in messages]
+        
+        response = await self._inner.chat_completion(
+            model=model,
+            messages=chat_messages,
+            generation=gen_params,
+            stream=stream,
+        )
+        
+        # Convert to dict format expected by callers
+        return {
+            "choices": [
+                {
+                    "message": {"content": c.message.content},
+                    "finish_reason": c.finish_reason,
+                    "index": c.index,
+                }
+                for c in response.choices
+            ],
+            "usage": {
+                "prompt_tokens": response.usage.prompt_tokens,
+                "completion_tokens": response.usage.completion_tokens,
+                "total_tokens": response.usage.total_tokens,
+            },
+            "id": response.id,
+            "model": response.model,
+        }
 
     async def health_check(self) -> bool:
         """Check if LM Studio is responsive."""
-        try:
-            await self._request_with_retry("GET", "/api/v1/models")
-            return True
-        except Exception:
-            return False
-
-    def get_loaded_model(self, model_id: str) -> str | None:
-        """Get loaded model identifier."""
-        return self._loaded_models.get(model_id)
+        return await self._inner.health_check()
 
 
 async def create_client(base_url: str | None = None) -> LMStudioClient:

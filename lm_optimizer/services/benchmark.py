@@ -60,17 +60,12 @@ class BenchmarkService:
             )
         return cases
 
-    def get_generation_params(self, load_config: LoadConfiguration) -> dict:
-        """Extract generation parameters from load configuration."""
-        if not load_config.generation:
-            return {}
-        return load_config.generation.to_api_params()
-
     async def run_benchmark(
         self,
         model_id: str,
         load_config: LoadConfiguration,
         context_length: int,
+        generation_params: GenerationParameters | None = None,
     ) -> ConfigurationResult:
         """Run full benchmark suite for a configuration."""
         from uuid import uuid4
@@ -84,9 +79,6 @@ class BenchmarkService:
         )
 
         logger.info("Starting benchmark", config_id=str(config_id), model=model_id)
-
-        # Extract generation parameters from load config
-        gen_params = self.get_generation_params(load_config)
 
         # Load model
         load_start = time.perf_counter()
@@ -110,13 +102,13 @@ class BenchmarkService:
             for i in range(self.config.warmup_repetitions):
                 logger.debug("Warmup run", run=i + 1)
                 for case in cases:
-                    await self._run_single_case(model_id, case, gen_params)
+                    await self._run_single_case(model_id, case, generation_params)
 
             # Measured runs
             for run_idx in range(self.config.repetitions):
                 logger.debug("Measured run", run=run_idx + 1)
                 for case in cases:
-                    metrics = await self._run_single_case(model_id, case, gen_params)
+                    metrics = await self._run_single_case(model_id, case, generation_params)
                     all_metrics.append(metrics)
 
             # Aggregate metrics
@@ -142,7 +134,7 @@ class BenchmarkService:
         return result
 
     async def _run_single_case(
-        self, model_id: str, case: BenchmarkCase, gen_params: dict | None = None
+        self, model_id: str, case: BenchmarkCase, gen_params: GenerationParameters | None = None
     ) -> BenchmarkMetrics:
         """Run a single benchmark case."""
         start_time = time.perf_counter()
@@ -150,19 +142,38 @@ class BenchmarkService:
         try:
             messages = [{"role": "user", "content": case.prompt}]
 
-            # Merge generation parameters: case-specific overrides gen_params
-            call_params = dict(gen_params) if gen_params else {}
-            # Case-specific temperature takes precedence
-            if "temperature" not in call_params:
-                call_params["temperature"] = case.temperature
+            # Build generation params for this case
+            # Start with provided gen_params, override with case-specific values
+            if gen_params:
+                call_gen_params = GenerationParameters(
+                    temperature=case.temperature,  # Case-specific temp takes precedence
+                    top_p=gen_params.top_p,
+                    top_k=gen_params.top_k,
+                    repetition_penalty=gen_params.repetition_penalty,
+                    min_p=gen_params.min_p,
+                    presence_penalty=gen_params.presence_penalty,
+                    frequency_penalty=gen_params.frequency_penalty,
+                    typical_p=gen_params.typical_p,
+                    mirostat_mode=gen_params.mirostat_mode,
+                    mirostat_tau=gen_params.mirostat_tau,
+                    mirostat_eta=gen_params.mirostat_eta,
+                    seed=gen_params.seed,
+                    stop_sequences=case.stop_sequences or gen_params.stop_sequences,
+                    reasoning=gen_params.reasoning,
+                    max_output_tokens=gen_params.max_output_tokens,
+                )
+            else:
+                call_gen_params = GenerationParameters(
+                    temperature=case.temperature,
+                    stop_sequences=case.stop_sequences,
+                )
 
             response = await self.client.chat_completion(
                 model=model_id,
                 messages=messages,
                 max_tokens=case.max_tokens,
                 seed=42,
-                stop=case.stop_sequences,
-                **call_params,
+                generation=call_gen_params,
             )
 
             total_time_ms = (time.perf_counter() - start_time) * 1000
