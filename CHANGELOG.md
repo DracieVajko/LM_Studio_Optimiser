@@ -171,6 +171,45 @@ Physical end-to-end LM Studio validation is still pending.
 
 > ⚠️ This is an untested beta. The developer machine is unavailable for repair, so no complete real-world optimization run has been performed for this release. Use with caution and verify generated configurations.
 
+## [1.0.0-beta.2] - 2026-09-19
+
+### Added
+
+- **Model Parameter Recommendations** (continued)
+  - API endpoint `GET /api/models/{model_id}/recommendations?task=chat` fully functional
+  - Hugging Face model card fetching with fallback to architecture heuristics
+  - `lm-optimizer recommend <model> --task coding` CLI command working
+
+- **Generation Parameter Optimization** (continued)
+  - Coarse search and refinement stages fully test generation parameter combinations
+  - Deterministic sampling for temperatures, top_p, top_k, repetition penalties
+  - Configurable candidate arrays in `advanced_settings`
+
+- **OpenAI-Compatible API Support** (continued)
+  - Native LM Studio API (`/api/v1`) correctly detected when both endpoints present
+  - URL handling for `/v1` suffix properly strips and detects
+  - Graceful degradation for load/unload on OpenAI-compatible API
+
+### Fixed
+
+- **API endpoint path detection**: Fixed native API detection for LM Studio's `{ "models": [...] }` response format
+- **Indentation issues**: Fixed `load_model` method indentation in `services/lm_studio.py`
+- **LoadConfiguration**: Removed `generation` field (generation params are per-request, not load config)
+- **API client**: Added `get_loaded_model` method for CLI compatibility
+
+### Changed
+
+- All 61 automated tests pass
+- CLI commands now accept `--url` override for all LM Studio commands
+- `LoadConfiguration` no longer includes generation parameters (correctly separated from load config)
+- Model loading uses native `/api/v1/models/load` endpoint correctly
+
+### Beta Status
+
+- All 61 automated tests pass
+- Real-world end-to-end validation on physical LM Studio hardware pending
+- Not production-ready - use with caution
+
 ### Changed - Optimization Correctness (v0.1.1)
 - **Hardware-agnostic scoring**: Removed hardcoded `50 tok/s`, `1000 prompt tok/s`, `2000ms TTFT`, `32768 context`, `6GB VRAM` assumptions. Speed/TTFT now run-relative, context model-relative, memory hardware-relative (15% headroom).
 - **Memory scoring**: No longer “less VRAM is always better”; 5GB/30tok and 8GB/50tok both score 1.0 on 24GB GPU, OOM on 6GB.

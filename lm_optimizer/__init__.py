@@ -3,5 +3,5 @@
 from .config import config
 from .logging_config import get_logger, setup_logging
 
-__version__ = "1.0.0-beta.1"
+__version__ = "1.0.0-beta.2"
 __all__ = ["config", "get_logger", "setup_logging"]
