@@ -66,6 +66,22 @@ class ModelIdentitySchema(BaseModel):
     size_bytes: int | None = None
 
 
+class GenerationParametersSchema(BaseModel):
+    temperature: float | None = Field(default=None, ge=0.0, le=2.0)
+    top_p: float | None = Field(default=None, ge=0.0, le=1.0)
+    top_k: int | None = Field(default=None, ge=1)
+    repetition_penalty: float | None = Field(default=None, ge=0.0, le=2.0)
+    min_p: float | None = Field(default=None, ge=0.0, le=1.0)
+    presence_penalty: float | None = Field(default=None, ge=-2.0, le=2.0)
+    frequency_penalty: float | None = Field(default=None, ge=-2.0, le=2.0)
+    typical_p: float | None = Field(default=None, ge=0.0, le=1.0)
+    mirostat_mode: int | None = Field(default=None, ge=0, le=2)
+    mirostat_tau: float | None = Field(default=None, ge=0.0, le=10.0)
+    mirostat_eta: float | None = Field(default=None, ge=0.0, le=1.0)
+    seed: int | None = None
+    stop_sequences: list[str] | None = None
+
+
 class LoadConfigSchema(BaseModel):
     context_length: int | None = None
     gpu_ratio: float | None = None
@@ -75,6 +91,7 @@ class LoadConfigSchema(BaseModel):
     num_experts: int | None = None
     rope_freq_base: float | None = None
     rope_freq_scale: float | None = None
+    generation: GenerationParametersSchema | None = None
 
 
 class AdvancedSettingsSchema(BaseModel):
@@ -93,6 +110,13 @@ class AdvancedSettingsSchema(BaseModel):
     max_batch: int | None = 1024
     enable_rope: bool = False  # Experimental, disabled by default. Must be explicitly enabled.
     enable_rope_scaling: bool | None = None  # alias
+    # Generation parameter fine-tuning
+    optimize_generation_params: bool = True  # Whether to optimize generation parameters
+    generation_temperatures: list[float] = [0.1, 0.3, 0.5, 0.7, 0.9, 1.0]
+    generation_top_p_values: list[float] = [0.8, 0.9, 0.95, 1.0]
+    generation_top_k_values: list[int] = [1, 10, 20, 40, 50, 100]
+    generation_repetition_penalties: list[float] = [1.0, 1.05, 1.1, 1.15, 1.2]
+    fixed_generation_params: GenerationParametersSchema | None = None  # Fixed params if not optimizing
 
 
 class OptimizationRequest(BaseModel):

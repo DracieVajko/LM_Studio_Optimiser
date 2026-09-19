@@ -19,6 +19,7 @@ from lm_optimizer.domain.models import (
     OptimizationStage,
     ProfileWeights,
     RunStatus,
+    GenerationParameters,
 )
 from lm_optimizer.logging_config import get_logger
 from lm_optimizer.scoring.normalization import (
@@ -350,7 +351,7 @@ class AdaptiveOptimizer:
         """Generate coarse search configurations with deterministic intelligent sampling.
 
         Covers search dimensions reasonably: low/high context, low/high GPU,
-        KV alternatives, Flash alternatives, batch alternatives.
+        KV alternatives, Flash alternatives, batch alternatives, generation parameters.
         Uses deterministic sampling (sorted, evenly spaced) for reproducibility.
         """
         # Sample dimensions to ensure coverage, not just first N
@@ -364,6 +365,20 @@ class AdaptiveOptimizer:
         flash_samples = sorted(space.flash_attention_options)
         kv_samples = sorted(space.kv_cache_options)
 
+        # Generation parameter samples
+        temp_samples = self._deterministic_sample(
+            space.generation_temperatures, min(3, len(space.generation_temperatures))
+        )
+        top_p_samples = self._deterministic_sample(
+            space.generation_top_p_values, min(3, len(space.generation_top_p_values))
+        )
+        top_k_samples = self._deterministic_sample(
+            space.generation_top_k_values, min(2, len(space.generation_top_k_values))
+        )
+        rep_pen_samples = self._deterministic_sample(
+            space.generation_repetition_penalties, min(2, len(space.generation_repetition_penalties))
+        )
+
         # Generate ALL combinations in deterministic sorted order
         all_configs = []
         for ctx in sorted(ctx_samples):
@@ -371,17 +386,28 @@ class AdaptiveOptimizer:
                 for flash in flash_samples:
                     for kv in kv_samples:
                         for batch in sorted(batch_samples):
-                            all_configs.append(
-                                LoadConfiguration(
-                                    context_length=ctx,
-                                    gpu_ratio=gpu,
-                                    flash_attention=flash,
-                                    offload_kv_cache_to_gpu=kv,
-                                    eval_batch_size=batch,
-                                )
-                            )
+                            for temp in sorted(temp_samples):
+                                for top_p in sorted(top_p_samples):
+                                    for top_k in sorted(top_k_samples):
+                                        for rep_pen in sorted(rep_pen_samples):
+                                            gen_params = GenerationParameters(
+                                                temperature=temp,
+                                                top_p=top_p,
+                                                top_k=top_k,
+                                                repetition_penalty=rep_pen,
+                                            )
+                                            all_configs.append(
+                                                LoadConfiguration(
+                                                    context_length=ctx,
+                                                    gpu_ratio=gpu,
+                                                    flash_attention=flash,
+                                                    offload_kv_cache_to_gpu=kv,
+                                                    eval_batch_size=batch,
+                                                    generation=gen_params,
+                                                )
+                                            )
 
-        # If still too many, deterministically sample 20 covering dimensions
+        # If still too many, deterministically sample 50 covering dimensions
         # Sort deterministically by tuple to ensure reproducibility
         all_configs.sort(
             key=lambda c: (
@@ -390,14 +416,17 @@ class AdaptiveOptimizer:
                 c.eval_batch_size or 0,
                 c.flash_attention or False,
                 c.offload_kv_cache_to_gpu or False,
+                c.generation.temperature if c.generation else 0.0,
+                c.generation.top_p if c.generation else 0.0,
             )
         )
 
-        if len(all_configs) > 20:
+        max_configs = 50
+        if len(all_configs) > max_configs:
             # Evenly spaced deterministic sampling to cover dimensions
-            step = len(all_configs) / 20
+            step = len(all_configs) / max_configs
             sampled = []
-            for i in range(20):
+            for i in range(max_configs):
                 idx = int(round(i * step))
                 if idx >= len(all_configs):
                     idx = len(all_configs) - 1
@@ -406,19 +435,22 @@ class AdaptiveOptimizer:
             seen = set()
             deduped = []
             for c in sampled:
+                gen = c.generation
                 key = (
                     c.context_length,
                     c.gpu_ratio,
                     c.flash_attention,
                     c.offload_kv_cache_to_gpu,
                     c.eval_batch_size,
+                    gen.temperature if gen else None,
+                    gen.top_p if gen else None,
                 )
                 if key not in seen:
                     seen.add(key)
                     deduped.append(c)
             return deduped
 
-        return all_configs[:20]
+        return all_configs[:max_configs]
 
     async def _stage_refinement(self) -> None:
         """Stage 3: Refinement around promising candidates (not just best)."""
@@ -441,15 +473,36 @@ class AdaptiveOptimizer:
 
         space = self.state.search_space
         tested_keys = {
-            (c.context_length, c.gpu_ratio, c.eval_batch_size) for c in self.state.tested_configs
+            (
+                c.context_length,
+                c.gpu_ratio,
+                c.eval_batch_size,
+                c.generation.temperature if c.generation else None,
+                c.generation.top_p if c.generation else None,
+            )
+            for c in self.state.tested_configs
         }
 
         for best in promising:
+            best_gen = best.config.generation
             # Refine around each promising candidate, avoiding failed regions
             ctx_candidates = self._refine_context(best.context_length, space.context_lengths)
             gpu_candidates = self._refine_gpu_ratio(best.gpu_ratio or 0.8, space.gpu_ratios)
             batch_candidates = self._refine_batch_size(
                 best.eval_batch_size or 256, space.batch_sizes
+            )
+            # Generation parameter refinement
+            temp_candidates = self._refine_generation_param(
+                best_gen.temperature if best_gen else 0.7, space.generation_temperatures
+            )
+            top_p_candidates = self._refine_generation_param(
+                best_gen.top_p if best_gen else 0.9, space.generation_top_p_values
+            )
+            top_k_candidates = self._refine_generation_param(
+                best_gen.top_k if best_gen else 40, space.generation_top_k_values
+            )
+            rep_pen_candidates = self._refine_generation_param(
+                best_gen.repetition_penalty if best_gen else 1.1, space.generation_repetition_penalties
             )
 
             # Also test important parameter interactions: toggle flash and kv at best context/gpu
@@ -463,6 +516,7 @@ class AdaptiveOptimizer:
                             flash_attention=flash,
                             offload_kv_cache_to_gpu=best.offload_kv_cache_to_gpu,
                             eval_batch_size=best.eval_batch_size,
+                            generation=best_gen,
                         )
                     )
             for kv in space.kv_cache_options:
@@ -474,11 +528,18 @@ class AdaptiveOptimizer:
                             flash_attention=best.flash_attention,
                             offload_kv_cache_to_gpu=kv,
                             eval_batch_size=best.eval_batch_size,
+                            generation=best_gen,
                         )
                     )
 
             for cfg in interaction_configs:
-                key = (cfg.context_length, cfg.gpu_ratio, cfg.eval_batch_size)
+                key = (
+                    cfg.context_length,
+                    cfg.gpu_ratio,
+                    cfg.eval_batch_size,
+                    cfg.generation.temperature if cfg.generation else None,
+                    cfg.generation.top_p if cfg.generation else None,
+                )
                 if key in tested_keys or key in self.state.failed_regions:
                     continue
                 if self.state.should_cancel:
@@ -495,37 +556,48 @@ class AdaptiveOptimizer:
             for ctx in ctx_candidates:
                 for gpu in gpu_candidates:
                     for batch in batch_candidates:
-                        key = (ctx, gpu, batch)
-                        if key in tested_keys:
-                            continue
-                        # Avoid clearly inferior regions (failed before)
-                        if (ctx, gpu) in self.state.failed_regions:
-                            continue
-                        if self.state.should_cancel:
-                            break
-                        while self.state.should_pause:
-                            await asyncio.sleep(1)
+                        for temp in temp_candidates:
+                            for top_p in top_p_candidates:
+                                for top_k in top_k_candidates:
+                                    for rep_pen in rep_pen_candidates:
+                                        key = (ctx, gpu, batch, temp, top_p)
+                                        if key in tested_keys:
+                                            continue
+                                        # Avoid clearly inferior regions (failed before)
+                                        if (ctx, gpu) in self.state.failed_regions:
+                                            continue
+                                        if self.state.should_cancel:
+                                            break
+                                        while self.state.should_pause:
+                                            await asyncio.sleep(1)
 
-                        config = LoadConfiguration(
-                            context_length=ctx,
-                            gpu_ratio=gpu,
-                            flash_attention=best.flash_attention,
-                            offload_kv_cache_to_gpu=best.offload_kv_cache_to_gpu,
-                            eval_batch_size=batch,
-                        )
+                                        gen_params = GenerationParameters(
+                                            temperature=temp,
+                                            top_p=top_p,
+                                            top_k=top_k,
+                                            repetition_penalty=rep_pen,
+                                        )
+                                        config = LoadConfiguration(
+                                            context_length=ctx,
+                                            gpu_ratio=gpu,
+                                            flash_attention=best.flash_attention,
+                                            offload_kv_cache_to_gpu=best.offload_kv_cache_to_gpu,
+                                            eval_batch_size=batch,
+                                            generation=gen_params,
+                                        )
 
-                        result = await self._test_config(config, ctx)
-                        tested_keys.add(key)
-                        if result and result.status == ConfigurationStatus.PASSED:
-                            self.state.tested_configs.append(result)
-                            self._update_best(result)
-                        elif result and result.status == ConfigurationStatus.OOM:
-                            self.state.failed_regions.add((ctx, gpu))
+                                        result = await self._test_config(config, ctx)
+                                        tested_keys.add(key)
+                                        if result and result.status == ConfigurationStatus.PASSED:
+                                            self.state.tested_configs.append(result)
+                                            self._update_best(result)
+                                        elif result and result.status == ConfigurationStatus.OOM:
+                                            self.state.failed_regions.add((ctx, gpu))
 
-                        run_repo.save(self.state.run)
+                                        run_repo.save(self.state.run)
 
-            # Recompute scores after each promising candidate's refinement
-            self._recompute_all_scores()
+        # Recompute scores after each promising candidate's refinement
+        self._recompute_all_scores()
 
     def _refine_context(self, best_ctx: int, all_ctx: list[int]) -> list[int]:
         """Generate context candidates around best, using hardware-aware steps.
@@ -577,8 +649,31 @@ class AdaptiveOptimizer:
                 candidates.append(batch)
         return sorted(set(candidates))
 
+    def _refine_generation_param(
+        self, best_val: float | int | None, all_vals: list[float] | list[int]
+    ) -> list[float] | list[int]:
+        """Generate generation parameter candidates around best, deterministic."""
+        if best_val is None or not all_vals:
+            return all_vals[:3]  # Return first few as fallback
+
+        candidates = [best_val]
+        # For continuous params (temperature, top_p), use offsets
+        if isinstance(best_val, float):
+            for offset in [-0.1, -0.05, 0.05, 0.1, -0.2, 0.2]:
+                val = round(best_val + offset, 2)
+                if 0.0 <= val <= 2.0 and val in all_vals and val not in candidates:
+                    candidates.append(val)
+        # For integer params (top_k), use multipliers
+        elif isinstance(best_val, int):
+            for mult in [0.5, 0.75, 1.5, 2.0]:
+                val = int(best_val * mult)
+                if val >= 1 and val in all_vals and val not in candidates:
+                    candidates.append(val)
+
+        return sorted(set(candidates))[:4]  # Limit to 4 candidates
+
     async def _stage_batch_optimization(self) -> None:
-        """Stage 4: Optimize eval batch size."""
+        """Stage 4: Optimize eval batch size and generation parameters."""
         logger.info("Stage 4: Batch optimization")
         self.state.run.stage = OptimizationStage.BATCH_OPTIMIZATION
         run_repo.save(self.state.run)
@@ -587,12 +682,16 @@ class AdaptiveOptimizer:
             return
 
         best = self.state.best_config
+        best_gen = best.config.generation
+        space = self.state.search_space
+
         tested_batches = {
             c.eval_batch_size
             for c in self.state.tested_configs
             if c.context_length == best.context_length and c.gpu_ratio == best.gpu_ratio
         }
-        for batch in self.state.search_space.batch_sizes:
+
+        for batch in space.batch_sizes:
             if batch in tested_batches:
                 continue
             if self.state.should_cancel:
@@ -606,6 +705,7 @@ class AdaptiveOptimizer:
                 flash_attention=best.flash_attention,
                 offload_kv_cache_to_gpu=best.offload_kv_cache_to_gpu,
                 eval_batch_size=batch,
+                generation=best_gen,
             )
 
             result = await self._test_config(config, best.context_length)
@@ -614,6 +714,67 @@ class AdaptiveOptimizer:
                 self._update_best(result)
 
             run_repo.save(self.state.run)
+
+        # Also optimize generation parameters at best context/gpu/batch
+        if best_gen:
+            temp_candidates = self._refine_generation_param(
+                best_gen.temperature, space.generation_temperatures
+            )
+            top_p_candidates = self._refine_generation_param(
+                best_gen.top_p, space.generation_top_p_values
+            )
+            top_k_candidates = self._refine_generation_param(
+                best_gen.top_k, space.generation_top_k_values
+            )
+            rep_pen_candidates = self._refine_generation_param(
+                best_gen.repetition_penalty, space.generation_repetition_penalties
+            )
+
+            tested_gen_keys = {
+                (
+                    c.generation.temperature if c.generation else None,
+                    c.generation.top_p if c.generation else None,
+                    c.generation.top_k if c.generation else None,
+                    c.generation.repetition_penalty if c.generation else None,
+                )
+                for c in self.state.tested_configs
+                if c.context_length == best.context_length and c.gpu_ratio == best.gpu_ratio
+            }
+
+            for temp in temp_candidates:
+                for top_p in top_p_candidates:
+                    for top_k in top_k_candidates:
+                        for rep_pen in rep_pen_candidates:
+                            gen_key = (temp, top_p, top_k, rep_pen)
+                            if gen_key in tested_gen_keys:
+                                continue
+                            if self.state.should_cancel:
+                                break
+                            while self.state.should_pause:
+                                await asyncio.sleep(1)
+
+                            gen_params = GenerationParameters(
+                                temperature=temp,
+                                top_p=top_p,
+                                top_k=top_k,
+                                repetition_penalty=rep_pen,
+                            )
+                            config = LoadConfiguration(
+                                context_length=best.context_length,
+                                gpu_ratio=best.gpu_ratio,
+                                flash_attention=best.flash_attention,
+                                offload_kv_cache_to_gpu=best.offload_kv_cache_to_gpu,
+                                eval_batch_size=best.eval_batch_size,
+                                generation=gen_params,
+                            )
+
+                            result = await self._test_config(config, best.context_length)
+                            tested_gen_keys.add(gen_key)
+                            if result and result.status == ConfigurationStatus.PASSED:
+                                self.state.tested_configs.append(result)
+                                self._update_best(result)
+
+                            run_repo.save(self.state.run)
 
     async def _stage_validation(self) -> None:
         """Stage 5: Final validation with multiple runs."""
@@ -632,6 +793,7 @@ class AdaptiveOptimizer:
             flash_attention=best.flash_attention,
             offload_kv_cache_to_gpu=best.offload_kv_cache_to_gpu,
             eval_batch_size=best.eval_batch_size,
+            generation=best.config.generation,
         )
         # Preserve RoPE if experimental and enabled
         if self.state.run.is_experimental:

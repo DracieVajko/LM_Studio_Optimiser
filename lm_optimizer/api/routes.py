@@ -10,6 +10,7 @@ from lm_optimizer.api.schemas import (
     AdvancedSettingsSchema,
     ApplyConfigRequest,
     ConfigurationResultResponse,
+    GenerationParametersSchema,
     HardwareInfoSchema,
     LoadConfigSchema,
     ModelIdentitySchema,
@@ -38,6 +39,7 @@ from lm_optimizer.domain.models import (
 from lm_optimizer.services.benchmark import BenchmarkService
 from lm_optimizer.services.hardware import hardware_detector
 from lm_optimizer.services.lm_studio import LMStudioClient, create_client
+from lm_optimizer.services.model_recommendations import model_recommendation_service
 from lm_optimizer.services.optimizer import AdaptiveOptimizer
 from lm_optimizer.services.quality import QualityConfig, QualityEvaluator
 from lm_optimizer.services.search_space import SearchSpaceGenerator
@@ -292,6 +294,50 @@ async def get_model(model_id: str):
         if not model:
             raise HTTPException(status_code=404, detail="Model not found")
         return _convert_model(model)
+    finally:
+        await client.close()
+
+
+@router.get("/api/models/{model_id}/recommendations")
+async def get_model_recommendations(
+    model_id: str,
+    task: str = "chat",
+):
+    """Get recommended generation parameters for a model.
+
+    Fetches recommendations from Hugging Face model cards or uses
+    architecture-based heuristics as fallback.
+
+    Args:
+        model_id: Model identifier
+        task: Task type (chat, coding, reasoning, creative, factual, json)
+
+    Returns:
+        ModelRecommendation with generation parameters and metadata
+    """
+    client = await get_lm_client()
+    try:
+        model = await client.get_model(model_id)
+        if not model:
+            raise HTTPException(status_code=404, detail="Model not found")
+
+        recommendation = await model_recommendation_service.get_recommendation(
+            model_id=model.id,
+            model_name=model.name,
+            architecture=model.architecture,
+            quantization=model.quantization,
+            task=task,
+        )
+
+        return {
+            "model_id": recommendation.model_id,
+            "model_name": recommendation.model_name,
+            "generation_params": recommendation.generation_params.to_dict(),
+            "load_params": recommendation.load_params,
+            "source": recommendation.source,
+            "confidence": recommendation.confidence,
+            "notes": recommendation.notes,
+        }
     finally:
         await client.close()
 

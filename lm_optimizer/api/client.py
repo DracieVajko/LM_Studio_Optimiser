@@ -29,6 +29,30 @@ class ModelStatus(str, Enum):
     ERROR = "error"
 
 
+class GenerationParameters(BaseModel):
+    """Generation/inference parameters."""
+
+    temperature: float | None = Field(default=None, ge=0.0, le=2.0, description="Sampling temperature")
+    top_p: float | None = Field(default=None, ge=0.0, le=1.0, description="Nucleus sampling top-p")
+    top_k: int | None = Field(default=None, ge=1, description="Top-k sampling")
+    repetition_penalty: float | None = Field(default=None, ge=0.0, le=2.0, description="Repetition penalty")
+    min_p: float | None = Field(default=None, ge=0.0, le=1.0, description="Min-p sampling")
+    presence_penalty: float | None = Field(default=None, ge=-2.0, le=2.0, description="Presence penalty")
+    frequency_penalty: float | None = Field(default=None, ge=-2.0, le=2.0, description="Frequency penalty")
+    typical_p: float | None = Field(default=None, ge=0.0, le=1.0, description="Typical-p sampling")
+    mirostat_mode: int | None = Field(default=None, ge=0, le=2, description="Mirostat mode")
+    mirostat_tau: float | None = Field(default=None, ge=0.0, le=10.0, description="Mirostat tau")
+    mirostat_eta: float | None = Field(default=None, ge=0.0, le=1.0, description="Mirostat eta")
+    seed: int | None = Field(default=None, description="Random seed")
+    stop_sequences: list[str] | None = Field(default=None, description="Stop sequences")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {k: v for k, v in self.model_dump().items() if v is not None and v != []}
+
+    def to_api_params(self) -> dict[str, Any]:
+        return self.to_dict()
+
+
 class LoadConfig(BaseModel):
     """Model load configuration parameters."""
 
@@ -46,10 +70,17 @@ class LoadConfig(BaseModel):
     )
     rope_freq_base: float | None = Field(default=None, description="RoPE frequency base")
     rope_freq_scale: float | None = Field(default=None, description="RoPE frequency scale")
+    # Generation parameters
+    generation: GenerationParameters | None = Field(default=None, description="Generation parameters")
 
     def to_api_params(self) -> dict[str, Any]:
         """Convert to API parameters, excluding None values."""
-        return {k: v for k, v in self.model_dump().items() if v is not None}
+        params = {k: v for k, v in self.model_dump(exclude={"generation"}).items() if v is not None}
+        if self.generation:
+            gen_params = self.generation.to_api_params()
+            if gen_params:
+                params["generation"] = gen_params
+        return params
 
 
 class ModelInfo(BaseModel):
@@ -112,11 +143,25 @@ class ChatCompletionRequest(BaseModel):
 
     model: str
     messages: list[ChatMessage]
-    temperature: float = 0.7
-    max_tokens: int = 512
+    temperature: float = Field(default=0.7, ge=0.0, le=2.0)
+    top_p: float | None = Field(default=None, ge=0.0, le=1.0)
+    top_k: int | None = Field(default=None, ge=1)
+    repetition_penalty: float | None = Field(default=None, ge=0.0, le=2.0)
+    min_p: float | None = Field(default=None, ge=0.0, le=1.0)
+    presence_penalty: float | None = Field(default=None, ge=-2.0, le=2.0)
+    frequency_penalty: float | None = Field(default=None, ge=-2.0, le=2.0)
+    typical_p: float | None = Field(default=None, ge=0.0, le=1.0)
+    mirostat_mode: int | None = Field(default=None, ge=0, le=2)
+    mirostat_tau: float | None = Field(default=None, ge=0.0, le=10.0)
+    mirostat_eta: float | None = Field(default=None, ge=0.0, le=1.0)
+    max_tokens: int = Field(default=512, ge=1)
     stream: bool = False
     seed: int | None = None
     stop: list[str] | None = None
+
+    def to_api_params(self) -> dict[str, Any]:
+        """Convert to API parameters, excluding None values."""
+        return {k: v for k, v in self.model_dump().items() if v is not None and v != []}
 
 
 class ChatCompletionChoice(BaseModel):
@@ -198,15 +243,28 @@ class APICapabilities:
 
 
 class LMStudioClient:
-    """Async client for LM Studio API."""
+    """Async client for LM Studio API.
+
+    Supports both native LM Studio API (/api/v1/...) and
+    OpenAI-compatible API (/v1/...).
+    """
 
     def __init__(self, base_url: str | None = None, timeout: float | None = None):
-        self.base_url = (base_url or config.lm_studio.base_url).rstrip("/")
+        raw_url = (base_url or config.lm_studio.base_url).rstrip("/")
+        # If URL ends with /v1, strip it and treat as OpenAI-compatible hint
+        if raw_url.endswith("/v1"):
+            self.base_url = raw_url[:-3]  # Remove /v1
+            self._prefer_openai_compatible = True
+        else:
+            self.base_url = raw_url
+            self._prefer_openai_compatible = False
         self.timeout = timeout or config.lm_studio.timeout
         self._client: httpx.AsyncClient | None = None
         self._capabilities: APICapabilities | None = None
         self._models_cache: list[ModelInfo] | None = None
         self._loaded_models: dict[str, str] = {}  # model_id -> identifier
+        self._api_base_path: str = "/api/v1"  # Default to native API
+        self._is_openai_compatible: bool = False
 
     async def __aenter__(self) -> "LMStudioClient":
         await self.connect()
@@ -226,10 +284,14 @@ class LMStudioClient:
             limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
         )
 
-        # Test connection and detect API version
+        # Test connection and detect API version/type
+        await self._detect_api_type()
         await self._detect_capabilities()
         logger.info(
-            "Connected to LM Studio", base_url=self.base_url, version=self._capabilities.version
+            "Connected to LM Studio",
+            base_url=self.base_url,
+            api_type="openai_compatible" if self._is_openai_compatible else "native",
+            version=self._capabilities.version,
         )
 
     async def close(self) -> None:
@@ -252,11 +314,66 @@ class LMStudioClient:
             raise RuntimeError("Capabilities not detected. Call connect() first.")
         return self._capabilities
 
+    @property
+    def api_base_path(self) -> str:
+        """Get the detected API base path."""
+        return self._api_base_path
+
+    @property
+    def is_openai_compatible(self) -> bool:
+        """Check if using OpenAI-compatible API."""
+        return self._is_openai_compatible
+
+    async def _detect_api_type(self) -> None:
+        """Detect whether the endpoint is native LM Studio API or OpenAI-compatible."""
+        # If user provided URL ending with /v1, prefer OpenAI-compatible API
+        if self._prefer_openai_compatible:
+            try:
+                response = await self._request_with_retry("GET", "/v1/models")
+                data = response.json()
+                if isinstance(data, dict) and "data" in data:
+                    self._api_base_path = "/v1"
+                    self._is_openai_compatible = True
+                    return
+            except Exception:
+                pass
+
+        # Try native LM Studio API first
+        try:
+            response = await self._request_with_retry("GET", "/api/v1/models")
+            data = response.json()
+            if isinstance(data, dict) and "data" in data:
+                self._api_base_path = "/api/v1"
+                self._is_openai_compatible = False
+                return
+            elif isinstance(data, list):
+                self._api_base_path = "/api/v1"
+                self._is_openai_compatible = False
+                return
+        except Exception:
+            pass
+
+        # Try OpenAI-compatible API
+        try:
+            response = await self._request_with_retry("GET", "/v1/models")
+            data = response.json()
+            if isinstance(data, dict) and "data" in data:
+                self._api_base_path = "/v1"
+                self._is_openai_compatible = True
+                return
+        except Exception:
+            pass
+
+        # Default to native API
+        self._api_base_path = "/api/v1"
+        self._is_openai_compatible = False
+
     async def _detect_capabilities(self) -> None:
         """Detect LM Studio API version and capabilities."""
         try:
-            # Try to get models to verify connection
-            response = await self._request_with_retry("GET", "/api/v1/models")
+            # Use detected API base path
+            models_path = f"{self._api_base_path}/models"
+            response = await self._request_with_retry("GET", models_path)
             models_data = response.json()
 
             # Detect version from response structure
@@ -268,8 +385,20 @@ class LMStudioClient:
             elif isinstance(models_data, list):
                 self._capabilities.version = "v0"
 
-            # Try to detect supported parameters by checking model schema or docs endpoint
-            await self._probe_load_parameters()
+            # For OpenAI-compatible API, we can't probe load parameters the same way
+            if not self._is_openai_compatible:
+                await self._probe_load_parameters()
+            else:
+                # OpenAI-compatible API doesn't support model load/unload via API
+                # Set defaults for native API parameters
+                self._capabilities.supports_context_length = False
+                self._capabilities.supports_gpu_ratio = False
+                self._capabilities.supports_flash_attention = False
+                self._capabilities.supports_kv_cache_offload = False
+                self._capabilities.supports_eval_batch_size = False
+                self._capabilities.supports_num_experts = False
+                self._capabilities.supports_rope_scaling = False
+                self._capabilities.load_parameters = []
 
         except Exception as e:
             logger.warning("Failed to detect capabilities, using defaults", error=str(e))
@@ -324,12 +453,16 @@ class LMStudioClient:
 
         raise RuntimeError("Retry logic failed unexpectedly")
 
+    def _api_path(self, endpoint: str) -> str:
+        """Build full API path using detected base path."""
+        return f"{self._api_base_path}{endpoint}"
+
     async def list_models(self, force_refresh: bool = False) -> list[ModelInfo]:
         """List all available models."""
         if self._models_cache is not None and not force_refresh:
             return self._models_cache
 
-        response = await self._request_with_retry("GET", "/api/v1/models")
+        response = await self._request_with_retry("GET", self._api_path("/models"))
         data = response.json()
 
         models = []
@@ -370,7 +503,13 @@ class LMStudioClient:
     async def load_model(
         self, model_id: str, load_config: LoadConfig | None = None
     ) -> LoadModelResponse:
-        """Load a model with specified configuration."""
+        """Load a model with specified configuration (native API only)."""
+        if self._is_openai_compatible:
+            return LoadModelResponse(
+                success=False,
+                error="Model load/unload not supported via OpenAI-compatible API. Use native LM Studio API."
+            )
+
         identifier = str(uuid.uuid4())[:8]
         request = LoadModelRequest(model=model_id, config=load_config, identifier=identifier)
 
@@ -387,7 +526,7 @@ class LMStudioClient:
             request.config = filtered_config
 
         response = await self._request_with_retry(
-            "POST", "/api/v1/models/load", json_data=request.model_dump()
+            "POST", self._api_path("/models/load"), json_data=request.model_dump()
         )
         result = LoadModelResponse(**response.json())
 
@@ -399,7 +538,13 @@ class LMStudioClient:
     async def unload_model(
         self, model_id: str | None = None, identifier: str | None = None
     ) -> UnloadModelResponse:
-        """Unload a model."""
+        """Unload a model (native API only)."""
+        if self._is_openai_compatible:
+            return UnloadModelResponse(
+                success=False,
+                error="Model load/unload not supported via OpenAI-compatible API. Use native LM Studio API."
+            )
+
         if identifier is None and model_id is not None:
             identifier = self._loaded_models.get(model_id)
 
@@ -410,7 +555,7 @@ class LMStudioClient:
 
         request = UnloadModelRequest(identifier=identifier)
         response = await self._request_with_retry(
-            "POST", "/api/v1/models/unload", json_data=request.model_dump()
+            "POST", self._api_path("/models/unload"), json_data=request.model_dump()
         )
         result = UnloadModelResponse(**response.json())
 
@@ -435,12 +580,32 @@ class LMStudioClient:
         stream: bool = False,
         seed: int | None = None,
         stop: list[str] | None = None,
+        top_p: float | None = None,
+        top_k: int | None = None,
+        repetition_penalty: float | None = None,
+        min_p: float | None = None,
+        presence_penalty: float | None = None,
+        frequency_penalty: float | None = None,
+        typical_p: float | None = None,
+        mirostat_mode: int | None = None,
+        mirostat_tau: float | None = None,
+        mirostat_eta: float | None = None,
     ) -> ChatCompletionResponse:
-        """Generate chat completion."""
+        """Generate chat completion with full generation parameters."""
         request = ChatCompletionRequest(
             model=model,
             messages=messages,
             temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            repetition_penalty=repetition_penalty,
+            min_p=min_p,
+            presence_penalty=presence_penalty,
+            frequency_penalty=frequency_penalty,
+            typical_p=typical_p,
+            mirostat_mode=mirostat_mode,
+            mirostat_tau=mirostat_tau,
+            mirostat_eta=mirostat_eta,
             max_tokens=max_tokens,
             stream=stream,
             seed=seed,
@@ -448,7 +613,7 @@ class LMStudioClient:
         )
 
         response = await self._request_with_retry(
-            "POST", "/api/v1/chat/completions", json_data=request.model_dump()
+            "POST", self._api_path("/chat/completions"), json_data=request.to_api_params()
         )
         return ChatCompletionResponse(**response.json())
 
@@ -456,14 +621,14 @@ class LMStudioClient:
         """Get embeddings for input text."""
         request = EmbeddingRequest(model=model, input=input_text)
         response = await self._request_with_retry(
-            "POST", "/api/v1/embeddings", json_data=request.model_dump()
+            "POST", self._api_path("/embeddings"), json_data=request.model_dump()
         )
         return EmbeddingResponse(**response.json())
 
     async def health_check(self) -> bool:
         """Check if LM Studio is responsive."""
         try:
-            await self._request_with_retry("GET", "/api/v1/models")
+            await self._request_with_retry("GET", self._api_path("/models"))
             return True
         except Exception:
             return False

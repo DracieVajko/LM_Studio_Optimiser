@@ -60,6 +60,12 @@ class BenchmarkService:
             )
         return cases
 
+    def get_generation_params(self, load_config: LoadConfiguration) -> dict:
+        """Extract generation parameters from load configuration."""
+        if not load_config.generation:
+            return {}
+        return load_config.generation.to_api_params()
+
     async def run_benchmark(
         self,
         model_id: str,
@@ -78,6 +84,9 @@ class BenchmarkService:
         )
 
         logger.info("Starting benchmark", config_id=str(config_id), model=model_id)
+
+        # Extract generation parameters from load config
+        gen_params = self.get_generation_params(load_config)
 
         # Load model
         load_start = time.perf_counter()
@@ -101,13 +110,13 @@ class BenchmarkService:
             for i in range(self.config.warmup_repetitions):
                 logger.debug("Warmup run", run=i + 1)
                 for case in cases:
-                    await self._run_single_case(model_id, case)
+                    await self._run_single_case(model_id, case, gen_params)
 
             # Measured runs
             for run_idx in range(self.config.repetitions):
                 logger.debug("Measured run", run=run_idx + 1)
                 for case in cases:
-                    metrics = await self._run_single_case(model_id, case)
+                    metrics = await self._run_single_case(model_id, case, gen_params)
                     all_metrics.append(metrics)
 
             # Aggregate metrics
@@ -132,20 +141,28 @@ class BenchmarkService:
         logger.info("Benchmark complete", config_id=str(config_id), status=result.status)
         return result
 
-    async def _run_single_case(self, model_id: str, case: BenchmarkCase) -> BenchmarkMetrics:
+    async def _run_single_case(
+        self, model_id: str, case: BenchmarkCase, gen_params: dict | None = None
+    ) -> BenchmarkMetrics:
         """Run a single benchmark case."""
         start_time = time.perf_counter()
 
         try:
             messages = [{"role": "user", "content": case.prompt}]
 
+            # Merge generation parameters: case-specific overrides gen_params
+            call_params = dict(gen_params) if gen_params else {}
+            # Case-specific temperature takes precedence
+            if "temperature" not in call_params:
+                call_params["temperature"] = case.temperature
+
             response = await self.client.chat_completion(
                 model=model_id,
                 messages=messages,
-                temperature=case.temperature,
                 max_tokens=case.max_tokens,
                 seed=42,
                 stop=case.stop_sequences,
+                **call_params,
             )
 
             total_time_ms = (time.perf_counter() - start_time) * 1000

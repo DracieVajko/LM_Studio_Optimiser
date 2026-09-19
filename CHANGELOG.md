@@ -119,6 +119,54 @@ First public beta release.
 
 Automated tests and static validation pass.
 
+## [1.0.0-beta.1] - 2026-09-19
+
+### Added
+
+- **Model Parameter Recommendations**
+  - New `recommend` CLI command to fetch generation parameters from Hugging Face model cards
+  - Architecture-based heuristics for 30+ model families (Llama, Mistral, Qwen, Phi, Gemma, DeepSeek, etc.)
+  - Task-specific presets: chat, coding, reasoning, creative, factual, JSON
+  - Quantization-aware parameter adjustments
+  - API endpoint: `GET /api/models/{model_id}/recommendations?task=chat`
+
+- **Generation Parameter Optimization**
+  - Full support for generation parameters: temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, typical_p, mirostat
+  - Generation parameters integrated into optimization search space
+  - Coarse search and refinement stages now test generation parameter combinations
+  - Configurable via `advanced_settings.optimize_generation_params` and related arrays
+  - CLI `benchmark` command now accepts `--temperature`, `--top-p`, `--top-k`, `--rep-penalty`, `--min-p`
+
+- **OpenAI-Compatible API Support**
+  - Auto-detects native LM Studio API (`/api/v1`) vs OpenAI-compatible API (`/v1`)
+  - Handles URLs with `/v1` suffix correctly (strips and detects)
+  - Works with remote LM Studio instances exposing OpenAI-compatible endpoint
+  - Graceful degradation: load/unload not available on OpenAI-compatible API
+
+- **Search Space Enhancements**
+  - Generation parameter candidates added to search space (temperatures, top_p, top_k, repetition penalties)
+  - Deterministic sampling for generation parameters in coarse search
+  - Refinement stage includes generation parameter tuning
+
+### Changed
+
+- Updated version to 1.0.0-beta.1 (PEP 440: 1.0.0b1)
+- API client now uses `_api_base_path` property for all endpoints
+- CLI `status` command shows detected API type (native vs OpenAI-compatible)
+- Benchmark results display generation parameters in output
+
+### Fixed
+
+- API endpoint path detection for URLs containing `/v1`
+- Indentation issues in optimizer refinement stage
+- Type hints for generation parameters in schemas
+
+### Beta Status
+
+- All 61 automated tests pass
+- Real-world end-to-end validation on physical LM Studio hardware pending
+- Not production-ready - use with caution
+
 Physical end-to-end LM Studio validation is still pending.
 
 > ⚠️ This is an untested beta. The developer machine is unavailable for repair, so no complete real-world optimization run has been performed for this release. Use with caution and verify generated configurations.

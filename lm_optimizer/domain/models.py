@@ -119,6 +119,31 @@ class BenchmarkCase:
 
 
 @dataclass
+class GenerationParameters:
+    """Generation/inference parameters."""
+
+    temperature: float | None = None
+    top_p: float | None = None
+    top_k: int | None = None
+    repetition_penalty: float | None = None
+    min_p: float | None = None
+    presence_penalty: float | None = None
+    frequency_penalty: float | None = None
+    typical_p: float | None = None
+    mirostat_mode: int | None = None
+    mirostat_tau: float | None = None
+    mirostat_eta: float | None = None
+    seed: int | None = None
+    stop_sequences: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {k: v for k, v in self.__dict__.items() if v is not None and v != []}
+
+    def to_api_params(self) -> dict:
+        return self.to_dict()
+
+
+@dataclass
 class LoadConfiguration:
     """Model load configuration parameters."""
 
@@ -130,6 +155,8 @@ class LoadConfiguration:
     num_experts: int | None = None
     rope_freq_base: float | None = None
     rope_freq_scale: float | None = None
+    # Generation parameters
+    generation: GenerationParameters = field(default_factory=GenerationParameters)
 
     def to_dict(self) -> dict:
         """Convert to dict, excluding None values."""

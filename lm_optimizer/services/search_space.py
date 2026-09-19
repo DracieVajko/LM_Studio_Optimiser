@@ -9,6 +9,7 @@ from lm_optimizer.domain.models import (
 )
 from lm_optimizer.logging_config import get_logger
 from lm_optimizer.services.lm_studio import LMStudioCapabilities, LMStudioClient
+from lm_optimizer.services.model_recommendations import GenerationParameters, model_recommendation_service
 
 logger = get_logger(__name__)
 
@@ -23,6 +24,11 @@ class SearchSpace:
     kv_cache_options: list[bool] = field(default_factory=list)
     batch_sizes: list[int] = field(default_factory=list)
     expert_counts: list[int] = field(default_factory=list)
+    # Generation parameter candidates
+    generation_temperatures: list[float] = field(default_factory=list)
+    generation_top_p_values: list[float] = field(default_factory=list)
+    generation_top_k_values: list[int] = field(default_factory=list)
+    generation_repetition_penalties: list[float] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -32,10 +38,20 @@ class SearchSpace:
             "kv_cache_options": self.kv_cache_options,
             "batch_sizes": self.batch_sizes,
             "expert_counts": self.expert_counts,
+            "generation_temperatures": self.generation_temperatures,
+            "generation_top_p_values": self.generation_top_p_values,
+            "generation_top_k_values": self.generation_top_k_values,
+            "generation_repetition_penalties": self.generation_repetition_penalties,
         }
 
     def estimate_size(self) -> int:
         """Estimate total number of configurations."""
+        gen_combinations = (
+            max(1, len(self.generation_temperatures))
+            * max(1, len(self.generation_top_p_values))
+            * max(1, len(self.generation_top_k_values))
+            * max(1, len(self.generation_repetition_penalties))
+        )
         return (
             len(self.context_lengths)
             * len(self.gpu_ratios)
@@ -43,6 +59,7 @@ class SearchSpace:
             * len(self.kv_cache_options)
             * len(self.batch_sizes)
             * max(1, len(self.expert_counts))
+            * gen_combinations
         )
 
 
@@ -83,6 +100,35 @@ class SearchSpaceGenerator:
         # Expert counts (MoE only)
         if model.is_moe and caps.supports_num_experts:
             space.expert_counts = self._generate_expert_counts(model, caps, advanced)
+
+        # Generation parameters
+        if advanced.get("optimize_generation_params", True):
+            space.generation_temperatures = advanced.get(
+                "generation_temperatures", [0.1, 0.3, 0.5, 0.7, 0.9, 1.0]
+            )
+            space.generation_top_p_values = advanced.get(
+                "generation_top_p_values", [0.8, 0.9, 0.95, 1.0]
+            )
+            space.generation_top_k_values = advanced.get(
+                "generation_top_k_values", [1, 10, 20, 40, 50, 100]
+            )
+            space.generation_repetition_penalties = advanced.get(
+                "generation_repetition_penalties", [1.0, 1.05, 1.1, 1.15, 1.2]
+            )
+        else:
+            # Use fixed generation parameters if provided
+            fixed = advanced.get("fixed_generation_params")
+            if fixed:
+                space.generation_temperatures = [fixed.temperature] if fixed.temperature else [0.7]
+                space.generation_top_p_values = [fixed.top_p] if fixed.top_p else [0.9]
+                space.generation_top_k_values = [fixed.top_k] if fixed.top_k else [40]
+                space.generation_repetition_penalties = [fixed.repetition_penalty] if fixed.repetition_penalty else [1.1]
+            else:
+                # Default single values
+                space.generation_temperatures = [0.7]
+                space.generation_top_p_values = [0.9]
+                space.generation_top_k_values = [40]
+                space.generation_repetition_penalties = [1.1]
 
         # RoPE parameters: EXPERIMENTAL - disabled by default
         # Only include if explicitly enabled via advanced_settings enable_rope=True

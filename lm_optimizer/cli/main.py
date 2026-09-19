@@ -24,6 +24,8 @@ from lm_optimizer.domain.models import (
 from lm_optimizer.logging_config import get_logger, setup_logging
 from lm_optimizer.services.benchmark import BenchmarkService
 from lm_optimizer.services.hardware import hardware_detector
+from lm_optimizer.services.lm_studio import LMStudioClient
+from lm_optimizer.services.model_recommendations import model_recommendation_service
 from lm_optimizer.services.optimizer import AdaptiveOptimizer
 from lm_optimizer.services.quality import QualityConfig, QualityEvaluator
 from lm_optimizer.services.search_space import SearchSpaceGenerator
@@ -234,6 +236,97 @@ def inspect(model: str = typer.Argument(..., help="Model ID to inspect")):
 
 
 @app.command()
+def recommend(
+    model: str = typer.Argument(..., help="Model ID to get recommendations for"),
+    task: str = typer.Option(
+        "chat", "--task", "-t", help="Task type: chat, coding, reasoning, creative, factual, json"
+    ),
+):
+    """Get recommended generation parameters for a model from Hugging Face or heuristics."""
+    setup_logging()
+
+    async def _recommend():
+        client = get_client()
+        try:
+            await client.connect()
+
+            model_info = await client.get_model(model)
+            if not model_info:
+                console.print(f"[red]Model not found: {model}[/red]")
+                sys.exit(1)
+
+            console.print(f"[bold]Fetching recommendations for {model}...[/bold]")
+
+            with console.status("Querying Hugging Face and analyzing model..."):
+                recommendation = await model_recommendation_service.get_recommendation(
+                    model_id=model_info.id,
+                    model_name=model_info.name,
+                    architecture=model_info.architecture,
+                    quantization=model_info.quantization,
+                    task=task,
+                )
+
+            console.print(Panel.fit(f"[bold]Model Recommendations: {model}[/bold]"))
+
+            # Source and confidence
+            source_colors = {
+                "huggingface": "green",
+                "lm_studio": "blue",
+                "heuristic": "yellow",
+                "default": "white",
+            }
+            source_color = source_colors.get(recommendation.source, "white")
+            console.print(f"Source: [{source_color}]{recommendation.source}[/{source_color}]")
+            console.print(f"Confidence: {recommendation.confidence:.0%}")
+            if recommendation.notes:
+                for note in recommendation.notes:
+                    console.print(f"  Note: {note}")
+
+            # Generation parameters
+            gen_table = Table(title="Recommended Generation Parameters")
+            gen_table.add_column("Parameter", style="cyan")
+            gen_table.add_column("Value", style="green")
+            gen_table.add_column("Description", style="dim")
+
+            params = recommendation.generation_params
+            param_descriptions = {
+                "temperature": "Sampling temperature (higher = more creative)",
+                "top_p": "Nucleus sampling threshold",
+                "top_k": "Top-k sampling limit",
+                "repetition_penalty": "Penalty for repeated tokens",
+                "min_p": "Min-p sampling threshold",
+                "presence_penalty": "Presence penalty for new topics",
+                "frequency_penalty": "Frequency penalty for repeated tokens",
+                "typical_p": "Typical-p sampling",
+                "mirostat_mode": "Mirostat algorithm mode",
+                "mirostat_tau": "Mirostat target entropy",
+                "mirostat_eta": "Mirostat learning rate",
+                "seed": "Random seed for reproducibility",
+                "stop_sequences": "Stop sequences",
+            }
+
+            for key, value in params.to_dict().items():
+                desc = param_descriptions.get(key, "")
+                if isinstance(value, list):
+                    value = ", ".join(value) if value else "None"
+                gen_table.add_row(key, str(value), desc)
+
+            console.print(gen_table)
+
+            # Show as JSON for easy copying
+            console.print("\n[dim]JSON for config:[/dim]")
+            console.print(JSON.from_data(recommendation.generation_params.to_dict()))
+
+        except Exception as e:
+            console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
+        finally:
+            await client.close()
+
+    asyncio.run(_recommend())
+
+
+@app.command()
 def benchmark(
     model: str = typer.Argument(..., help="Model ID to benchmark"),
     context: int = typer.Option(4096, "--context", "-c", help="Context length"),
@@ -244,6 +337,12 @@ def benchmark(
     repetitions: int = typer.Option(
         3, "--repetitions", "-r", help="Number of benchmark repetitions"
     ),
+    # Generation parameters
+    temperature: float = typer.Option(0.7, "--temperature", help="Sampling temperature (0-2)"),
+    top_p: float = typer.Option(0.9, "--top-p", help="Nucleus sampling top-p (0-1)"),
+    top_k: int = typer.Option(40, "--top-k", help="Top-k sampling (1+)"),
+    repetition_penalty: float = typer.Option(1.1, "--rep-penalty", help="Repetition penalty (0-2)"),
+    min_p: float = typer.Option(0.05, "--min-p", help="Min-p sampling (0-1)"),
 ):
     """Run benchmark with specific configuration."""
     setup_logging()
@@ -253,12 +352,20 @@ def benchmark(
         try:
             await client.connect()
 
+            gen_params = GenerationParameters(
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                repetition_penalty=repetition_penalty,
+                min_p=min_p,
+            )
             load_config = LoadConfiguration(
                 context_length=context,
                 gpu_ratio=gpu_ratio,
                 flash_attention=flash,
                 offload_kv_cache_to_gpu=kv_gpu,
                 eval_batch_size=batch,
+                generation=gen_params,
             )
 
             benchmark_service = BenchmarkService(
@@ -604,6 +711,21 @@ def _display_benchmark_result(result):
         "Eval Batch Size", str(result.eval_batch_size) if result.eval_batch_size else "Auto"
     )
 
+    # Show generation parameters if available
+    if result.config and result.config.generation:
+        gen = result.config.generation
+        gen_params = gen.to_dict()
+        if gen_params:
+            table.add_row("Generation Params", " (see below)")
+            gen_table = Table(title="Generation Parameters")
+            gen_table.add_column("Parameter", style="cyan")
+            gen_table.add_column("Value", style="green")
+            for key, value in gen_params.items():
+                if isinstance(value, list):
+                    value = ", ".join(value) if value else "None"
+                gen_table.add_row(key, str(value))
+            console.print(gen_table)
+
     console.print(table)
 
     # Per-test metrics - TTFT is estimated when streaming not available
@@ -683,6 +805,20 @@ def _display_optimization_result(result):
         table.add_row("Experimental", result.experimental_reason or "Yes")
 
     console.print(table)
+
+    # Show generation parameters if available
+    if best.config and best.config.generation:
+        gen = best.config.generation
+        gen_params = gen.to_dict()
+        if gen_params:
+            gen_table = Table(title="Generation Parameters")
+            gen_table.add_column("Parameter", style="cyan")
+            gen_table.add_column("Value", style="green")
+            for key, value in gen_params.items():
+                if isinstance(value, list):
+                    value = ", ".join(value) if value else "None"
+                gen_table.add_row(key, str(value))
+            console.print(gen_table)
 
     # Metrics with baseline comparison (percentage changes from actual measurements)
     metrics_table = Table(title="Performance Metrics")
