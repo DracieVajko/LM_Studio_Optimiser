@@ -1,0 +1,38 @@
+# Virtualenvs
+.venv/
+venv/
+.env
+
+# Python caches / build artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+build/
+dist/
+
+# Test / lint caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Local runtime state (machine-specific, never part of a release)
+data/*.db
+data/logs/
+data/reports/
+data/presets/
+data/checkpoints/
+logs/
+results/
+*.log
+
+# Pause signal flags (live control files)
+pause_*.flag
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

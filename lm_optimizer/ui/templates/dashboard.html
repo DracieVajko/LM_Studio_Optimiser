@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LM Studio Auto Optimizer</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/css/app.css">
+</head>
+<body class="bg-gray-50 min-h-screen">
+    <div id="app">
+        <!-- Navigation -->
+        <nav class="bg-white border-b border-gray-200 sticky top-0 z-40">
+            <div class="container mx-auto px-4">
+                <div class="flex items-center justify-between h-16">
+                    <div class="flex items-center space-x-8">
+                        <a href="/" class="flex items-center space-x-2">
+                            <svg class="w-8 h-8 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path>
+                            </svg>
+                            <span class="text-xl font-bold text-gray-900">LM Optimizer</span>
+                        </a>
+                        <div class="hidden md:flex space-x-6">
+                            <a href="/" class="nav-link text-gray-600 hover:text-blue-600 font-medium">Dashboard</a>
+                            <a href="/history" class="nav-link text-gray-600 hover:text-blue-600 font-medium">History</a>
+                            <a href="/settings" class="nav-link text-gray-600 hover:text-blue-600 font-medium">Settings</a>
+                        </div>
+                    </div>
+                    <div class="flex items-center space-x-4">
+                        <span id="lm-status" class="status-badge status-offline text-sm font-medium">
+                            <span class="status-dot"></span>Disconnected
+                        </span>
+                    </div>
+                </div>
+            </div>
+        </nav>
+
+        <!-- Main Content -->
+        <main class="container mx-auto px-4 py-8" id="main-content">
+            <div class="flex justify-center py-12"><div class="spinner"></div></div>
+        </main>
+    </div>
+
+    <script>
+    // Boot reporter: if the module below fails (syntax, import, CDN),
+    // the page explains itself instead of staying blank forever.
+    window.__bootError = null;
+    window.addEventListener('error', function (e) {
+        window.__bootError = (e && e.message) || 'script error';
+        var main = document.getElementById('main-content');
+        var stillLoading = main && main.querySelector('.spinner');
+        if (stillLoading) {
+            main.innerHTML = '<div class="card"><div class="card-body text-center py-12">'
+                + '<h3 class="text-lg font-medium text-gray-900">Dashboard failed to start.</h3>'
+                + '<p class="text-sm text-gray-500 mt-1">JavaScript error: '
+                + String(window.__bootError).slice(0, 300) + '</p>'
+                + '<p class="text-xs text-gray-400 mt-2">Check DevTools console (F12), then '
+                + '<a class="underline" href="/history">History</a> or '
+                + '<a class="underline" href="/settings">Settings</a>.</p>'
+                + '<button class="btn btn-outline mt-4" onclick="window.location.reload()">Retry</button>'
+                + '</div></div>';
+        }
+    }, true);
+    window.addEventListener('unhandledrejection', function (e) {
+        var reason = (e && e.reason && (e.reason.message || e.reason)) || 'request failed';
+        console.error('Unhandled rejection:', reason);
+    });
+    // Watchdog: silent hangs (no error, no content) become a visible card.
+    setTimeout(function () {
+        var main = document.getElementById('main-content');
+        var stillLoading = main && main.querySelector('.spinner');
+        if (stillLoading && !window.__bootError) {
+            main.innerHTML = '<div class="card"><div class="card-body text-center py-12">'
+                + '<h3 class="text-lg font-medium text-gray-900">Dashboard is taking too long.</h3>'
+                + '<p class="text-sm text-gray-500 mt-1">No data arrived within 25 seconds. '
+                + 'The server may be starting, unreachable, or a request is hanging.</p>'
+                + '<div class="mt-4 flex justify-center gap-2">'
+                + '<button class="btn btn-outline" onclick="window.location.reload()">Retry</button>'
+                + '<a class="btn btn-outline" href="/settings">Settings</a>'
+                + '</div></div></div>';
+        }
+    }, 25000);
+    </script>
+    <script type="module" src="/static/js/app.js?v=4"></script>
+</body>
+</html>
