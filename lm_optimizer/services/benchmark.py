@@ -583,6 +583,7 @@ class BenchmarkService:
                 reasoning=reasoning,
             )
             usage, output_text, stats = self._extract_response(response)
+            thinking_text = response.get("thinking_text", "") or ""
             if (
                 not output_text.strip()
                 and (reasoning in (None, "off"))
@@ -599,6 +600,7 @@ class BenchmarkService:
                     reasoning="on",
                 )
                 usage, output_text, stats = self._extract_response(response)
+                thinking_text = response.get("thinking_text", "") or ""
             if not output_text.strip():
                 # Degenerate generation (e.g. immediate EOS): must not poison
                 # speed stats with absurd tok/s from ~0 tokens.
@@ -607,6 +609,8 @@ class BenchmarkService:
                     category=case.category,
                     success=False,
                     error="Empty output",
+                    thinking_text=thinking_text,
+                    prompt=case.prompt,
                 )
 
             total_time_ms = (time.perf_counter() - start_time) * 1000
@@ -651,6 +655,8 @@ class BenchmarkService:
                 prompt_tok_s=prompt_tok_s,
                 generation_tok_s=generation_tok_s,
                 output_text=output_text,
+                thinking_text=thinking_text,
+                prompt=case.prompt,
             )
 
         except Exception as e:
@@ -725,6 +731,8 @@ class BenchmarkService:
                 prompt_tok_s=statistics.median([m.prompt_tok_s for m in successful]),
                 generation_tok_s=statistics.median([m.generation_tok_s for m in successful]),
                 output_text=best_text_run.output_text,
+                thinking_text=best_text_run.thinking_text,
+                prompt=successful[0].prompt,
             )
             aggregated.append(agg)
 

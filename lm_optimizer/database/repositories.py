@@ -439,6 +439,14 @@ class RunRepository:
             pareto_config_ids=pareto_config_ids,
         )
 
+    def count_configurations(self, run_id: str) -> int:
+        """Lightweight row count (history lists must not load full configs)."""
+        with db_manager.get_connection() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM configurations WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            return int(row[0]) if row else 0
+
     def _get_configurations(self, run_id: str) -> list[ConfigurationResult]:
         """Get all configurations for a run."""
         with db_manager.get_connection() as conn:
@@ -479,6 +487,8 @@ class RunRepository:
                     "generation_tok_s",
                     "error",
                     "output_text",
+                    "thinking_text",
+                    "prompt",
                 }
                 filtered = {k: v for k, v in m.items() if k in known}
                 metrics.append(BenchmarkMetrics(**filtered))
@@ -536,6 +546,8 @@ class ConfigurationRepository:
                     "generation_tok_s": m.generation_tok_s,
                     "error": m.error,
                     "output_text": m.output_text,
+                    "thinking_text": m.thinking_text,
+                    "prompt": m.prompt,
                 }
                 for m in config.metrics
             ]
@@ -666,6 +678,8 @@ class ConfigurationRepository:
                     "generation_tok_s",
                     "error",
                     "output_text",
+                    "thinking_text",
+                    "prompt",
                 }
                 filtered = {k: v for k, v in m.items() if k in known}
                 metrics.append(BenchmarkMetrics(**filtered))
@@ -881,6 +895,69 @@ class SettingsRepository:
             }
 
 
+class DuelRepository:
+    """Model-vs-model sandbox duels (own table, never mixed with runs)."""
+
+    def save(self, duel: dict) -> str:
+        """Insert or update a duel by id."""
+        with db_manager.get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO duels (id, kind, model_a, model_b, prompt, status,
+                                   faster, result_json, error, completed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET kind = ?, model_a = ?, model_b = ?,
+                    prompt = ?, status = ?, faster = ?, result_json = ?,
+                    error = ?, completed_at = ?
+                """,
+                (
+                    duel["id"], duel.get("kind", "text"), duel["model_a"], duel["model_b"],
+                    duel.get("prompt", ""), duel.get("status", "running"),
+                    duel.get("faster"), duel.get("result_json"), duel.get("error"),
+                    duel.get("completed_at"),
+                    duel.get("kind", "text"), duel["model_a"], duel["model_b"],
+                    duel.get("prompt", ""), duel.get("status", "running"),
+                    duel.get("faster"), duel.get("result_json"), duel.get("error"),
+                    duel.get("completed_at"),
+                ),
+            )
+        return duel["id"]
+
+    @staticmethod
+    def _row_to_duel(row: sqlite3.Row) -> dict:
+        return {
+            "id": row["id"],
+            "kind": row["kind"],
+            "model_a": row["model_a"],
+            "model_b": row["model_b"],
+            "prompt": row["prompt"],
+            "status": row["status"],
+            "faster": row["faster"],
+            "result_json": row["result_json"],
+            "error": row["error"],
+            "created_at": row["created_at"],
+            "completed_at": row["completed_at"],
+        }
+
+    def get(self, job_id: str) -> dict | None:
+        with db_manager.get_connection() as conn:
+            row = conn.execute("SELECT * FROM duels WHERE id = ?", (job_id,)).fetchone()
+            return self._row_to_duel(row) if row else None
+
+    def list_all(self, limit: int = 50, offset: int = 0) -> list[dict]:
+        with db_manager.get_connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM duels ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+                (limit, offset),
+            ).fetchall()
+            return [self._row_to_duel(r) for r in rows]
+
+    def delete(self, job_id: str) -> bool:
+        with db_manager.get_connection() as conn:
+            cursor = conn.execute("DELETE FROM duels WHERE id = ?", (job_id,))
+            return cursor.rowcount > 0
+
+
 # Global repositories
 hardware_repo = HardwareRepository()
 model_repo = ModelRepository()
@@ -889,3 +966,4 @@ config_repo = ConfigurationRepository()
 preset_repo = PresetRepository()
 settings_repo = SettingsRepository()
 capability_repo = CapabilityRepository()
+duel_repo = DuelRepository()

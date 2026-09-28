@@ -9,6 +9,10 @@ from fastapi.responses import JSONResponse
 from lm_optimizer.api.schemas import (
     AdvancedSettingsSchema,
     ApplyConfigRequest,
+    CompareRequest,
+    CompareResponse,
+    SandboxRequest,
+    SandboxResponse,
     ConfigurationResultResponse,
     GPUInfoSchema,
     HardwareInfoSchema,
@@ -23,6 +27,7 @@ from lm_optimizer.api.schemas import (
 )
 from lm_optimizer.database.repositories import (
     config_repo,
+    duel_repo,
     preset_repo,
     run_repo,
     settings_repo,
@@ -50,15 +55,45 @@ router = APIRouter()
 _current_optimizer: AdaptiveOptimizer | None = None
 _current_run_id: UUID | None = None
 
+# In-memory A/B compare jobs (short-lived; polling via GET /compare/{id}).
+_compare_jobs: dict[str, dict] = {}
+
+# In-memory sandbox duels (files persist under results/sandbox/{job_id}/).
+_sandbox_jobs: dict[str, dict] = {}
+
 
 def get_lm_studio_url() -> str:
     """Get LM Studio URL from settings."""
     return settings_repo.get("lm_studio_url", "http://127.0.0.1:1234")
 
 
-async def get_lm_client() -> LMStudioClient:
-    """Get or create LM Studio client."""
-    client = await create_client(get_lm_studio_url())
+async def warm_capability_cache() -> bool:
+    """One load-free connect at startup so later requests hit the caps cache.
+
+    Never raises: a down LM Studio must not prevent server startup.
+    """
+    try:
+        client = await get_lm_client(echo_probe=False)
+        try:
+            return True
+        finally:
+            try:
+                await client.close()
+            except Exception:
+                pass
+    except Exception as e:
+        logger.warning("Startup capability warmup skipped", error=str(e)[:160])
+        return False
+
+
+async def get_lm_client(echo_probe: bool = True) -> LMStudioClient:
+    """Get or create LM Studio client.
+
+    Read-only endpoints (status/models/connect-test) must pass
+    echo_probe=False: the echo phase loads a real model, which takes
+    far longer than the UI timeout and disturbs loaded models.
+    """
+    client = await create_client(get_lm_studio_url(), echo_probe=echo_probe)
     return client
 
 
@@ -122,7 +157,28 @@ def _convert_config(c: LoadConfiguration) -> LoadConfigSchema:
     )
 
 
-def _convert_run(r) -> OptimizationRunResponse:
+STALE_NONTERMINAL = frozenset({"running", "resumed"})
+STALE_AFTER_SECONDS = 2 * 3600
+
+
+def _is_stale_run(run_id, status_value: str) -> bool:
+    """A running/resumed run with no fresh checkpoint is dead (killed process)."""
+    if str(status_value or "").lower() not in STALE_NONTERMINAL:
+        return False
+    try:
+        from lm_optimizer.storage.run_checkpoint import checkpoint_path as _cp
+
+        p = _cp(str(run_id))
+        if not p.exists():
+            return True
+        import time as _time
+
+        return (_time.time() - p.stat().st_mtime) > STALE_AFTER_SECONDS
+    except Exception:
+        return False
+
+
+def _convert_run(r, config_count: int = 0, stale: bool = False) -> OptimizationRunResponse:
     pab = (r.benchmark_params or {}).get("phase_ab") or {}
     raw_id = pab.get("raw_fastest_id")
     try:
@@ -156,6 +212,8 @@ def _convert_run(r) -> OptimizationRunResponse:
         phase_b_enabled=bool(pab.get("phase_b_enabled", getattr(r, "phase_b_enabled", False))),
         phase_b_result=pab.get("phase_b_result", getattr(r, "phase_b_result", None)),
         pause=pab.get("pause"),
+        config_count=int(config_count),
+        stale=bool(stale),
     )
 
 
@@ -203,6 +261,8 @@ def _convert_config_result(c: ConfigurationResult) -> ConfigurationResultRespons
                 "generation_tok_s": m.generation_tok_s,
                 "error": m.error,
                 "output_text": m.output_text[:200] if m.output_text else "",
+                "thinking_text": (m.thinking_text or "")[:2000],
+                "prompt": (m.prompt or "")[:4000],
             }
             for m in c.metrics
         ],
@@ -213,6 +273,7 @@ def _convert_config_result(c: ConfigurationResult) -> ConfigurationResultRespons
         error=c.error,
         score=c.score,
         score_breakdown=c.score_breakdown,
+        generation=c.generation,
         score_weights=(c.generation or {}).get("score_weights"),
         tested_at=c.tested_at,
         duration_ms=c.duration_ms,
@@ -249,37 +310,58 @@ from datetime import datetime
 
 @router.get("/status")
 async def get_status():
-    """Get system status."""
+    """Get system status (degrades to disconnected when LM Studio is down)."""
     hardware = hardware_detector.detect()
-    client = await get_lm_client()
-    lm_connected = await client.health_check()
-    await client.close()
+    url = get_lm_studio_url()
 
-    # Get currently loaded model
-    loaded_model = None
-    if lm_connected:
-        client = await get_lm_client()
-        models = await client.list_models()
-        loaded = [m for m in models if m.id in client._loaded_models]
-        if loaded:
-            loaded_model = _convert_model(loaded[0])
-        await client.close()
+    def _offline():
+        return {
+            "lm_studio": {"connected": False, "url": url, "loaded_model": None},
+            "hardware": _convert_hardware(hardware),
+        }
 
-    return {
-        "lm_studio": {
-            "connected": lm_connected,
-            "url": get_lm_studio_url(),
-            "loaded_model": loaded_model,
-        },
-        "hardware": _convert_hardware(hardware),
-    }
+    try:
+        client = await get_lm_client(echo_probe=False)
+    except Exception as e:
+        logger.warning("LM Studio unreachable for /status", error=str(e)[:160])
+        return _offline()
+    try:
+        try:
+            lm_connected = await client.health_check()
+        except Exception:
+            lm_connected = False
+
+        # Get currently loaded model
+        loaded_model = None
+        if lm_connected:
+            try:
+                models = await client.list_models()
+                loaded = [m for m in models if m.id in client._loaded_models]
+                if loaded:
+                    loaded_model = _convert_model(loaded[0])
+            except Exception:
+                pass
+
+        return {
+            "lm_studio": {
+                "connected": bool(lm_connected),
+                "url": url,
+                "loaded_model": loaded_model,
+            },
+            "hardware": _convert_hardware(hardware),
+        }
+    finally:
+        try:
+            await client.close()
+        except Exception:
+            pass
 
 
 @router.post("/connect")
 async def connect_lm_studio(url: str):
     """Test connection to LM Studio."""
     try:
-        client = await create_client(url)
+        client = await create_client(url, echo_probe=False)
         await client.close()
         # Update setting
         settings_repo.set("lm_studio_url", url)
@@ -295,19 +377,29 @@ async def connect_lm_studio(url: str):
 
 @router.get("/models")
 async def list_models():
-    """List all available models from LM Studio."""
-    client = await get_lm_client()
+    """List all available models from LM Studio (empty when unreachable)."""
     try:
-        models = await client.list_models()
+        client = await get_lm_client(echo_probe=False)
+    except Exception as e:
+        logger.warning("LM Studio unreachable for /models", error=str(e)[:160])
+        return {"models": []}
+    try:
+        try:
+            models = await client.list_models()
+        except Exception:
+            return {"models": []}
         return {"models": [_convert_model(m) for m in models]}
     finally:
-        await client.close()
+        try:
+            await client.close()
+        except Exception:
+            pass
 
 
 @router.get("/models/{model_id}")
 async def get_model(model_id: str):
     """Get model details."""
-    client = await get_lm_client()
+    client = await get_lm_client(echo_probe=False)
     try:
         model = await client.get_model(model_id)
         if not model:
@@ -651,14 +743,79 @@ async def get_optimization_progress(run_id: UUID):
 # ============================================================
 
 
+def _safe_convert_run(r):
+    """Convert one run; unreadable rows are skipped (never kill the list)."""
+    try:
+        return _convert_run(r)
+    except Exception as e:
+        logger.warning("Skipping unreadable run row", error=str(e)[:160])
+        return None
+
+
+def _safe_convert_config(c):
+    """Convert one config; unreadable rows are skipped (never kill the list)."""
+    try:
+        return _convert_config_result(c)
+    except Exception as e:
+        logger.warning("Skipping unreadable config row", error=str(e)[:160])
+        return None
+
+
+def _enrich_config_detail(conv: dict, config, model_id: str) -> dict:
+    """Single-config detail: full outputs + recomputed per-test quality.
+
+    Heuristic quality is deterministic, so per-test scores are recomputed
+    from stored outputs (only aggregates are persisted). Never raises:
+    on any failure the truncated list view is kept.
+    """
+    try:
+        from lm_optimizer.services.quality import QualityEvaluator
+
+        full = {m.test_name: m.output_text or "" for m in (config.metrics or [])}
+        ev = QualityEvaluator()
+        for m in conv.get("metrics", []):
+            try:
+                name = m.get("test_name", "")
+                if name in full:
+                    m["output_text"] = full[name]
+                    if full[name]:
+                        q = ev.evaluate(model_id, name, full[name])
+                        m["quality_overall"] = round(q.overall, 3)
+                src = next((x for x in (config.metrics or []) if x.test_name == name), None)
+                if src is not None:
+                    if getattr(src, "thinking_text", ""):
+                        m["thinking_text"] = src.thinking_text
+                    if getattr(src, "prompt", ""):
+                        m["prompt"] = src.prompt
+            except Exception:
+                continue
+    except Exception as e:
+        logger.warning("Detail enrich failed", error=str(e)[:160])
+    return conv
+
+
 @router.get("/runs")
 async def list_runs(limit: int = 50, offset: int = 0, model_id: str | None = None):
-    """List optimization runs."""
+    """List optimization runs (corrupt rows skipped, counted)."""
     if model_id:
         runs = run_repo.get_by_model(model_id, limit)
     else:
         runs = run_repo.list_all(limit, offset)
-    return {"runs": [_convert_run(r) for r in runs]}
+    kept, skipped = [], 0
+    for r in runs:
+        try:
+            n = run_repo.count_configurations(str(r.id))
+        except Exception:
+            n = 0
+        stale = _is_stale_run(getattr(r, "id", None), getattr(getattr(r, "status", None), "value", ""))
+        c = _safe_convert_run(r)
+        if c is None:
+            skipped += 1
+        else:
+            c.config_count = n
+            c.stale = stale
+            kept.append(c)
+    return {"runs": kept, "skipped": skipped}
 
 
 @router.get("/runs/{run_id}", response_model=OptimizationRunResponse)
@@ -667,27 +824,47 @@ async def get_run(run_id: UUID):
     run = run_repo.get(str(run_id))
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
-    return _convert_run(run)
+    try:
+        n = run_repo.count_configurations(str(run_id))
+    except Exception:
+        n = len(run.configurations or [])
+    stale = _is_stale_run(str(run_id), getattr(getattr(run, "status", None), "value", ""))
+    return _convert_run(run, config_count=n, stale=stale)
 
 
 @router.get("/runs/{run_id}/configurations")
 async def list_configurations(run_id: UUID):
-    """List all configurations for a run."""
+    """List all configurations for a run (corrupt rows skipped, counted)."""
     run = run_repo.get(str(run_id))
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
-    return {"configurations": [_convert_config_result(c) for c in run.configurations]}
+    kept, skipped = [], 0
+    for c in run.configurations:
+        conv = _safe_convert_config(c)
+        if conv is None:
+            skipped += 1
+        else:
+            kept.append(conv)
+    return {"configurations": kept, "skipped": skipped}
 
 
 @router.get(
-    "/api/runs/{run_id}/configurations/{config_id}", response_model=ConfigurationResultResponse
+    "/runs/{run_id}/configurations/{config_id}", response_model=ConfigurationResultResponse
 )
 async def get_configuration(run_id: UUID, config_id: UUID):
-    """Get configuration result details."""
+    """Get configuration result details (full outputs, per-test quality)."""
     config = config_repo.get(str(config_id))
     if not config or str(config.run_id) != str(run_id):
         raise HTTPException(status_code=404, detail="Configuration not found")
-    return _convert_config_result(config)
+    conv = _convert_config_result(config)
+    model_id = ""
+    try:
+        run = run_repo.get(str(run_id))
+        if run is not None and getattr(run, "model", None) is not None:
+            model_id = run.model.id or ""
+    except Exception:
+        pass
+    return _enrich_config_detail(conv.model_dump(), config, model_id)
 
 
 @router.get("/runs/{run_id}/pareto")
@@ -698,7 +875,8 @@ async def get_pareto_frontier(run_id: UUID):
         raise HTTPException(status_code=404, detail="Run not found")
 
     pareto = run.get_pareto_configs()
-    return {"configurations": [_convert_config_result(c) for c in pareto]}
+    kept = [c for c in (_safe_convert_config(x) for x in pareto) if c is not None]
+    return {"configurations": kept}
 
 
 # ============================================================
@@ -708,9 +886,17 @@ async def get_pareto_frontier(run_id: UUID):
 
 @router.post("/apply")
 async def apply_configuration(request: ApplyConfigRequest):
-    """Apply a configuration to LM Studio."""
-    client = await get_lm_client()
+    """Apply a configuration to LM Studio (one-shot load, not a saved default)."""
+    client = await get_lm_client(echo_probe=False)
     try:
+        try:
+            model = await client.get_model(request.model_id)
+        except Exception:
+            model = None
+        if not model:
+            raise HTTPException(
+                status_code=404, detail=f"Model '{request.model_id}' not found in LM Studio"
+            )
         result = await client.load_model(
             request.model_id, LoadConfiguration(**request.config.dict())
         )
@@ -718,7 +904,10 @@ async def apply_configuration(request: ApplyConfigRequest):
             raise HTTPException(status_code=400, detail=result.error or "Failed to load model")
         return {"success": True, "identifier": result.identifier}
     finally:
-        await client.close()
+        try:
+            await client.close()
+        except Exception:
+            pass
 
 
 @router.post("/restore/{model_id}")
@@ -893,6 +1082,342 @@ def generate_markdown_report(run) -> str:
         )
 
     return "\n".join(lines)
+
+
+@router.post("/compare", response_model=CompareResponse)
+async def start_compare(request: CompareRequest, background_tasks: BackgroundTasks):
+    """Start an A/B comparison of two configs on the SAME tests."""
+    import uuid
+
+    from lm_optimizer.services.compare import parse_compare_cases
+
+    if request.tests is not None:
+        try:
+            parse_compare_cases({"tests": [t.model_dump() for t in request.tests]})
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    compare_id = str(uuid.uuid4())
+    _compare_jobs[compare_id] = {"status": "running", "verdict": None, "result": None, "error": None}
+    background_tasks.add_task(_run_compare_task, compare_id, request)
+    return CompareResponse(compare_id=compare_id, status="running")
+
+
+@router.get("/compare/{compare_id}", response_model=CompareResponse)
+async def get_compare(compare_id: str):
+    """Poll an A/B comparison result."""
+    job = _compare_jobs.get(compare_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Compare job not found")
+    return CompareResponse(compare_id=compare_id, **job)
+
+
+async def _run_compare_task(compare_id: str, request: CompareRequest) -> None:
+    """Background A/B task: same tests on A then B, partial-safe."""
+    try:
+        from lm_optimizer.services.compare import CompareCase, run_ab_compare
+
+        client = await get_lm_client()
+        try:
+            cfg_a = LoadConfiguration(**request.config_a.model_dump(exclude_none=True))
+            cfg_b = LoadConfiguration(**request.config_b.model_dump(exclude_none=True))
+            cases = (
+                [CompareCase(**t.model_dump()) for t in request.tests]
+                if request.tests
+                else None
+            )
+            res = await run_ab_compare(
+                client,
+                request.model_id,
+                cfg_a,
+                cfg_b,
+                cases,
+                repetitions=request.repetitions,
+                context_length=request.context_length,
+            )
+            _compare_jobs[compare_id] = {
+                "status": "done",
+                "verdict": res.verdict,
+                "result": res.to_dict(),
+                "error": None,
+            }
+        finally:
+            try:
+                await client.close()
+            except Exception:
+                pass
+    except Exception as e:
+        _compare_jobs[compare_id] = {
+            "status": "failed",
+            "verdict": None,
+            "result": None,
+            "error": f"{type(e).__name__}: {e}"[:300],
+        }
+
+
+@router.post("/sandbox", response_model=SandboxResponse)
+async def start_sandbox(request: SandboxRequest, background_tasks: BackgroundTasks):
+    """Start a model-vs-model duel (text / html / scene). Sequential A then B."""
+    import uuid
+
+    try:
+        client = await get_lm_client(echo_probe=False)
+    except Exception as e:
+        raise HTTPException(
+            status_code=503, detail=f"LM Studio unreachable: {str(e)[:160]}"
+        )
+    try:
+        for mid in (request.model_a, request.model_b):
+            try:
+                found = await client.get_model(mid)
+            except Exception:
+                found = None
+            if not found:
+                raise HTTPException(status_code=404, detail=f"Model '{mid}' not found")
+    finally:
+        try:
+            await client.close()
+        except Exception:
+            pass
+
+    job_id = uuid.uuid4().hex[:12]
+    _sandbox_jobs[job_id] = {"status": "running", "kind": request.kind.value, "result": None, "error": None}
+    try:
+        duel_repo.save({
+            "id": job_id, "kind": request.kind.value, "model_a": request.model_a,
+            "model_b": request.model_b, "prompt": request.prompt, "status": "running",
+            "faster": None, "result_json": None, "error": None, "completed_at": None,
+        })
+    except Exception as e:
+        logger.warning("Duel history save failed (job still runs)", error=str(e)[:160])
+    background_tasks.add_task(_run_sandbox_task, job_id, request)
+    return SandboxResponse(job_id=job_id, status="running", kind=request.kind.value)
+
+
+@router.get("/sandbox/{job_id}", response_model=SandboxResponse)
+async def get_sandbox(job_id: str):
+    """Poll a sandbox duel result (in-memory first, history fallback)."""
+    import json as _json
+
+    job = _sandbox_jobs.get(job_id)
+    if job:
+        return SandboxResponse(job_id=job_id, **job)
+    try:
+        row = duel_repo.get(job_id)
+    except Exception:
+        row = None
+    if not row:
+        raise HTTPException(status_code=404, detail="Sandbox job not found")
+    result = None
+    if row.get("result_json"):
+        try:
+            result = _json.loads(row["result_json"])
+        except Exception:
+            result = None
+    return SandboxResponse(
+        job_id=job_id, status=row.get("status", "done"),
+        kind=row.get("kind", "text"), result=result, error=row.get("error"),
+    )
+
+
+@router.get("/duels")
+async def list_duels(limit: int = 50, offset: int = 0):
+    """Duel history (summaries; full result via single get)."""
+    import time as _time
+
+    def _stale(r: dict) -> bool:
+        if str(r.get("status", "")).lower() not in ("running",):
+            return False
+        try:
+            from datetime import datetime as _dt
+
+            created = _dt.fromisoformat(str(r.get("created_at", "")).replace("Z", ""))
+            return (_time.time() - created.timestamp()) > 6 * 3600
+        except Exception:
+            return False
+
+    rows = duel_repo.list_all(limit, offset)
+    out = []
+    for r in rows:
+        d = {k: r[k] for k in (
+            "id", "kind", "model_a", "model_b", "status", "faster",
+            "error", "created_at", "completed_at",
+        ) if k in r}
+        d["prompt"] = (r.get("prompt") or "")[:300]
+        d["stale"] = _stale(r)
+        out.append(d)
+    return {"duels": out}
+
+
+@router.get("/duels/{job_id}")
+async def get_duel(job_id: str):
+    """Full duel record including result."""
+    try:
+        row = duel_repo.get(job_id)
+    except Exception:
+        row = None
+    if not row:
+        raise HTTPException(status_code=404, detail="Duel not found")
+    return row
+
+
+def _duel_files_dir(job_id: str):
+    """Sandbox file root (module attr: monkeypatchable in tests)."""
+    from lm_optimizer.services import sandbox as _sb
+
+    return _sb.DEFAULT_SANDBOX_ROOT / job_id
+
+
+@router.delete("/duels/{job_id}")
+async def delete_duel(job_id: str):
+    """Delete a duel record plus its generated files."""
+    import shutil
+
+    try:
+        shutil.rmtree(_duel_files_dir(job_id), ignore_errors=True)
+    except Exception:
+        pass
+    try:
+        gone = duel_repo.delete(job_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Delete failed: {str(e)[:160]}")
+    _sandbox_jobs.pop(job_id, None)
+    if not gone:
+        raise HTTPException(status_code=404, detail="Duel not found")
+    return {"success": True, "id": job_id}
+
+
+@router.delete("/runs/{run_id}")
+async def delete_run(run_id: UUID):
+    """Delete a run (refuses live or fresh non-terminal runs)."""
+    try:
+        run = run_repo.get(str(run_id))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lookup failed: {str(e)[:160]}")
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    status_value = getattr(getattr(run, "status", None), "value", "")
+    if str(run_id) == str(_current_run_id) or (
+        str(status_value).lower() in ("running", "resumed")
+        and not _is_stale_run(str(run_id), status_value)
+    ):
+        raise HTTPException(status_code=409, detail="Run is active; pause/cancel first")
+    try:
+        ok = run_repo.delete(str(run_id))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Delete failed: {str(e)[:160]}")
+    if not ok:
+        raise HTTPException(status_code=404, detail="Run not found")
+    try:
+        from lm_optimizer.storage.run_checkpoint import remove_checkpoint as _rm
+
+        _rm(str(run_id))
+    except Exception:
+        pass
+    return {"success": True, "id": str(run_id)}
+
+
+@router.post("/runs/{run_id}/abandon")
+async def abandon_run(run_id: UUID, force: bool = False):
+    """Mark a dead non-terminal run INTERRUPTED (keeps it in history).
+
+    Refuses live runs (fresh checkpoint or current) and terminal states
+    unless force=1. Stale running/resumed processes are the main target.
+    """
+    from datetime import datetime
+
+    try:
+        run = run_repo.get(str(run_id))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lookup failed: {str(e)[:160]}")
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    status_value = str(getattr(getattr(run, "status", None), "value", "")).lower()
+    terminal = status_value not in ("running", "resumed", "paused", "pending")
+    if terminal and not force:
+        raise HTTPException(status_code=409, detail=f"Run is already {status_value}")
+    if not force and (
+        str(run_id) == str(_current_run_id)
+        or (
+            status_value in ("running", "resumed")
+            and not _is_stale_run(str(run_id), status_value)
+        )
+    ):
+        raise HTTPException(status_code=409, detail="Run looks alive; pause/cancel first")
+    try:
+        run.status = RunStatus.INTERRUPTED
+        run.completed_at = datetime.now()
+        run.error = ((run.error + "; " if getattr(run, "error", None) else "")
+                     + "abandoned: process gone, no fresh checkpoint")
+        run_repo.save(run)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Abandon failed: {str(e)[:160]}")
+    try:
+        from lm_optimizer.storage.run_checkpoint import remove_checkpoint as _rm
+
+        _rm(str(run_id))
+    except Exception:
+        pass
+    return {"success": True, "id": str(run_id), "status": "interrupted"}
+
+
+def _persist_duel(job_id: str, request: SandboxRequest, status: str,
+                  result_json: str | None, error: str | None,
+                  faster: str | None = None) -> None:
+    """Best-effort duel history write (never breaks the duel itself)."""
+    try:
+        from datetime import datetime
+
+        duel_repo.save({
+            "id": job_id, "kind": request.kind.value, "model_a": request.model_a,
+            "model_b": request.model_b, "prompt": request.prompt, "status": status,
+            "faster": faster, "result_json": result_json, "error": error,
+            "completed_at": datetime.now().isoformat() if status != "running" else None,
+        })
+    except Exception as e:
+        logger.warning("Duel history update failed", error=str(e)[:160])
+
+
+async def _run_sandbox_task(job_id: str, request: SandboxRequest) -> None:
+    """Background duel: A, unload, B. Files land in results/sandbox/{job}/."""
+    import json as _json
+
+    try:
+        from lm_optimizer.services.sandbox import run_duel
+
+        client = await get_lm_client(echo_probe=False)
+        try:
+            res = await run_duel(
+                client,
+                request.model_a,
+                request.model_b,
+                request.prompt,
+                kind=request.kind.value,
+                timeout_s=request.timeout_s,
+                job_id=job_id,
+            )
+            _sandbox_jobs[job_id] = {
+                "status": "done",
+                "kind": request.kind.value,
+                "result": res.to_dict(),
+                "error": None,
+            }
+            _persist_duel(job_id, request, "done", _json.dumps(res.to_dict()), None,
+                          faster=res.faster)
+        finally:
+            try:
+                await client.close()
+            except Exception:
+                pass
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"[:300]
+        _sandbox_jobs[job_id] = {
+            "status": "failed",
+            "kind": request.kind.value,
+            "result": None,
+            "error": err,
+        }
+        _persist_duel(job_id, request, "failed", None, err)
 
 
 # Import logger

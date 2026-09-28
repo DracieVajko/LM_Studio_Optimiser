@@ -748,11 +748,14 @@ export const UI = {
             <div class="modal-content">
                 <div class="modal-header">
                     <h3 class="text-lg font-semibold">${title}</h3>
-                    <button onclick="UI.closeModal()" class="text-gray-400 hover:text-gray-600 text-2xl">&times;</button>
+                    <button class="modal-x text-gray-400 hover:text-gray-600 text-2xl" aria-label="Close">&times;</button>
                 </div>
                 <div class="modal-body">${content}</div>
             </div>
         `;
+        // Module scope: no inline onclick (it cannot see this object).
+        modal.querySelector('.modal-x').addEventListener('click', () => this.closeModal());
+        modal.querySelector('.modal-content').addEventListener('click', (e) => e.stopPropagation());
         document.body.appendChild(modal);
     },
 };

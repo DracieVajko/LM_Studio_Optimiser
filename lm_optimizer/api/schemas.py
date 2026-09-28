@@ -147,6 +147,8 @@ class OptimizationRunResponse(BaseModel):
     phase_b_enabled: bool = False
     phase_b_result: dict | None = None
     pause: dict | None = None
+    config_count: int = 0
+    stale: bool = False
 
 
 class ConfigurationResultResponse(BaseModel):
@@ -161,8 +163,10 @@ class ConfigurationResultResponse(BaseModel):
     peak_vram_gb: float | None = None
     peak_ram_gb: float | None = None
     error: str | None = None
-    score: float = 0.0
+    # None = scoreless by design (speed probes, quality-failed): listed, never wins.
+    score: float | None = None
     score_breakdown: dict | None = None
+    generation: dict | None = None
     score_weights: dict | None = None
     tested_at: datetime | None = None
     duration_ms: float = 0.0
@@ -216,3 +220,50 @@ class SettingsSchema(BaseModel):
 class ApplyConfigRequest(BaseModel):
     model_id: str
     config: LoadConfigSchema
+
+
+class CompareTestSchema(BaseModel):
+    name: str
+    prompt: str
+    max_tokens: int = 256
+    temperature: float = 0.3
+    category: str = "custom"
+
+
+class CompareRequest(BaseModel):
+    model_id: str
+    config_a: LoadConfigSchema
+    config_b: LoadConfigSchema
+    tests: list[CompareTestSchema] | None = None
+    repetitions: int = Field(default=2, ge=1, le=5)
+    context_length: int = Field(default=2048, ge=256, le=131072)
+
+
+class CompareResponse(BaseModel):
+    compare_id: str
+    status: str  # running | done | failed
+    verdict: str | None = None
+    result: dict | None = None
+    error: str | None = None
+
+
+class SandboxKind(str, Enum):
+    TEXT = "text"
+    HTML = "html"
+    SCENE = "scene"
+
+
+class SandboxRequest(BaseModel):
+    model_a: str
+    model_b: str
+    prompt: str = Field(min_length=1, max_length=8000)
+    kind: SandboxKind = SandboxKind.TEXT
+    timeout_s: float = Field(default=600, ge=30, le=3600)
+
+
+class SandboxResponse(BaseModel):
+    job_id: str
+    status: str  # running | done | failed
+    kind: str
+    result: dict | None = None
+    error: str | None = None

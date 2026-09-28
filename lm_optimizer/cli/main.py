@@ -2454,5 +2454,113 @@ def _display_optimization_result(run):
         console.print(pf_table)
 
 
+def _display_compare_result(res) -> None:
+    """Display A/B compare verdict (ASCII only for Windows console)."""
+    from lm_optimizer.services.compare import CompareResult
+
+    assert isinstance(res, CompareResult)
+    console.print(Panel.fit(f"[bold]Compare Result: {res.model_id}[/bold]"))
+    console.print(f"Tests: {', '.join(res.cases) or 'none'}")
+
+    table = Table(title="A vs B")
+    table.add_column("Metric", style="cyan")
+    table.add_column("A", justify="right", style="green")
+    table.add_column("B", justify="right", style="yellow")
+    table.add_row(
+        "Status",
+        "OK" if res.side_a_ok else f"FAIL ({res.error_a or '?'})",
+        "OK" if res.side_b_ok else f"FAIL ({res.error_b or '?'})",
+    )
+    table.add_row("Generation tok/s", f"{res.speed_a:.1f}", f"{res.speed_b:.1f}")
+    table.add_row(
+        "Correctness",
+        f"{res.quality_a:.3f}" if res.quality_a is not None else "N/A",
+        f"{res.quality_b:.3f}" if res.quality_b is not None else "N/A",
+    )
+    console.print(table)
+
+    summary = Table(title="Verdict")
+    summary.add_column("Metric", style="cyan")
+    summary.add_column("Value", style="green")
+    summary.add_row("Speed winner", str(res.speed_winner or "N/A"))
+    summary.add_row("Quality winner", str(res.quality_winner or "N/A"))
+    summary.add_row("Delta A-B", f"{res.delta_tok_s:.1f} tok/s")
+    if res.speedup:
+        summary.add_row("Speedup A/B", f"{res.speedup:.2f}x")
+    summary.add_row("Verdict", res.verdict)
+    console.print(summary)
+
+
+@app.command()
+def compare(
+    model: str = typer.Argument(..., help="Model ID to compare on"),
+    config_a: Path = typer.Option(..., "--config-a", help="Side A config JSON file"),
+    config_b: Path = typer.Option(..., "--config-b", help="Side B config JSON file"),
+    tests: Path | None = typer.Option(
+        None, "--tests", help="Custom tests JSON file (default: 5 campaign tests)"
+    ),
+    context: int = typer.Option(2048, "--context", "-c", help="Context length for both sides"),
+    repetitions: int = typer.Option(2, "--repetitions", "-r", help="Repetitions per test"),
+):
+    """Compare two load configs on the SAME tests (A/B verdict)."""
+    from lm_optimizer.services.compare import (
+        default_compare_cases,
+        load_compare_cases_file,
+        load_config_file,
+        run_ab_compare,
+    )
+
+    setup_logging()
+
+    async def _compare():
+        client = get_client()
+        try:
+            await client.connect()
+            snap = await prepare_host(client, purpose="compare")
+            for line in format_snapshot(snap):
+                console.print(f"  {line}")
+            if not snap.get("verified_empty") and snap.get("leftovers"):
+                console.print("[red]Stale models loaded, aborting. Unload them first.[/red]")
+                sys.exit(1)
+
+            try:
+                cfg_a = load_config_file(config_a)
+            except ValueError as e:
+                console.print(f"[red]Side A config error: {e}[/red]")
+                sys.exit(1)
+            try:
+                cfg_b = load_config_file(config_b)
+            except ValueError as e:
+                console.print(f"[red]Side B config error: {e}[/red]")
+                sys.exit(1)
+            if tests is not None:
+                try:
+                    cases = load_compare_cases_file(tests)
+                except ValueError as e:
+                    console.print(f"[red]Tests file error: {e}[/red]")
+                    sys.exit(1)
+            else:
+                cases = default_compare_cases()
+
+            with console.status("Running A/B comparison..."):
+                res = await run_ab_compare(
+                    client, model, cfg_a, cfg_b, cases,
+                    repetitions=repetitions, context_length=context,
+                )
+            _display_compare_result(res)
+            if not res.side_a_ok and not res.side_b_ok:
+                sys.exit(1)
+        except SystemExit:
+            raise
+        except Exception as e:
+            logger.exception("Compare failed")
+            console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
+        finally:
+            await client.close()
+
+    asyncio.run(_compare())
+
+
 if __name__ == "__main__":
     app()

@@ -159,6 +159,26 @@ Physical end-to-end LM Studio validation is still pending.
 - **Version**: Bumped `0.1.0 → 1.0.0-beta` (PEP 440 `1.0.0b0` in package) across `pyproject.toml`, `__init__.py`, `api/main.py`, `domain/models.py`.
 - **Tests & CI**: Added smoke tests for URL, disconnected LM Studio, model/profile selection, preset compatibility, DB init; `pytest 61 passed`, `ruff check`, `mypy`, `compileall` clean.
 
+## [1.1.0] - 2026-09-28
+
+### Added
+- **Model sandbox (`/sandbox`)**: text / HTML / 3D-scene duels model-vs-model (sequential with unload, server defaults), isolated output folders, iframe preview + file links, preset prompts per kind, model dropdowns.
+- **Duel history**: `duels` table (migration 10), `GET /api/duels`, per-duel view, `DELETE` incl. files; History page section with bulk cleanup.
+- **Run lifecycle**: `DELETE /api/runs/{id}` (guarded), `POST /api/runs/{id}/abandon` (dead runs → INTERRUPTED), `config_count` + `stale` flags, per-row Abandon/Delete buttons.
+- **Results transparency**: per-test Prompt/Thinking/Output blocks with token counts, `thinking_text` plumbing (client → benchmark → DB → API → UI), full config detail + standalone JSON page, truthful zero-pass reasons incl. quality_rejected.
+- **Dark mode**: OS-following with toggle, chart theming, contrast-checked overrides.
+- **Nav unification**: identical header (logo, links, theme, status badge) on all pages; shared status poller.
+
+### Changed
+- Read-only API endpoints are load-free (`echo_probe=False`): `/api/status` ~0.5 s instead of timeouts; capability probing cached per server + warmed at startup.
+- `/api/runs` lists skip corrupt rows (counted); scoreless configs serialize (`score: null`) instead of killing the endpoint.
+- Apply is validated (404 unknown model), load-free, with one-shot confirmation.
+
+### Fixed
+- `websocket.js` class/comma SyntaxError whitescreening dashboard+results; JS syntax regression test over all UI scripts.
+- Recommended card and table reading config from wrong level (always OFF/CPU/Auto); comparison modal X button (module-scope handler).
+- Double-prefix route `/api/api/runs/...`; SPA nav hijack swallowing new pages; asset cache-busting versions.
+
 ## [Unreleased]
 
 ### Planned

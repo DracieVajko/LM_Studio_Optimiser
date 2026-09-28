@@ -38,6 +38,9 @@ logger = get_logger(__name__)
 # resolution, so unknown keys 400 without loading anything, known keys 404.
 _PROBE_MODEL = "lms-probe-nonexistent-model"
 
+# Process-wide cache of safe-phase probe results per server URL.
+_CAPS_CACHE: dict[str, dict] = {}
+
 # Slow-model allowances: big loads/generations legitimately take minutes.
 LOAD_TIMEOUT_S = 600.0
 CHAT_TIMEOUT_FLOOR_S = 300.0
@@ -207,12 +210,31 @@ class LMStudioClient:
         return self._capabilities
 
     async def _detect_capabilities(self) -> None:
-        """Detect LM Studio API version and capabilities."""
+        """Detect LM Studio API version and capabilities.
+
+        Safe-phase key probing is cached per server URL: capabilities do not
+        change at runtime, and re-probing (~25 requests) on every status call
+        spams the server log. The echo phase is never cached (it is skipped
+        or executed per connection as requested).
+        """
         try:
             response = await self._request_with_retry("GET", "/api/v1/models")
             response.json()  # validates shape; parse happens in list_models
             self._capabilities = LMStudioCapabilities(version="v1")
+            cache_key = (self.base_url or "").rstrip("/")
+            cached = _CAPS_CACHE.get(cache_key)
+            if cached is not None:
+                self._apply_accepted(set(cached.get("load_parameters", [])))
+                logger.debug("Capabilities from cache", base_url=self.base_url)
+                return
             await self._probe_load_parameters()
+            try:
+                _CAPS_CACHE[cache_key] = {
+                    "version": "v1",
+                    "load_parameters": sorted(self._capabilities.load_parameters),
+                }
+            except Exception:
+                pass
         except Exception as e:
             logger.warning("Failed to detect capabilities, using defaults", error=str(e))
             self._capabilities = LMStudioCapabilities(version="v1")
@@ -667,9 +689,16 @@ class LMStudioClient:
 
         parts = data.get("output") or []
         texts = [p.get("content", "") for p in parts if p.get("type") == "message"]
+        thinking_parts = [
+            p.get("content", "")
+            for p in parts
+            if p.get("type") not in ("message",) and p.get("content")
+        ]
         if not texts:
             texts = [p.get("content", "") for p in parts if p.get("content")]
+            thinking_parts = []
         text = "\n".join(texts)
+        thinking_text = "\n".join(thinking_parts)
 
         stats = data.get("stats") or {}
         prompt_tokens = int(stats.get("input_tokens", 0))
@@ -693,6 +722,7 @@ class LMStudioClient:
             },
             "system_fingerprint": None,
             "_stats": stats,
+            "thinking_text": thinking_text,
         }
 
     async def health_check(self) -> bool:

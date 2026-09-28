@@ -176,6 +176,27 @@ export const API = {
         return this.request(`/presets/${presetId}/apply`, { method: 'POST' });
     },
 
+    // Sandbox duels
+    async getDuels(limit = 50, offset = 0) {
+        return this.request(`/duels?limit=${limit}&offset=${offset}`);
+    },
+
+    async getDuel(jobId) {
+        return this.request(`/duels/${jobId}`);
+    },
+
+    async deleteDuel(jobId) {
+        return this.request(`/duels/${jobId}`, { method: 'DELETE' });
+    },
+
+    async deleteRun(runId) {
+        return this.request(`/runs/${runId}`, { method: 'DELETE' });
+    },
+
+    async abandonRun(runId) {
+        return this.request(`/runs/${runId}/abandon`, { method: 'POST' });
+    },
+
     // Settings
     async getSettings() {
         return this.request('/settings');

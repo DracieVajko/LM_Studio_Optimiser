@@ -358,6 +358,14 @@ body {
     margin-bottom: 0.5rem;
 }
 
+/* Jump-to-row flash highlight */
+.flash-highlight {
+    outline: 2px solid #2563eb;
+    outline-offset: -2px;
+    background-color: #eff6ff !important;
+    transition: background-color 0.3s;
+}
+
 /* Loading Spinner */
 .spinner {
     display: inline-block;
@@ -501,6 +509,114 @@ body {
     margin: 0 auto 1rem;
     color: #d1d5db;
 }
+
+/* Generic text input (sandbox/compare forms). Mirrors .form-input. */
+.input {
+    padding: 0.625rem 0.875rem;
+    font-size: 0.875rem;
+    border: 1px solid #d1d5db;
+    border-radius: 0.5rem;
+    background-color: white;
+    color: #111827;
+}
+
+.input:focus {
+    outline: none;
+    border-color: #2563eb;
+    box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
+}
+
+textarea.input {
+    resize: vertical;
+}
+
+select.input {
+    appearance: none;
+    background-image: url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 20 20'%3e%3cpath stroke='%236b7280' stroke-linecap='round' stroke-linejoin='round' stroke-width='1.5' d='M6 8l4 4 4-4'/%3e%3c/svg%3e");
+    background-position: right 0.5rem center;
+    background-repeat: no-repeat;
+    background-size: 1.5em 1.5em;
+    padding-right: 2.5rem;
+}
+
+.badge-gray {
+    background-color: #f3f4f6;
+    color: #4b5563;
+}
+
+/* ================= Dark mode (class strategy, OS-following by default) ================= */
+.dark {
+    color-scheme: dark;
+}
+
+.dark body {
+    background-color: #111827;
+    color: #f3f4f6;
+}
+
+/* Tailwind gray/white surfaces */
+.dark .bg-white { background-color: #1f2937 !important; }
+.dark .bg-gray-50 { background-color: #1f2937 !important; }
+.dark .bg-gray-100 { background-color: #374151 !important; }
+.dark .bg-blue-50 { background-color: #1e3a5f !important; }
+.dark .bg-amber-50 { background-color: #45300a !important; }
+.dark .bg-red-50 { background-color: #3f1d1d !important; }
+.dark .bg-green-50 { background-color: #052e22 !important; }
+.dark .border-gray-200 { border-color: #374151 !important; }
+.dark .border-blue-100 { border-color: #1e40af !important; }
+.dark .border-amber-200 { border-color: #92600e !important; }
+.dark .border-red-300 { border-color: #7f1d1d !important; }
+
+/* Tailwind gray text (light-on-dark pairs, contrast-checked) */
+.dark .text-gray-900 { color: #f9fafb !important; }
+.dark .text-gray-800 { color: #f3f4f6 !important; }
+.dark .text-gray-700 { color: #e5e7eb !important; }
+.dark .text-gray-600 { color: #d1d5db !important; }
+.dark .text-gray-500 { color: #9ca3af !important; }
+.dark .text-gray-400 { color: #9ca3af !important; }
+.dark .text-blue-900 { color: #bfdbfe !important; }
+.dark .text-blue-600 { color: #93c5fd !important; }
+.dark .text-red-700 { color: #fca5a5 !important; }
+.dark .text-red-600 { color: #fca5a5 !important; }
+.dark .text-green-600 { color: #6ee7b7 !important; }
+.dark .text-amber-700 { color: #fcd34d !important; }
+
+/* App classes */
+.dark .card { background: #1f2937; border-color: #374151; box-shadow: 0 1px 3px rgba(0, 0, 0, 0.5); }
+.dark .card-header { border-bottom-color: #374151; }
+.dark .form-label { color: #d1d5db; }
+.dark .form-input, .dark .input { background-color: #111827; border-color: #4b5563; color: #f3f4f6; }
+.dark .form-input:disabled { background-color: #1f2937; color: #6b7280; }
+.dark .table th { color: #9ca3af; background-color: #111827; border-bottom-color: #374151; }
+.dark .table td { color: #e5e7eb; border-bottom-color: #374151; }
+.dark .table tbody tr:hover { background-color: #273244; }
+.dark .table tbody tr.bg-red-50 { background-color: #3f1d1d; }
+.dark .btn-outline { border-color: #4b5563; color: #e5e7eb; }
+.dark .btn-outline:hover:not(:disabled) { background-color: #374151; }
+.dark .btn-secondary { background-color: #374151; color: #f3f4f6; }
+.dark .btn-secondary:hover:not(:disabled) { background-color: #4b5563; }
+.dark .modal-content { background: #1f2937; }
+.dark .modal-header { border-bottom-color: #374151; }
+.dark .modal-header h3 { color: #f9fafb; }
+.dark .progress-bar { background-color: #374151; }
+.dark .empty-state { color: #9ca3af; }
+.dark .empty-state-icon { color: #4b5563; }
+.dark .spinner { border-color: #374151; border-top-color: #60a5fa; }
+.dark .flash-highlight { outline-color: #60a5fa; background-color: #1e3a5f !important; }
+.dark .accordion-header { background-color: #1f2937 !important; }
+.dark pre.bg-gray-50 { background-color: #111827 !important; color: #e5e7eb; }
+
+/* Status + badges (dark remains readable: light text on deep tint) */
+.dark .status-online { color: #6ee7b7; background-color: #064e3b; }
+.dark .status-offline { color: #fca5a5; background-color: #7f1d1d; }
+.dark .status-running { color: #fdba74; background-color: #7c2d12; }
+.dark .badge-success { background-color: #064e3b; color: #a7f3d0; }
+.dark .badge-warning { background-color: #78350f; color: #fde68a; }
+.dark .badge-error { background-color: #7f1d1d; color: #fecaca; }
+.dark .badge-info { background-color: #1e3a8a; color: #bfdbfe; }
+.dark .badge-gray { background-color: #374151; color: #d1d5db; }
+.dark .nav-link { color: #d1d5db; }
+.dark #chart-tooltip { background-color: #f3f4f6 !important; color: #111827; }
 
 /* Responsive */
 @media (max-width: 768px) {

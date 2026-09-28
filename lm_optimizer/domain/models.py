@@ -319,6 +319,11 @@ class BenchmarkMetrics:
     generation_tok_s: float = 0.0
     error: str | None = None
     output_text: str = ""
+    # Reasoning trace, when the server exposes it separately from the answer.
+    # Empty for non-reasoning models and all pre-plumbing rows (honest "n/a").
+    thinking_text: str = ""
+    # The exact prompt sent (for per-test Prompt/Thinking/Output display).
+    prompt: str = ""
 
     @property
     def ttft_ms(self) -> float:
@@ -458,7 +463,7 @@ class OptimizationRun:
     completed_at: datetime | None = None
     duration_seconds: float = 0.0
     error: str | None = None
-    optimizer_version: str = "1.0.0-beta"
+    optimizer_version: str = "1.1.0"
     benchmark_repetitions: int = 3
     validation_repetitions: int = 5
     # Phase A/B strategy fields (all defaulted; legacy runs ignore them).

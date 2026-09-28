@@ -77,6 +77,7 @@ class DatabaseManager:
             (7, "add_benchmark_params", self._migration_007_benchmark_params),
             (8, "add_best_columns", self._migration_008_best_columns),
             (9, "add_capability_snapshots", self._migration_009_capability_snapshots),
+            (10, "add_duels", self._migration_010_duels),
         ]
 
         for version, name, migration_func in migrations:
@@ -343,6 +344,26 @@ class DatabaseManager:
                 matrix_json TEXT NOT NULL
             )
         """)
+
+
+    def _migration_010_duels(self, conn: sqlite3.Connection) -> None:
+        """Model-vs-model sandbox duels (separate from optimization runs)."""
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS duels (
+                id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL DEFAULT 'text',
+                model_a TEXT NOT NULL,
+                model_b TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'running',
+                faster TEXT,
+                result_json TEXT,
+                error TEXT,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                completed_at TIMESTAMP
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_duels_created ON duels(created_at)")
 
 
 # Global database manager

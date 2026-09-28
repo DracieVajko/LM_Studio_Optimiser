@@ -1,7 +1,7 @@
 // LM Studio Auto Optimizer - History Page
 
-import { API } from './api.js?v=4';
-import { UI } from './ui.js?v=4';
+import { API } from './api.js?v=6';
+import { UI } from './ui.js?v=6';
 
 const HistoryPage = {
     state: {
@@ -13,8 +13,20 @@ const HistoryPage = {
     async init() {
         UI.init();
         await this.loadRuns();
+        await this.loadDuels();
         this.render();
         this.attachEvents();
+    },
+
+    async loadDuels() {
+        try {
+            const response = await API.getDuels(100);
+            this.state.duels = response.duels || [];
+        } catch (error) {
+            console.error('Failed to load duels:', error);
+            this.state.duels = [];
+            this.state.duelsError = (error && error.message) || String(error);
+        }
     },
 
     async loadRuns() {
@@ -22,16 +34,27 @@ const HistoryPage = {
             const response = await API.getRuns(100);
             this.state.runs = response.runs || [];
             this.state.filteredRuns = this.state.runs;
+            this.state.loadError = null;
         } catch (error) {
             console.error('Failed to load runs:', error);
-            UI.showToast('Failed to load history', 'error');
+            this.state.loadError = (error && error.message) || String(error);
+            this.state.runs = [];
+            this.state.filteredRuns = [];
         }
     },
 
     render() {
         const main = document.getElementById('main-content');
+        const err = this.state.loadError
+            ? `<div class="card border-red-300"><div class="card-body text-center py-8">`
+              + `<h3 class="text-lg font-medium text-red-700">History failed to load.</h3>`
+              + `<p class="text-sm text-gray-500 mt-1">${String(this.state.loadError).slice(0, 300)}</p>`
+              + `<button class="btn btn-outline mt-4" onclick="window.location.reload()">Retry</button>`
+              + `</div></div>`
+            : '';
         main.innerHTML = `
             <div class="space-y-8">
+                ${err}
                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
                     <div>
                         <h1 class="text-3xl font-bold text-gray-900">Optimization History</h1>
@@ -89,10 +112,107 @@ const HistoryPage = {
                 <div class="card" id="runs-table-container">
                     ${this.renderRunsTable()}
                 </div>
+
+                <!-- Sandbox Duels -->
+                <div class="flex items-center justify-between mt-8 mb-2">
+                    <h2 class="text-xl font-bold text-gray-900">Sandbox Duels</h2>
+                    <button id="delete-duels" class="btn btn-outline btn-sm" disabled>Delete selected</button>
+                </div>
+                <div class="card" id="duels-table-container">
+                    ${this.renderDuelsTable()}
+                </div>
             </div>
         `;
 
         this.attachEvents();
+    },
+
+    renderDuelsTable() {
+        const duels = this.state.duels || [];
+        if (this.state.duelsError && !duels.length) {
+            return `<div class="card-body"><p class="text-sm text-red-600">Duels failed to load: ${this.state.duelsError}</p></div>`;
+        }
+        if (!duels.length) {
+            return `<div class="card-body"><p class="text-sm text-gray-500">No duels yet — run one from the Sandbox page.</p></div>`;
+        }
+        return `
+            <div class="card-body p-0">
+                <div class="table-container">
+                    <table class="table">
+                        <thead><tr>
+                            <th></th><th>Date</th><th>Kind</th><th>Model A vs B</th>
+                            <th>Status</th><th>Faster</th><th>Actions</th>
+                        </tr></thead>
+                        <tbody>
+                            ${duels.map(d => `
+                                <tr class="duel-row hover:bg-gray-50" data-duel-id="${d.id}">
+                                    <td><input type="checkbox" class="duel-checkbox" data-id="${d.id}"></td>
+                                    <td class="font-mono text-sm">${new Date(d.created_at).toLocaleString()}</td>
+                                    <td><span class="badge badge-info">${d.kind}</span></td>
+                                    <td><div class="font-medium text-sm font-mono">${d.model_a}</div>
+                                        <div class="text-xs text-gray-500 font-mono">vs ${d.model_b}</div></td>
+                                    <td><span class="badge ${UI.getStatusBadge(d.status)}">${d.status}</span>${d.stale ? ' <span class="badge badge-warning" title="Still running with no completion">stale</span>' : ''}</td>
+                                    <td class="font-mono">${d.faster || '—'}</td>
+                                    <td><button class="btn btn-outline btn-sm view-duel" data-id="${d.id}">View</button></td>
+                                </tr>
+                                <tr class="duel-detail-row hidden" data-duel-detail="${d.id}">
+                                    <td colspan="7"><div class="p-3 duel-detail-body" data-duel-body="${d.id}"></div></td>
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        `;
+    },
+
+    async toggleDuelDetail(id) {
+        const row = document.querySelector(`[data-duel-detail="${id}"]`);
+        const body = document.querySelector(`[data-duel-body="${id}"]`);
+        if (!row || !body) return;
+        if (!body.dataset.loaded) {
+            body.innerHTML = '<p class="text-sm text-gray-500">Loading...</p>';
+            try {
+                const d = await API.getDuel(id);
+                body.innerHTML = this.renderDuelDetail(d);
+            } catch (e) {
+                body.innerHTML = `<p class="text-sm text-red-600">Failed: ${String((e && e.message) || e).slice(0, 200)}</p>`;
+                row.classList.remove('hidden');
+                return;
+            }
+            body.dataset.loaded = '1';
+        }
+        row.classList.toggle('hidden');
+    },
+
+    renderDuelDetail(d) {
+        let result = null;
+        try {
+            result = typeof d.result_json === 'string' ? JSON.parse(d.result_json) : d.result_json;
+        } catch (e) {
+            result = null;
+        }
+        const esc = (s) => String(s == null ? '' : s).replace(/[&<>"]/g, (c) => (
+            { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+        let inner = `<p class="text-sm"><span class="font-medium">Prompt:</span> ${esc((d.prompt || '').slice(0, 2000))}</p>`;
+        if (!result) {
+            return inner + `<p class="text-sm text-gray-500 mt-1">${d.status === 'running' ? 'Still running...' : 'No result stored.'}</p>`;
+        }
+        const sideBlock = (label, s) => {
+            if (!s) return '';
+            if (s.file_path) {
+                const parts = String(s.file_path).split('/');
+                const url = `/sandbox/files/${parts[0]}/${parts[1]}/index.html`;
+                return `<div><h4 class="font-bold">${label}</h4>`
+                    + `<p class="text-xs font-mono text-gray-500">results/sandbox/${esc(s.file_path)}</p>`
+                    + `<p class="mt-1"><a class="underline text-blue-600" target="_blank" rel="noopener" href="${url}">Open index.html</a></p></div>`;
+            }
+            return `<div><h4 class="font-bold">${label} <span class="text-xs font-normal text-gray-500">${s.tok_s ? s.tok_s.toFixed(1) + ' tok/s' : ''}</span></h4>`
+                + `<pre class="font-mono text-xs bg-gray-50 p-2 rounded overflow-auto max-h-64 mt-1">${esc((s.text || s.error || '').slice(0, 6000))}</pre></div>`;
+        };
+        const sa = result.side_a, sb = result.side_b;
+        inner += `<div class="grid md:grid-cols-2 gap-4 mt-2">${sideBlock('A', sa)}${sideBlock('B', sb)}</div>`;
+        return inner;
     },
 
     renderModelOptions() {
@@ -144,13 +264,16 @@ const HistoryPage = {
                                         <div class="text-xs text-gray-500 font-mono">${r.model.id}</div>
                                     </td>
                                     <td><span class="badge badge-info">${r.profile}</span></td>
-                                    <td><span class="badge ${UI.getStatusBadge(r.status)}">${r.status}</span></td>
+                                    <td><span class="badge ${UI.getStatusBadge(r.status)}">${r.status}</span>${r.stale ? ' <span class="badge badge-warning" title="No fresh checkpoint: process is gone">stale</span> <button class="btn btn-outline btn-sm abandon-run" data-run-id="${r.id}" title="Mark interrupted (keeps history)">Abandon</button>' : ''}</td>
                                     <td class="font-mono">${this.getBestGenSpeed(r)}</td>
                                     <td class="font-mono">${this.getBestQuality(r)}</td>
                                     <td class="font-mono">${r.duration_seconds ? r.duration_seconds.toFixed(1) + 's' : '—'}</td>
-                                    <td class="font-mono">${r.configurations?.length || 0}</td>
+                                    <td class="font-mono">${r.config_count ?? r.configurations?.length ?? 0}</td>
                                     <td>
-                                        <button class="btn btn-outline btn-sm view-run" data-run-id="${r.id}">View</button>
+                                        <div class="flex gap-1">
+                                            <button class="btn btn-outline btn-sm view-run" data-run-id="${r.id}">View</button>
+                                            <button class="btn btn-outline btn-sm delete-run" data-run-id="${r.id}" title="Delete run">🗑</button>
+                                        </div>
                                     </td>
                                 </tr>
                             `).join('')}
@@ -208,6 +331,82 @@ const HistoryPage = {
                 window.location.href = `/results/${row.dataset.runId}`;
             });
         });
+
+        // Abandon stale runs (keeps them as interrupted history)
+        document.querySelectorAll('.abandon-run').forEach(btn => {
+            btn.addEventListener('click', async (e) => {
+                e.stopPropagation();
+                if (!window.confirm('Mark this dead run as interrupted? (stays in history)')) return;
+                try {
+                    await API.abandonRun(btn.dataset.runId);
+                    UI.showToast('Run marked interrupted', 'success');
+                    await this.refresh();
+                } catch (err) {
+                    UI.showToast((err && err.message) || 'Abandon failed', 'error');
+                }
+            });
+        });
+
+        // Delete run buttons (server refuses live runs with 409)
+        document.querySelectorAll('.delete-run').forEach(btn => {
+            btn.addEventListener('click', async (e) => {
+                e.stopPropagation();
+                if (!window.confirm('Delete this run and its configurations?')) return;
+                try {
+                    await API.deleteRun(btn.dataset.runId);
+                    UI.showToast('Run deleted', 'success');
+                    await this.refresh();
+                } catch (err) {
+                    UI.showToast((err && err.message) || 'Delete failed', 'error');
+                }
+            });
+        });
+
+        // Duel expand
+        document.querySelectorAll('.view-duel').forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                this.toggleDuelDetail(btn.dataset.id);
+            });
+        });
+        document.querySelectorAll('.duel-row').forEach(row => {
+            row.addEventListener('click', (e) => {
+                if (e.target.closest('button') || e.target.closest('input')) return;
+                this.toggleDuelDetail(row.dataset.duelId);
+            });
+        });
+
+        // Duel checkboxes + bulk delete
+        const delBtn = document.getElementById('delete-duels');
+        const syncDel = () => {
+            const n = document.querySelectorAll('.duel-checkbox:checked').length;
+            if (delBtn) {
+                delBtn.disabled = n === 0;
+                delBtn.textContent = n ? `Delete selected (${n})` : 'Delete selected';
+            }
+        };
+        document.querySelectorAll('.duel-checkbox').forEach(cb => {
+            cb.addEventListener('click', (e) => e.stopPropagation());
+            cb.addEventListener('change', syncDel);
+        });
+        if (delBtn) {
+            delBtn.addEventListener('click', async () => {
+                const ids = [...document.querySelectorAll('.duel-checkbox:checked')]
+                    .map(cb => cb.dataset.id);
+                if (!ids.length) return;
+                if (!window.confirm(`Delete ${ids.length} duel(s) including generated files?`)) return;
+                for (const id of ids) {
+                    try {
+                        await API.deleteDuel(id);
+                    } catch (err) {
+                        UI.showToast(`Failed ${id}: ${(err && err.message) || err}`, 'error');
+                    }
+                }
+                await this.loadDuels();
+                document.getElementById('duels-table-container').innerHTML = this.renderDuelsTable();
+                this.attachEvents();
+            });
+        }
     },
 
     applyFilters() {
@@ -244,10 +443,9 @@ const HistoryPage = {
 
     async refresh() {
         await this.loadRuns();
+        await this.loadDuels();
         this.state.filteredRuns = this.state.runs;
-        const container = document.getElementById('runs-table-container');
-        container.innerHTML = this.renderRunsTable();
-        this.attachEvents();
+        this.render(); // full re-render: fresh nodes, single attachEvents
     },
 };
 

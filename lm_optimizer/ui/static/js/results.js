@@ -1,9 +1,9 @@
 // LM Studio Auto Optimizer - Results Page
 
-import { API } from './api.js?v=4';
-import { UI } from './ui.js?v=4';
-import { Charts } from './charts.js?v=4';
-import { WebSocketManager } from './websocket.js?v=4';
+import { API } from './api.js?v=6';
+import { UI } from './ui.js?v=6';
+import { Charts } from './charts.js?v=6';
+import { WebSocketManager } from './websocket.js?v=6';
 
 const ResultsPage = {
     state: {
@@ -203,6 +203,8 @@ const ResultsPage = {
             : passed.sort((a, b) => (b.score || 0) - (a.score || 0))[0] || null;
         const oom = this.state.configurations.filter(c => c.status === 'oom').length;
         const timeouts = this.state.configurations.filter(c => c.status === 'timeout').length;
+        const qualityRejected = this.state.configurations.filter(c => c.status === 'quality_failed').length;
+        const loadFailures = failed.length - oom - timeouts - qualityRejected;
 
         // ZERO-PASS: explicit failure state, no Apply offer.
         if (!bestConfig) {
@@ -212,7 +214,7 @@ const ResultsPage = {
                 <p class="text-sm text-gray-500 font-mono">${run.model?.id || ''}</p></div>
                 <div class="card-body">
                     <p>No valid configurations were successfully benchmarked.</p>
-                    <p class="mt-2 text-sm">Reason: load_failures=${failed.length - oom - timeouts}, oom=${oom}, timeouts=${timeouts}</p>
+                    <p class="mt-2 text-sm">Reason: load_failures=${loadFailures}, oom=${oom}, timeouts=${timeouts}, quality_rejected=${qualityRejected}</p>
                     <div class="flex flex-wrap gap-2 mt-2">
                         <span class="badge badge-info">${run.profile}</span>
                         <span class="badge ${UI.getStatusBadge(run.status)}">${run.status}</span>
@@ -304,9 +306,22 @@ const ResultsPage = {
         const ctx = by(c => c.context_length || 0);
         const qual = by(c => c.quality?.overall || 0);
         const mem = passed.slice().sort((a, b) => (a.peak_vram_gb || 0) - (b.peak_vram_gb || 0))[0];
-        const row = (label, c) => c ? `<div class="text-sm"><span class="text-gray-500">${label}:</span> <span class="font-mono">${c.context_length} ctx, ${(c.avg_generation_tok_s || 0).toFixed(1)} tok/s</span></div>` : '';
+        const tip = (c) => {
+            const k = c.config || {};
+            return `${c.context_length} ctx · flash ${k.flash_attention ? 'ON' : 'OFF'} · KV ${k.offload_kv_cache_to_gpu ? 'GPU' : 'CPU'} · batch ${k.eval_batch_size || 'auto'} · parallel ${k.parallel || 'auto'} · quality ${c.quality?.overall?.toFixed(3) ?? '—'}`;
+        };
+        const row = (label, c) => c ? `<div class="text-sm"><button class="alt-jump hover:underline" data-jump="${c.id}" title="${tip(c)}"><span class="text-gray-500">${label}:</span> <span class="font-mono">${c.context_length} ctx, ${(c.avg_generation_tok_s || 0).toFixed(1)} tok/s →</span></button></div>` : '';
         return `<div class="mt-4 p-3 bg-gray-50 rounded"><h4 class="font-medium mb-1">ALTERNATIVES</h4>
             ${row('Best Speed', speed)}${row('Best Context', ctx)}${row('Best Quality', qual)}${row('Best Memory', mem)}</div>`;
+    },
+
+    jumpToConfig(configId) {
+        const row = document.querySelector(`tr[data-cfg-row-anchor="${configId}"]`)
+            || document.querySelector(`[data-cfg-row="${configId}"]`);
+        if (!row) return;
+        row.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        row.classList.add('flash-highlight');
+        setTimeout(() => row.classList.remove('flash-highlight'), 2000);
     },
 
     renderMetricCard(label, value, icon) {
@@ -320,15 +335,16 @@ const ResultsPage = {
     },
 
     renderBestConfigDetails(config) {
+        const cfg = config.config || {};
         return `
             <div class="mt-6 p-4 bg-blue-50 rounded-lg border border-blue-100">
                 <h3 class="font-semibold text-blue-900 mb-3">Recommended Configuration</h3>
                 <div class="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
                     <div><span class="text-gray-500">Context</span><br><span class="font-mono font-medium">${config.context_length}</span></div>
-                    <div><span class="text-gray-500">GPU Ratio</span><br><span class="font-mono font-medium">${config.gpu_ratio ? (config.gpu_ratio * 100).toFixed(0) + '%' : 'Auto'}</span></div>
-                    <div><span class="text-gray-500">Flash Attn</span><br><span class="font-mono font-medium">${config.flash_attention ? 'ON' : 'OFF'}</span></div>
-                    <div><span class="text-gray-500">KV Cache</span><br><span class="font-mono font-medium">${config.offload_kv_cache_to_gpu ? 'GPU' : 'CPU'}</span></div>
-                    <div><span class="text-gray-500">Batch</span><br><span class="font-mono font-medium">${config.eval_batch_size || 'Auto'}</span></div>
+                    <div><span class="text-gray-500">GPU Ratio</span><br><span class="font-mono font-medium">${cfg.gpu_ratio != null ? (cfg.gpu_ratio * 100).toFixed(0) + '%' : 'Auto'}</span></div>
+                    <div><span class="text-gray-500">Flash Attn</span><br><span class="font-mono font-medium">${cfg.flash_attention ? 'ON' : 'OFF'}</span></div>
+                    <div><span class="text-gray-500">KV Cache</span><br><span class="font-mono font-medium">${cfg.offload_kv_cache_to_gpu ? 'GPU' : 'CPU'}</span></div>
+                    <div><span class="text-gray-500">Batch</span><br><span class="font-mono font-medium">${cfg.eval_batch_size || 'Auto'}</span></div>
                     <div><span class="text-gray-500">VRAM</span><br><span class="font-mono font-medium">${config.peak_vram_gb ? config.peak_vram_gb.toFixed(1) + ' GB' : '—'}</span></div>
                     <div><span class="text-gray-500">Score</span><br><span class="font-mono font-medium">${config.score != null ? config.score.toFixed(3) : '—'}</span></div>
                 </div>
@@ -482,16 +498,19 @@ const ResultsPage = {
                                     <th>Quality</th>
                                     <th>Score</th>
                                     <th>Status</th>
+                                    <th>Detail</th>
                                 </tr>
                             </thead>
                             <tbody>
-                                ${this.state.configurations.map(c => `
-                                    <tr class="${c.status === 'passed' ? '' : 'bg-red-50'}">
+                                ${this.state.configurations.map(c => {
+                                    const cfg = c.config || {};
+                                    return `
+                                    <tr data-cfg-row-anchor="${c.id}" class="${c.status === 'passed' ? '' : 'bg-red-50'}">
                                         <td class="font-mono">${c.context_length}</td>
-                                        <td>${c.gpu_ratio ? (c.gpu_ratio * 100).toFixed(0) + '%' : 'Auto'}</td>
-                                        <td>${c.flash_attention ? 'ON' : 'OFF'}</td>
-                                        <td>${c.offload_kv_cache_to_gpu ? 'GPU' : 'CPU'}</td>
-                                        <td>${c.eval_batch_size || 'Auto'}</td>
+                                        <td>${cfg.gpu_ratio != null ? (cfg.gpu_ratio * 100).toFixed(0) + '%' : 'Auto'}</td>
+                                        <td>${cfg.flash_attention ? 'ON' : 'OFF'}</td>
+                                        <td>${cfg.offload_kv_cache_to_gpu ? 'GPU' : 'CPU'}</td>
+                                        <td>${cfg.eval_batch_size || 'Auto'}</td>
                                         <td class="font-mono font-medium">${c.avg_generation_tok_s?.toFixed(1) || '—'}</td>
                                         <td class="font-mono">${c.avg_prompt_tok_s?.toFixed(0) || '—'}</td>
                                         <td class="font-mono">${c.avg_ttft_ms?.toFixed(0) || '—'} ms</td>
@@ -499,14 +518,59 @@ const ResultsPage = {
                                         <td>${c.quality?.overall?.toFixed(3) || '—'}</td>
                                         <td class="font-mono font-medium">${c.score != null ? c.score.toFixed(3) : '—'}</td>
                                         <td><span class="badge ${this.getStatusBadge(c.status)}">${c.status}</span></td>
+                                        <td><button class="btn btn-outline btn-sm cfg-detail-btn" data-cfg="${c.id}">Detail</button></td>
                                     </tr>
-                                `).join('')}
+                                    <tr class="cfg-detail-row hidden" data-cfg-row="${c.id}">
+                                        <td colspan="14">
+                                            <div class="p-3 space-y-2">
+                                                ${this.renderConfigFacts(c)}
+                                                <div><a class="underline text-blue-600 text-sm" target="_blank" rel="noopener" href="/results/${this.state.runId}/configs/${c.id}">Open full JSON</a></div>
+                                                <div><span class="font-medium">Per-test outputs:</span>
+                                                ${(c.metrics || []).map(m => `
+                                                    <div class="mt-1 border-t pt-1">
+                                                        <span class="font-mono text-xs font-medium">${m.test_name}</span>
+                                                        <span class="text-xs text-gray-500">tok/s ${m.generation_tok_s != null ? m.generation_tok_s.toFixed(1) : '—'} · in ${m.prompt_tokens ?? '—'} / out ${m.completion_tokens ?? '—'} tok · ${m.success ? 'ok' : 'fail: ' + (m.error || '')}</span>
+                                                        <div class="text-xs font-medium mt-1">Prompt</div>
+                                                        <pre class="font-mono text-xs bg-gray-50 p-2 rounded overflow-auto max-h-40">${String(m.prompt || '(prompt not stored for this run)').slice(0, 4000)}</pre>
+                                                        <div class="text-xs font-medium mt-1">Thinking</div>
+                                                        <pre class="font-mono text-xs bg-gray-50 p-2 rounded overflow-auto max-h-40">${String(m.thinking_text || 'n/a (starý beh alebo nereasoning model)').slice(0, 4000)}</pre>
+                                                        <div class="text-xs font-medium mt-1">Output</div>
+                                                        <pre class="font-mono text-xs bg-gray-50 p-2 rounded overflow-auto max-h-40">${String(m.output_text || '—').slice(0, 2000)}</pre>
+                                                        <button class="btn btn-outline btn-sm cfg-full-output-btn" data-cfg="${c.id}" data-test="${m.test_name}">Full output + quality</button>
+                                                        <div class="cfg-full-output" data-full-out="${c.id}:${m.test_name}"></div>
+                                                    </div>`).join('')}
+                                                </div>
+                                            </div>
+                                        </td>
+                                    </tr>
+                                `;}).join('')}
                             </tbody>
                         </table>
                     </div>
                 </div>
             </div>
         `;
+    },
+
+    renderConfigFacts(c) {
+        const k = c.config || {};
+        const g = c.generation || {};
+        const temps = g.temperature_overrides || {};
+        const fact = (label, val) => `<div><span class="text-gray-500">${label}</span><br><span class="font-mono font-medium">${val}</span></div>`;
+        return `<div class="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
+            ${fact('Context', c.context_length)}
+            ${fact('Flash attention', k.flash_attention ? 'ON' : 'OFF')}
+            ${fact('KV cache', k.offload_kv_cache_to_gpu ? 'GPU' : 'CPU')}
+            ${fact('Eval batch', k.eval_batch_size || 'server default')}
+            ${fact('Physical batch', k.physical_batch_size || 'server default')}
+            ${fact('Parallel', k.parallel || 'server default')}
+            ${fact('Checkpoints', k.context_checkpoints ?? 'server default')}
+            ${fact('Style', g.style || '—')}
+            ${fact('Reasoning', g.reasoning ?? '—')}
+            ${fact('Temperatures', Object.keys(temps).length ? Object.entries(temps).map(([t, v]) => `${t}=${v}`).join(', ') : 'suite defaults')}
+            ${fact('top_p / top_k', 'server defaults (not tuned)')}
+            ${fact('Load channel', g.load_channel || '—')}
+        </div>`;
     },
 
     getStatusBadge(status) {
@@ -579,6 +643,50 @@ const ResultsPage = {
                 document.getElementById('select-all-configs').checked = false;
                 this.updateCompareButton();
             });
+        }
+
+        // Alternatives jump links
+        document.querySelectorAll('.alt-jump').forEach(btn => {
+            btn.addEventListener('click', () => this.jumpToConfig(btn.dataset.jump));
+        });
+
+        // Expandable config detail rows
+        document.querySelectorAll('.cfg-detail-btn').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const row = document.querySelector(`[data-cfg-row="${btn.dataset.cfg}"]`);
+                if (row) row.classList.toggle('hidden');
+            });
+        });
+
+        // Lazy full per-test output + quality
+        document.querySelectorAll('.cfg-full-output-btn').forEach(btn => {
+            btn.addEventListener('click', () => this.loadFullOutput(btn));
+        });
+    },
+
+    async loadFullOutput(btn) {
+        const slot = document.querySelector(
+            `[data-full-out="${btn.dataset.cfg}:${btn.dataset.test}"]`
+        );
+        if (!slot) return;
+        if (slot.dataset.loaded) {
+            slot.classList.toggle('hidden');
+            return;
+        }
+        slot.innerHTML = '<p class="text-xs text-gray-500">Loading full output...</p>';
+        try {
+            const detail = await API.getConfiguration(this.state.runId, btn.dataset.cfg);
+            const m = (detail.metrics || []).find(x => x.test_name === btn.dataset.test);
+            if (!m) throw new Error('test not found');
+            const q = m.quality_overall != null ? `quality ${m.quality_overall}` : 'quality n/a';
+            slot.innerHTML = `<p class="text-xs text-gray-500">${q} · in ${m.prompt_tokens ?? '—'} / out ${m.completion_tokens ?? '—'} tok</p>`
+                + `<div class="text-xs font-medium mt-1">Thinking</div>`
+                + `<pre class="font-mono text-xs bg-gray-50 p-2 rounded overflow-auto max-h-96">${String(m.thinking_text || 'n/a').slice(0, 20000)}</pre>`
+                + `<div class="text-xs font-medium mt-1">Output</div>`
+                + `<pre class="font-mono text-xs bg-gray-50 p-2 rounded overflow-auto max-h-96">${String(m.output_text || '—').slice(0, 20000)}</pre>`;
+            slot.dataset.loaded = '1';
+        } catch (e) {
+            slot.innerHTML = `<p class="text-xs text-red-600">Failed: ${String((e && e.message) || e).slice(0, 200)}</p>`;
         }
     },
 
@@ -726,6 +834,12 @@ const ResultsPage = {
 
         if (!bestConfig) return;
 
+        const ok = window.confirm(
+            'Load this model in LM Studio with the winning configuration?\n\n'
+            + 'One-shot load only — it does NOT change any saved default. '
+            + 'After unload/restart LM Studio uses its own defaults again.'
+        );
+        if (!ok) return;
         UI.showLoading('Applying configuration...');
         try {
             await API.applyConfiguration({
@@ -819,3 +933,12 @@ if (document.readyState === 'loading') {
 } else {
     ResultsPage.init();
 }
+
+// Charts bake colors at creation: re-render current view on theme switch.
+window.addEventListener('lm-theme-changed', () => {
+    try {
+        if (typeof Charts !== 'undefined' && Charts && Charts.init) Charts.init();
+        const active = document.querySelector('#results-tabs .tab.active');
+        if (active && ResultsPage.renderChart) ResultsPage.renderChart();
+    } catch (e) { /* theme-only refresh, never fatal */ }
+});

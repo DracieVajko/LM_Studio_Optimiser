@@ -11,10 +11,18 @@ export const Charts = {
 
     charts: new Map(),
 
+    isDark() {
+        try {
+            return document.documentElement.classList.contains('dark');
+        } catch (e) {
+            return false;
+        }
+    },
+
     init() {
-        // Set default Chart.js options
+        // Set default Chart.js options (theme-aware; re-run after theme switch)
         Chart.defaults.font.family = "'Inter', sans-serif";
-        Chart.defaults.color = '#6b7280';
+        Chart.defaults.color = this.isDark() ? '#9ca3af' : '#6b7280';
         Chart.defaults.plugins.legend.display = false;
     },
 
@@ -157,6 +165,10 @@ export const Charts = {
     },
 
     getScatterOptions(xLabel, yLabel, showLegend = false) {
+        const dark = this.isDark();
+        const title = dark ? '#e5e7eb' : '#374151';
+        const grid = dark ? '#374151' : '#e5e7eb';
+        const ticks = dark ? '#9ca3af' : '#6b7280';
         return {
             responsive: true,
             maintainAspectRatio: false,
@@ -168,14 +180,14 @@ export const Charts = {
             },
             scales: {
                 x: {
-                    title: { display: true, text: xLabel, color: '#374151' },
-                    grid: { color: '#e5e7eb' },
-                    ticks: { color: '#6b7280' },
+                    title: { display: true, text: xLabel, color: title },
+                    grid: { color: grid },
+                    ticks: { color: ticks },
                 },
                 y: {
-                    title: { display: true, text: yLabel, color: '#374151' },
-                    grid: { color: '#e5e7eb' },
-                    ticks: { color: '#6b7280' },
+                    title: { display: true, text: yLabel, color: title },
+                    grid: { color: grid },
+                    ticks: { color: ticks },
                     beginAtZero: true,
                 },
             },

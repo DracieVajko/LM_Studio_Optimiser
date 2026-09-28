@@ -3,10 +3,8 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Optimization Results - LM Studio Auto Optimizer</title>
+    <title>Model Sandbox - LM Studio Auto Optimizer</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="/static/css/app.css">
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%232563eb' stroke-width='2'%3E%3Cpath stroke-linecap='round' stroke-linejoin='round' d='M13 10V3L4 14h7v7l9-11h-7z'/%3E%3C/svg%3E">
     <script src="/static/js/theme.js?v=6"></script>
@@ -27,7 +25,7 @@
                         <div class="hidden md:flex space-x-6">
                             <a href="/" class="nav-link text-gray-600 hover:text-blue-600 font-medium">Dashboard</a>
                             <a href="/history" class="nav-link text-gray-600 hover:text-blue-600 font-medium">History</a>
-                            <a href="/sandbox" class="nav-link text-gray-600 hover:text-blue-600 font-medium">Sandbox</a>
+                            <a href="/sandbox" class="nav-link text-blue-600 font-medium">Sandbox</a>
                             <a href="/settings" class="nav-link text-gray-600 hover:text-blue-600 font-medium">Settings</a>
                         </div>
                     </div>
@@ -42,39 +40,40 @@
         </nav>
 
         <main class="container mx-auto px-4 py-8" id="main-content">
-            <div class="flex justify-center py-12"><div class="spinner"></div></div>
+            <h1 class="text-2xl font-bold mb-2">Model Sandbox</h1>
+            <p class="text-sm text-gray-500 mb-4">Same prompt on model A, unload, then model B. Server defaults, no tuning parameters.</p>
+            <div class="flex gap-2 mb-4" id="sb-kinds">
+                <button class="btn btn-outline sb-kind" data-kind="text">Text duel</button>
+                <button class="btn btn-outline sb-kind" data-kind="html">HTML duel</button>
+                <button class="btn btn-outline sb-kind" data-kind="scene">3D scene duel</button>
+            </div>
+            <div class="card"><div class="card-body">
+                <label class="font-medium block">1. Prompt (same for both models)</label>
+                <textarea id="sb-prompt" class="input w-full mt-1 font-mono" rows="4" placeholder="One prompt for both models..."></textarea>
+                <div class="grid md:grid-cols-2 gap-4 mt-4">
+                    <div>
+                        <label class="font-medium">2. Model A (runs first)</label>
+                        <select id="sb-a" class="input w-full mt-1"><option value="">Loading models...</option></select>
+                    </div>
+                    <div>
+                        <label class="font-medium">3. Model B (after A unloads)</label>
+                        <select id="sb-b" class="input w-full mt-1"><option value="">Loading models...</option></select>
+                    </div>
+                </div>
+                <div class="flex gap-2 mt-4">
+                    <button id="sb-run" class="btn btn-primary">Run duel</button>
+                </div>
+                <div class="mt-2">
+                    <span class="text-xs text-gray-500">No own prompt? Try a preset:</span>
+                    <div class="flex flex-wrap gap-2 mt-1" id="sb-presets"></div>
+                </div>
+                <p class="text-xs text-gray-400 mt-2">Server defaults apply (no tuning here — use your LM Studio preset). HTML/scene outputs land in results/sandbox/{job}/A|B/index.html (fresh folder per run).</p>
+            </div></div>
+            <div class="card mt-4"><div class="card-body" id="sb-out">
+                <p class="text-sm text-gray-500">Result appears here.</p>
+            </div></div>
         </main>
     </div>
-
-    <script>
-    window.addEventListener('error', function (e) {
-        var main = document.getElementById('main-content');
-        var stillLoading = main && main.querySelector('.spinner');
-        if (stillLoading) {
-            main.innerHTML = '<div class="card"><div class="card-body text-center py-12">'
-                + '<h3 class="text-lg font-medium text-gray-900">Results failed to start.</h3>'
-                + '<p class="text-sm text-gray-500 mt-1">JavaScript error: '
-                + String((e && e.message) || 'script error').slice(0, 300) + '</p>'
-                + '<div class="mt-4 flex justify-center gap-2">'
-                + '<button class="btn btn-outline" onclick="window.location.reload()">Retry</button>'
-                + '<a class="btn btn-outline" href="/history">Back to History</a>'
-                + '</div></div>';
-        }
-    }, true);
-    setTimeout(function () {
-        var main = document.getElementById('main-content');
-        var stillLoading = main && main.querySelector('.spinner');
-        if (stillLoading) {
-            main.innerHTML = '<div class="card"><div class="card-body text-center py-12">'
-                + '<h3 class="text-lg font-medium text-gray-900">Result is taking too long.</h3>'
-                + '<p class="text-sm text-gray-500 mt-1">No data arrived within 25 seconds.</p>'
-                + '<div class="mt-4 flex justify-center gap-2">'
-                + '<button class="btn btn-outline" onclick="window.location.reload()">Retry</button>'
-                + '<a class="btn btn-outline" href="/history">Back to History</a>'
-                + '</div></div></div>';
-        }
-    }, 25000);
-    </script>
-    <script type="module" src="/static/js/results.js?v=6"></script>
+    <script src="/static/js/sandbox.js?v=6"></script>
 </body>
 </html>

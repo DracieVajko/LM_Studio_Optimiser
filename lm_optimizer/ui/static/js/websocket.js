@@ -36,7 +36,7 @@ export class WebSocketManager {
 
         this.connections.set(runId, ws);
         return ws;
-    },
+    }
 
     disconnect(runId) {
         const ws = this.connections.get(runId);
@@ -45,7 +45,7 @@ export class WebSocketManager {
             this.connections.delete(runId);
             this.reconnectAttempts.delete(runId);
         }
-    },
+    }
 
     disconnectAll() {
         for (const [runId, ws] of this.connections) {
@@ -53,7 +53,7 @@ export class WebSocketManager {
         }
         this.connections.clear();
         this.reconnectAttempts.clear();
-    },
+    }
 
     attemptReconnect(runId, onMessage) {
         const attempts = this.reconnectAttempts.get(runId) || 0;
@@ -71,17 +71,17 @@ export class WebSocketManager {
         setTimeout(() => {
             this.connect(runId, onMessage);
         }, delay);
-    },
+    }
 
     send(runId, message) {
         const ws = this.connections.get(runId);
         if (ws && ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify(message));
         }
-    },
+    }
 
     isConnected(runId) {
         const ws = this.connections.get(runId);
         return ws && ws.readyState === WebSocket.OPEN;
-    },
+    }
 }

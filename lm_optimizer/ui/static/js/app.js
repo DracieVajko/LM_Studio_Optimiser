@@ -1,9 +1,9 @@
 // LM Studio Auto Optimizer - Main Application
 
-import { API } from './api.js?v=4';
-import { UI } from './ui.js?v=4';
-import { Charts } from './charts.js?v=4';
-import { WebSocketManager } from './websocket.js?v=4';
+import { API } from './api.js?v=6';
+import { UI } from './ui.js?v=6';
+import { Charts } from './charts.js?v=6';
+import { WebSocketManager } from './websocket.js?v=6';
 
 // Application State
 const App = {
@@ -15,6 +15,8 @@ const App = {
 
     async init() {
         try {
+            // Dashboard owns the header badge (shared poller stands down).
+            window.__statusManaged = true;
             // Initialize UI
             UI.init();
 
@@ -44,11 +46,16 @@ const App = {
         }
     },
 
+    // Pages with their own HTML/JS (sandbox, results, ...) must do a full
+    // browser navigation; only dashboard/history/settings render inline.
+    spaViews: ['', 'dashboard', 'history', 'settings'],
+
     setupNavigation() {
         document.querySelectorAll('.nav-link').forEach(link => {
             link.addEventListener('click', (e) => {
-                e.preventDefault();
                 const view = link.getAttribute('href').slice(1);
+                if (!this.spaViews.includes(view)) return; // full navigation
+                e.preventDefault();
                 this.navigateTo(view);
             });
         });
