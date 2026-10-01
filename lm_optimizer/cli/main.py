@@ -2616,5 +2616,88 @@ def compare(
     asyncio.run(_compare())
 
 
+@app.command(name="sample-sweep")
+def sample_sweep(
+    model: str = typer.Argument(..., help="Model ID to sweep sampling on"),
+    config: Path = typer.Option(..., "--config", help="Load config JSON file"),
+    context: int = typer.Option(2048, "--context", "-c", help="Context length"),
+    repetitions: int = typer.Option(1, "--repetitions", "-r", help="Repetitions per test"),
+):
+    """Sweep generation sampling (precision/chat/creative) with quality re-validation."""
+    from lm_optimizer.services.compare import load_config_file
+    from lm_optimizer.services.quality import QualityEvaluator
+    from lm_optimizer.services.sampling_sweep import run_sampling_sweep
+
+    setup_logging()
+
+    async def _sweep():
+        client = get_client()
+        try:
+            await client.connect()
+            snap = await prepare_host(client, purpose="sample-sweep")
+            for line in format_snapshot(snap):
+                console.print(f"  {line}")
+            if not snap.get("verified_empty") and snap.get("leftovers"):
+                console.print("[red]Stale models loaded, aborting. Unload them first.[/red]")
+                sys.exit(1)
+
+            try:
+                cfg = load_config_file(config)
+            except ValueError as e:
+                console.print(f"[red]Config error: {e}[/red]")
+                sys.exit(1)
+            try:
+                info = await client.get_model(model)
+            except Exception:
+                info = None
+            arch = getattr(info, "architecture", None)
+            if info is None:
+                console.print(f"[red]Model not found: {model}[/red]")
+                sys.exit(1)
+
+            from lm_optimizer.services.benchmark import BenchmarkService
+
+            svc = BenchmarkService(client)
+            with console.status("Running sampling sweep..."):
+                res = await run_sampling_sweep(
+                    svc, QualityEvaluator(), model, cfg, context,
+                    architecture=arch, repetitions=repetitions,
+                )
+            table = Table(title=f"Sampling sweep: {model}")
+            table.add_column("Profile")
+            table.add_column("Temp", justify="right")
+            table.add_column("top_p", justify="right")
+            table.add_column("top_k", justify="right")
+            table.add_column("tok/s", justify="right")
+            table.add_column("Quality", justify="right")
+            table.add_column("Status")
+            for row in res["combos"]:
+                table.add_row(
+                    row["profile"],
+                    str(row.get("temperature")),
+                    str(row.get("top_p")),
+                    str(row.get("top_k")),
+                    f"{row.get('tok_s', 0):.1f}",
+                    str(row.get("quality")),
+                    "OK" if row.get("ok") else f"FAIL ({row.get('error', '?')})",
+                )
+            console.print(table)
+            if res["best_profile"]:
+                console.print(f"[green]Best: {res['best_profile']}[/green]")
+            else:
+                console.print("[red]No passing combo[/red]")
+                sys.exit(1)
+        except SystemExit:
+            raise
+        except Exception as e:
+            logger.exception("Sampling sweep failed")
+            console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
+        finally:
+            await client.close()
+
+    asyncio.run(_sweep())
+
+
 if __name__ == "__main__":
     app()

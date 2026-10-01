@@ -399,7 +399,10 @@ async def list_models():
 @router.get("/models/{model_id}")
 async def get_model(model_id: str):
     """Get model details."""
-    client = await get_lm_client(echo_probe=False)
+    try:
+        client = await get_lm_client(echo_probe=False)
+    except Exception:
+        raise HTTPException(status_code=503, detail="LM Studio unreachable")
     try:
         model = await client.get_model(model_id)
         if not model:

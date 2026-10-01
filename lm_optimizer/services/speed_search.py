@@ -99,9 +99,18 @@ def _plan_s1(anchor: LoadConfiguration, caps: SpeedCaps, rest: set, add) -> list
     elif caps.flash_required:
         notes.append("flash_attention: server requires flash — off not probed")
     if caps.is_moe and "num_experts" in rest:
-        add("S1", "MoE expert count (REST)", num_experts=4)
+        for n in (2, 4, 8):
+            if n != anchor.num_experts:
+                add("S1", f"MoE expert count {n} (REST)", num_experts=n)
     if caps.has_draft_model:
         add("S1", "speculative draft path (REST)", speculative_draft_mtp=True)
+        for n in (3, 8):
+            add(
+                "S1",
+                f"speculative draft max tokens {n} (REST)",
+                speculative_draft_mtp=True,
+                speculative_draft_max_tokens=n,
+            )
     else:
         notes.append("speculative/MTP: no draft model discovered — not auto-probed")
     return notes
@@ -111,7 +120,7 @@ def _plan_s2_s3(anchor: LoadConfiguration, rest: set, add) -> list:
     """S2 batch around the anchor + S3 concurrency probes."""
     if "eval_batch_size" in rest:
         base = anchor.eval_batch_size or 512
-        for alt in (128, 1024):
+        for alt in (64, 128, 256, 1024, 2048):
             if alt != base:
                 add("S2", f"eval batch {alt} (REST)", eval_batch_size=alt)
     if "physical_batch_size" in rest:
@@ -125,7 +134,7 @@ def _plan_s2_s3(anchor: LoadConfiguration, rest: set, add) -> list:
             if alt != base:
                 add("S2", f"context checkpoints {alt} (REST)", context_checkpoints=alt)
     if "parallel" in rest:
-        for alt in (1, 2):
+        for alt in (1, 2, 8):
             if alt != (anchor.parallel or 4):
                 add("S3", f"parallel {alt} (throughput)", kind="throughput", parallel=alt)
     return []

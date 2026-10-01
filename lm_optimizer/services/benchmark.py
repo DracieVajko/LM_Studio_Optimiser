@@ -580,6 +580,8 @@ class BenchmarkService:
                 input_text=case.prompt,
                 temperature=case.temperature,
                 max_output_tokens=case.max_tokens,
+                top_p=case.top_p,
+                top_k=case.top_k,
                 reasoning=reasoning,
             )
             usage, output_text, stats = self._extract_response(response)
@@ -597,6 +599,8 @@ class BenchmarkService:
                     input_text=case.prompt,
                     temperature=case.temperature,
                     max_output_tokens=case.max_tokens,
+                    top_p=case.top_p,
+                    top_k=case.top_k,
                     reasoning="on",
                 )
                 usage, output_text, stats = self._extract_response(response)
@@ -631,6 +635,8 @@ class BenchmarkService:
                             ),
                             temperature=case.temperature,
                             max_output_tokens=case.max_tokens,
+                            top_p=case.top_p,
+                            top_k=case.top_k,
                             reasoning=reasoning,
                         )
                         nusage, ntext, nstats = self._extract_response(nudge)

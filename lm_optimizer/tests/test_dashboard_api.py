@@ -129,13 +129,49 @@ class TestDashboardRenders:
             assert "detail" in resp.json()
 
     def test_api_error_shape(self):
+        from unittest.mock import AsyncMock
+
+        from lm_optimizer.api import routes as _routes
         from lm_optimizer.api.main import app
 
-        with TestClient(app) as client:
-            resp = client.get("/api/models/does-not-exist",
-                              headers={"Accept": "application/json"})
-            assert resp.status_code == 404
-            assert "detail" in resp.json()
+        async def _no_client(*args, **kwargs):
+            fake = AsyncMock()
+            fake.get_model.return_value = None
+            fake.close.return_value = None
+            return fake
+
+        import lm_optimizer.api.routes as routes_mod
+        _orig = routes_mod.get_lm_client
+        routes_mod.get_lm_client = _no_client
+        try:
+            with TestClient(app) as client:
+                resp = client.get("/api/models/does-not-exist",
+                                  headers={"Accept": "application/json"})
+                assert resp.status_code == 404
+                assert "detail" in resp.json()
+        finally:
+            routes_mod.get_lm_client = _orig
+
+    def test_model_route_unreachable_is_json_not_raise(self):
+        """CI has no LM Studio: unreachable server must be JSON 503, never raise."""
+        from fastapi.testclient import TestClient
+
+        from lm_optimizer.api.main import app
+        import lm_optimizer.api.routes as routes_mod
+
+        async def _raise(*args, **kwargs):
+            raise ConnectionError("LM Studio unreachable")
+
+        _orig = routes_mod.get_lm_client
+        routes_mod.get_lm_client = _raise
+        try:
+            with TestClient(app, raise_server_exceptions=False) as client:
+                resp = client.get("/api/models/does-not-exist",
+                                  headers={"Accept": "application/json"})
+                assert resp.status_code in (404, 503)
+                assert "detail" in resp.json()
+        finally:
+            routes_mod.get_lm_client = _orig
 
 
 class TestLauncher:

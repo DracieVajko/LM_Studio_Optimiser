@@ -620,6 +620,118 @@ class TestGenerationProfiles:
                     assert pub.get("source"), (mid, _name)
 
 
+class TestSamplingPassthrough:
+    def test_top_p_top_k_reach_chat(self):
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+
+        from lm_optimizer.domain.models import BenchmarkCase
+        from lm_optimizer.services.benchmark import BenchmarkService
+
+        seen = {}
+
+        async def _chat(**kwargs):
+            seen.update({k: kwargs.get(k) for k in ("temperature", "top_p", "top_k")})
+            return {
+                "choices": [{"message": {"content": "hash tables map keys fast."}}],
+                "usage": {"prompt_tokens": 12, "completion_tokens": 8, "total_tokens": 20},
+                "_stats": {"tokens_per_second": 50.0, "time_to_first_token_seconds": 0.05},
+            }
+
+        c = MagicMock()
+        c.chat_completion = AsyncMock(side_effect=_chat)
+        svc = BenchmarkService(c)
+        case = BenchmarkCase(
+            name="short_instruction", category="instruction", prompt="Hi.",
+            max_tokens=64, temperature=0.6, top_p=0.95, top_k=20,
+        )
+        m = asyncio.run(svc._run_single_case("m", case))
+        assert m.success
+        assert seen == {"temperature": 0.6, "top_p": 0.95, "top_k": 20}
+
+    def test_defaults_stay_none(self):
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+
+        from lm_optimizer.domain.models import BenchmarkCase
+        from lm_optimizer.services.benchmark import BenchmarkService
+
+        seen = {}
+
+        async def _chat(**kwargs):
+            seen.update({k: kwargs.get(k) for k in ("top_p", "top_k")})
+            return {
+                "choices": [{"message": {"content": "hash tables map keys fast."}}],
+                "usage": {"prompt_tokens": 12, "completion_tokens": 8, "total_tokens": 20},
+                "_stats": {"tokens_per_second": 50.0, "time_to_first_token_seconds": 0.05},
+            }
+
+        c = MagicMock()
+        c.chat_completion = AsyncMock(side_effect=_chat)
+        svc = BenchmarkService(c)
+        case = BenchmarkCase(
+            name="short_instruction", category="instruction", prompt="Hi.", max_tokens=64,
+        )
+        asyncio.run(svc._run_single_case("m", case))
+        assert seen == {"top_p": None, "top_k": None}
+
+
+class TestSamplingSweep:
+    def test_combos_from_publisher(self):
+        from lm_optimizer.services.sampling_sweep import sampling_combos
+
+        combos = sampling_combos("qwen3.8-9b-distill", "qwen35")
+        assert [c["profile"] for c in combos] == ["precision", "chat", "creative"]
+        prec = combos[0]
+        assert (prec["temperature"], prec["top_p"], prec["top_k"]) == (0.6, 0.95, 20)
+
+    def test_runner_scores_each_combo(self):
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+
+        from lm_optimizer.domain.models import LoadConfiguration
+        from lm_optimizer.services.benchmark import BenchmarkConfig, BenchmarkService
+        from lm_optimizer.services.quality import QualityEvaluator
+        from lm_optimizer.services.sampling_sweep import run_sampling_sweep
+
+        async def _chat(**kwargs):
+            return {
+                "choices": [{"message": {"content": "hash tables map keys fast and well."}}],
+                "usage": {"prompt_tokens": 12, "completion_tokens": 10, "total_tokens": 22},
+                "_stats": {"tokens_per_second": 40.0, "time_to_first_token_seconds": 0.05},
+            }
+
+        c = MagicMock()
+        ok = MagicMock()
+        ok.success = True
+        ok.loaded_config = None
+        ok.identifier = "x"
+        c.load_model = AsyncMock(return_value=ok)
+        c.ensure_unloaded = AsyncMock(return_value=True)
+        c.chat_completion = AsyncMock(side_effect=_chat)
+        svc = BenchmarkService(
+            c, benchmark_config=BenchmarkConfig(repetitions=1, warmup_repetitions=0))
+        res = asyncio.run(run_sampling_sweep(
+            svc, QualityEvaluator(), "m",
+            LoadConfiguration(context_length=2048), 2048,
+            [{"profile": "chat", "temperature": 0.7, "top_p": 0.8, "top_k": 20}],
+            repetitions=1,
+        ))
+        assert len(res["combos"]) == 1
+        assert res["combos"][0]["quality"] is not None
+        assert res["combos"][0]["tok_s"] > 0
+
+    def test_sample_sweep_command_registered(self):
+        import typer
+
+        from lm_optimizer.cli.main import app
+
+        info = typer.main.get_command(app)
+        assert "sample-sweep" in info.commands
+        params = [p.name for p in info.commands["sample-sweep"].params]
+        assert "config" in params
+
+
 class TestUnifiedMemory:
     def test_darwin_reports_unified_without_nvidia(self, monkeypatch):
         import platform as _platform

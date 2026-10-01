@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.3.0] - 2026-10-01
+
+### Added
+- **Denser speed grid**: eval batch {64, 128, 256, 1024, 2048}, MoE experts {2, 4, 8},
+  parallel {1, 2, 8} (~+6 probes per model, still under the 25-probe cap).
+- **Speculative token sweep**: `speculative_draft_max_tokens` {3, 8} with MTP whenever
+  a draft model is discovered.
+- **Sampling sweep**: opt-in `sample-sweep` CLI command — top_p/top_k ×
+  precision/chat/creative from source-tagged publisher values, full suite +
+  quality re-validation per combo, best-profile verdict.
+- **BenchmarkCase top_p/top_k**: threaded from case definition through all
+  generation paths (incl. reasoning retry and JSON nudge); defaults stay None
+  (server defaults, comparability preserved).
+
+### Fixed
+- **CI red**: `GET /api/models/{id}` returns JSON 503 when LM Studio is unreachable
+  instead of raising; error-shape test no longer needs a live server.
+
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 

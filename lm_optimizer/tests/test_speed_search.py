@@ -116,6 +116,53 @@ class TestPlanShape:
         assert all(d.get("speculative_draft_mtp") is None for d in dicts)
 
 
+class TestSpeculativeSweep:
+    def test_draft_token_variants(self):
+        probes, _ = build_speed_plan(_anchor(), 2048, _caps(has_draft_model=True))
+        mtp = [p for p in probes if p.config.speculative_draft_mtp]
+        assert mtp, "expected MTP probe with draft model"
+        tokens = {
+            p.config.speculative_draft_max_tokens
+            for p in probes
+            if p.config.speculative_draft_mtp
+        }
+        assert {3, 8} <= tokens
+
+    def test_no_draft_no_token_sweep(self):
+        probes, _ = build_speed_plan(_anchor(), 2048, _caps(has_draft_model=False))
+        assert all(
+            p.config.speculative_draft_max_tokens is None for p in probes
+        )
+
+
+class TestDenserGrid:
+    def test_eval_batch_grid(self):
+        probes, _ = build_speed_plan(_anchor(), 2048, _caps())
+        batches = {
+            p.config.eval_batch_size
+            for p in probes
+            if p.stage == "S2" and p.config.eval_batch_size != 512
+        }
+        assert {64, 128, 256, 1024, 2048} <= batches
+
+    def test_expert_sweep(self):
+        probes, _ = build_speed_plan(_anchor(), 2048, _caps(is_moe=True))
+        experts = {
+            p.config.num_experts for p in probes if p.config.num_experts is not None
+        }
+        assert {2, 4, 8} <= experts
+
+    def test_parallel_grid(self):
+        probes, _ = build_speed_plan(_anchor(), 2048, _caps())
+        parals = {p.config.parallel for p in probes if p.stage == "S3"}
+        assert {1, 2, 8} <= parals
+
+    def test_still_bounded(self):
+        probes, _ = build_speed_plan(
+            _anchor(), 2048, _caps(is_moe=True, has_draft_model=True))
+        assert len(probes) <= 25
+
+
 class TestInteractions:
     def test_combines_winners_only(self):
         a = LoadConfiguration(context_length=2048, offload_kv_cache_to_gpu=True)
