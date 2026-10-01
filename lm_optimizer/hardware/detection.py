@@ -141,8 +141,26 @@ def get_cpu_info() -> CPUInfo:
         name=cpu_name,
         cores_physical=psutil.cpu_count(logical=False) or 1,
         cores_logical=psutil.cpu_count(logical=True) or 1,
-        frequency_ghz=round(psutil.cpu_freq().max / 1000, 2) if psutil.cpu_freq() else None,
+        frequency_ghz=_cpu_freq_ghz(),
     )
+
+
+def _cpu_freq_ghz() -> float | None:
+    """CPU frequency in GHz, or None where the platform cannot report it.
+
+    psutil.cpu_freq may be missing entirely (some macOS runners) or return
+    None: frequency is informational, detection must never fail because of it.
+    """
+    try:
+        freq = psutil.cpu_freq()
+    except (AttributeError, TypeError, OSError):
+        return None
+    try:
+        if freq is None or freq.max is None:
+            return None
+        return round(freq.max / 1000, 2)
+    except (TypeError, AttributeError):
+        return None
 
 
 def get_memory_info() -> MemoryInfo:

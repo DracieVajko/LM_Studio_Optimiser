@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.3.1] - 2026-10-02
+
+### Fixed
+- **macOS CI**: `get_cpu_info()` no longer crashes where `psutil.cpu_freq` is
+  missing (AttributeError on some runners) — frequency degrades to None,
+  detection never fails. Regression tests included.
+
 ## [1.3.0] - 2026-10-01
 
 ### Added

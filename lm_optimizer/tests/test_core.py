@@ -42,6 +42,22 @@ class TestHardwareDetection:
         assert cpu.cores_logical >= cpu.cores_physical
         assert cpu.name is not None
 
+    def test_cpu_freq_missing_degrades_to_none(self, monkeypatch):
+        """macOS runners may lack psutil.cpu_freq entirely: degrade, never raise."""
+        import psutil as _psutil
+
+        monkeypatch.delattr(_psutil, "cpu_freq", raising=False)
+        cpu = get_cpu_info()
+        assert cpu.frequency_ghz is None
+        assert cpu.cores_physical >= 1
+
+    def test_cpu_freq_none_degrades_to_none(self, monkeypatch):
+        import psutil as _psutil
+
+        monkeypatch.setattr(_psutil, "cpu_freq", lambda: None)
+        cpu = get_cpu_info()
+        assert cpu.frequency_ghz is None
+
     def test_memory_info(self):
         mem = get_memory_info()
         assert mem.total_gb > 0
