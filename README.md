@@ -18,19 +18,13 @@ Prompt/Thinking/Output transparency, OS-following dark mode, resilient Web UI.
 
 ## Screenshots
 
-> Screenshots land in `docs/screenshots/` (pending upload).
-
 | Dashboard | History |
 |-|-|
 | ![Dashboard](docs/screenshots/dashboard.png) | ![History](docs/screenshots/history.png) |
 
-| Results | Sandbox |
+| Optimization Profiles | Sandbox |
 |-|-|
-| ![Results](docs/screenshots/results.png) | ![Sandbox](docs/screenshots/sandbox.png) |
-
-| Settings | Optimization Profiles |
-|-|-|
-| ![Settings](docs/screenshots/settings.png) | ![Profiles](docs/screenshots/profiles.png) |
+| ![Profiles](docs/screenshots/profiles.png) | ![Sandbox](docs/screenshots/sandbox.png) |
 
 | CMD menu (no UI) |
 |-|
