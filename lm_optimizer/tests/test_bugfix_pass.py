@@ -112,6 +112,81 @@ class TestBug1NullChecks:
         assert q.checks_total == 6
         assert q.details.get("json_valid") is False
 
+    def test_thinking_before_json_fallback_with_flag(self):
+        from lm_optimizer.services.quality import QualityEvaluator
+
+        out = (
+            'Okay, let me think. Name "John Doe", age 30, skills JavaScript Python Java, '
+            'city San Francisco country USA.\n'
+            '{"name": "John Doe", "age": 30, '
+            '"skills": ["JavaScript", "Python", "Java"], '
+            '"address": {"city": "San Francisco", "country": "USA"}}'
+        )
+        q = QualityEvaluator().evaluate("m", "structured_output", out)
+        assert q.overall > 0.0, "extractable JSON must not auto-fail"
+        assert q.details.get("thinking_outside_json") is True
+        assert q.task_completion == 1.0
+
+    def test_nudge_recovers_json(self):
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+
+        from lm_optimizer.domain.models import BenchmarkCase
+        from lm_optimizer.services.benchmark import BenchmarkService
+
+        thinking = "I need to output JSON with name and age. Let me think about John Doe, 30."
+        clean = '{"name": "John Doe", "age": 30}'
+
+        async def _chat(**kwargs):
+            n = _chat.calls
+            _chat.calls += 1
+            text = thinking if n == 0 else clean
+            return {
+                "choices": [{"message": {"content": text}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30},
+                "_stats": {"tokens_per_second": 50.0, "time_to_first_token_seconds": 0.05},
+            }
+
+        _chat.calls = 0
+        c = MagicMock()
+        c.chat_completion = AsyncMock(side_effect=_chat)
+        svc = BenchmarkService(c)
+        case = BenchmarkCase(name="structured_output", category="format",
+                             prompt="Output JSON.", max_tokens=256, temperature=0.0)
+        m = asyncio.run(svc._run_single_case("m", case))
+        assert m.success
+        assert m.output_text == clean
+        assert thinking in (m.thinking_text or "")
+
+    def test_no_nudge_when_json_present(self):
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+
+        from lm_optimizer.domain.models import BenchmarkCase
+        from lm_optimizer.services.benchmark import BenchmarkService
+
+        async def _chat(**kwargs):
+            return {
+                "choices": [{"message": {"content": '{"a": 1}'}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+                "_stats": {"tokens_per_second": 50.0, "time_to_first_token_seconds": 0.05},
+            }
+
+        c = MagicMock()
+        c.chat_completion = AsyncMock(side_effect=_chat)
+        svc = BenchmarkService(c)
+        case = BenchmarkCase(name="structured_output", category="format",
+                             prompt="Output JSON.", max_tokens=256, temperature=0.0)
+        asyncio.run(svc._run_single_case("m", case))
+        assert c.chat_completion.await_count == 1
+
+    def test_unbalanced_think_tag_malformed(self):
+        from lm_optimizer.services.quality import QualityEvaluator
+
+        out = "Some reasoning here.</think>\n\n# Summary\n\nSolar is widely available."
+        q = QualityEvaluator().evaluate("m", "long_context", out)
+        assert q.no_malformed < 1.0
+
     def test_failed_test_ranking_never_compares_none(self):
         from lm_optimizer.services.recovery import rank_failed_tests
 

@@ -233,6 +233,11 @@ async def run_ab_compare(
     ev = evaluator or QualityEvaluator()
 
     for tag, cfg in (("A", config_a), ("B", config_b)):
+        if tag == "B":
+            # Fail-closed boundary: B must not run beside a resident A.
+            from lm_optimizer.services.unload_guard import assert_unloaded
+
+            await assert_unloaded(client, purpose=f"compare:{model_id}")
         try:
             out = await svc.run_cases(
                 model_id, cfg, context_length, bench_cases,

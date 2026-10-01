@@ -4,8 +4,22 @@ export const API = {
     baseURL: '/api',
     // Every async operation has a timeout: never loading forever (§15).
     timeoutMs: 12000,
+    // In-flight GET dedup: concurrent identical polls share one fetch, so a
+    // runaway loop (or N tabs in one page context) cannot multiply traffic.
+    _inflight: new Map(),
 
     async request(endpoint, options = {}) {
+        const method = (options.method || 'GET').toUpperCase();
+        const key = method === 'GET' ? `${method} ${endpoint}` : null;
+        if (key && this._inflight.has(key)) return this._inflight.get(key);
+        const pending = this._requestInner(endpoint, options).finally(() => {
+            if (key && this._inflight.get(key) === pending) this._inflight.delete(key);
+        });
+        if (key) this._inflight.set(key, pending);
+        return pending;
+    },
+
+    async _requestInner(endpoint, options = {}) {
         const url = `${this.baseURL}${endpoint}`;
         const timeoutMs = options.timeoutMs || this.timeoutMs;
         const controller = new AbortController();

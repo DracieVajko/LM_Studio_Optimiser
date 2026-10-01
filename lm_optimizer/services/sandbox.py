@@ -176,7 +176,16 @@ async def run_duel(
         tokens = max_output_tokens or FILE_MAX_TOKENS
 
     res.side_a = await _run_side(client, model_a, full_prompt, tokens, timeout_s)
+    # Fail-closed boundary: B must never generate alongside a resident A.
+    from lm_optimizer.services.unload_guard import assert_unloaded
+
+    await assert_unloaded(client, purpose=f"sandbox:{jid}:A")
     res.side_b = await _run_side(client, model_b, full_prompt, tokens, timeout_s)
+    try:
+        await assert_unloaded(client, purpose=f"sandbox:{jid}:B")
+    except Exception as e:
+        # Post-hygiene only: the duel result stands, the host warning is loud.
+        logger.warning("Host left dirty after duel", job=jid, error=str(e)[:200])
 
     if kind in ("html", "scene"):
         root = _job_dir(sandbox_root, jid)

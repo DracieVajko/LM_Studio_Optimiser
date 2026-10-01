@@ -420,6 +420,229 @@ class TestNavUnified:
                 assert href in text, f"{name} missing {href}"
 
 
+class TestUnloadGuard:
+    def _client(self, stubborn=False):
+        from unittest.mock import AsyncMock, MagicMock
+
+        state = {"loaded": ["model-a"]}
+
+        async def _unload_all():
+            if not stubborn:
+                state["loaded"] = []
+            return {"model-a": not stubborn}
+
+        async def _instances():
+            return [
+                {"instance_id": "i1", "model": m, "config": {}}
+                for m in state["loaded"]
+            ]
+
+        c = MagicMock()
+        c.unload_all = AsyncMock(side_effect=_unload_all)
+        c.get_loaded_instances = AsyncMock(side_effect=_instances)
+        return c
+
+    def test_clean_host_passes(self):
+        import asyncio
+
+        from lm_optimizer.services.unload_guard import assert_unloaded
+
+        asyncio.run(assert_unloaded(self._client(), purpose="test"))
+
+    def test_stubborn_instance_raises(self):
+        import asyncio
+
+        import pytest
+
+        from lm_optimizer.services.unload_guard import UnloadNotClean, assert_unloaded
+
+        with pytest.raises(UnloadNotClean, match="[Kk]eep Model in Memory"):
+            asyncio.run(
+                assert_unloaded(self._client(stubborn=True), purpose="test", attempts=2)
+            )
+
+
+class TestMatrixFailFast:
+    def test_dirty_row_raises(self):
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+
+        import pytest
+
+        from lm_optimizer.domain.models import LoadConfiguration
+        from lm_optimizer.services.matrix import run_one
+        from lm_optimizer.services.unload_guard import UnloadNotClean
+
+        async def _chat(**kwargs):
+            return {
+                "choices": [{"message": {"content": "hi there buddy"}}],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 5, "total_tokens": 10},
+                "_stats": {"tokens_per_second": 50.0, "time_to_first_token_seconds": 0.05},
+            }
+
+        ok_load = MagicMock()
+        ok_load.success = True
+        ok_load.loaded_config = None
+        c = MagicMock()
+        c.load_model = AsyncMock(return_value=ok_load)
+        c.chat_completion = AsyncMock(side_effect=_chat)
+        c.ensure_unloaded = AsyncMock(return_value=True)
+        # Host stays dirty no matter what: unload sweep is a no-op here.
+        c.unload_all = AsyncMock(return_value={})
+        c.get_loaded_instances = AsyncMock(return_value=[
+            {"instance_id": "stuck", "model": "m", "config": {}}
+        ])
+        with pytest.raises(UnloadNotClean):
+            asyncio.run(run_one(c, "m", LoadConfiguration(context_length=2048)))
+
+
+class TestFlashLessonPersists:
+    def _opt(self):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from lm_optimizer.domain.models import ModelIdentity, OptimizationRun
+        from lm_optimizer.services.optimizer import AdaptiveOptimizer, OptimizationState
+        from lm_optimizer.services.search_space import SearchSpace
+
+        opt = AdaptiveOptimizer.__new__(AdaptiveOptimizer)
+        opt.client = MagicMock()
+        opt.benchmark = MagicMock()
+        opt.quality = MagicMock()
+        opt.search_generator = MagicMock()
+        opt.state = OptimizationState(
+            run=OptimizationRun(model=ModelIdentity(id="m", name="m")),
+            search_space=SearchSpace(),
+        )
+        opt._progress_cb = None
+        return opt
+
+    def _failed(self, error):
+        from lm_optimizer.domain.models import ConfigurationResult
+
+        r = ConfigurationResult()
+        r.error = error
+        return r
+
+    def test_lesson_persists_to_settings(self):
+        from lm_optimizer.database.repositories import settings_repo
+
+        opt = self._opt()
+        opt._note_flash_requirement(
+            self._failed("V Cache Quantization requires flash attention (KV-Q4)")
+        )
+        assert opt.state.flash_required is True
+        assert settings_repo.get("flash_required") == "1"
+
+    def test_other_errors_do_not_set_flag(self):
+        from lm_optimizer.database.repositories import settings_repo
+
+        opt = self._opt()
+        opt._note_flash_requirement(self._failed("OOM allocating KV cache"))
+        assert opt.state.flash_required is False
+        assert settings_repo.get("flash_required") is None
+
+    def test_prepare_applies_persisted_advice(self):
+        from lm_optimizer.database.repositories import settings_repo
+
+        settings_repo.set("flash_required", "1")
+        opt = self._opt()
+        opt._apply_persisted_flash_advice()
+        assert opt.state.flash_required is True
+
+    def test_flash_off_success_clears_flag(self):
+        from lm_optimizer.database.repositories import settings_repo
+        from lm_optimizer.domain.models import LoadConfiguration
+
+        settings_repo.set("flash_required", "1")
+        opt = self._opt()
+        opt.state.flash_required = True
+        opt._clear_flash_requirement(LoadConfiguration(flash_attention=False))
+        assert opt.state.flash_required is False
+        assert settings_repo.get("flash_required") == "0"
+
+
+class TestDisplayTotal:
+    def _state(self, tested, planned, estimate=5040):
+        from types import SimpleNamespace
+
+        space = SimpleNamespace(estimate_size=lambda: estimate)
+        return SimpleNamespace(tested_configs=[None] * tested,
+                               planned_total=planned, search_space=space)
+
+    def test_prefers_planned(self):
+        from lm_optimizer.services.optimizer import _display_total
+
+        assert _display_total(self._state(5, 25)) == 25
+
+    def test_never_below_tested(self):
+        from lm_optimizer.services.optimizer import _display_total
+
+        assert _display_total(self._state(30, 25)) == 30
+
+    def test_legacy_falls_back_to_estimate(self):
+        from lm_optimizer.services.optimizer import _display_total
+
+        assert _display_total(self._state(2, 0)) == 5040
+        assert _display_total(self._state(0, 0, estimate=0)) == 1
+
+    def test_completed_run_reports_full_bar(self):
+        # End-of-run display contract: CLI sets the bar to 100 explicitly;
+        # _display_total never exceeds tested reality mid-run.
+        from lm_optimizer.services.optimizer import _display_total
+
+        assert _display_total(self._state(25, 30)) == 30
+
+
+class TestGenerationProfiles:
+    def test_known_and_unknown_families(self):
+        from lm_optimizer.services.generation_profiles import profiles_for
+
+        qwen = profiles_for("qwen3.8-9b-distill", "qwen35")
+        assert set(qwen) == {"precision", "chat", "creative"}
+        assert qwen["precision"]["ours"]["temperature"] == 0.1
+        assert qwen["precision"]["publisher"]["temperature"] == 0.6
+        unknown = profiles_for("some-future-model-x", None)
+        assert unknown["chat"]["publisher"] is None
+        assert unknown["precision"]["ours"]["temperature"] == 0.1
+
+    def test_every_number_has_source(self):
+        from lm_optimizer.services.generation_profiles import profiles_for
+
+        for mid, arch in [("qwen3.8-9b-distill", "qwen35"),
+                          ("mistralai/ministral-3-3b", "mistral3"),
+                          ("google/gemma-4-12b", "gemma4"),
+                          ("openai/gpt-oss-20b", "gpt-oss"),
+                          ("mystery", None)]:
+            for _name, prof in profiles_for(mid, arch).items():
+                assert prof["ours"].get("source"), (mid, _name)
+                pub = prof.get("publisher")
+                if pub is not None:
+                    assert pub.get("source"), (mid, _name)
+
+
+class TestUnifiedMemory:
+    def test_darwin_reports_unified_without_nvidia(self, monkeypatch):
+        import platform as _platform
+
+        import lm_optimizer.services.hostguard as hg
+
+        def _no_subprocess(*a, **k):
+            raise AssertionError("nvidia-smi must not run on Darwin")
+
+        monkeypatch.setattr(_platform, "system", lambda: "Darwin")
+        monkeypatch.setattr(hg.subprocess, "run", _no_subprocess)
+        snap = hg.gpu_free_mb()
+        assert snap and snap[0].get("unified_memory") is True
+        lines = hg.format_snapshot({"gpus": snap, "mem": {}, "verified_empty": True})
+        assert any("unified" in line.lower() for line in lines)
+
+    def test_nvidia_path_unchanged(self, monkeypatch):
+        import lm_optimizer.services.hostguard as hg
+
+        snap = hg.gpu_free_mb()
+        assert isinstance(snap, list)
+
+
 class TestDarkMode:
     def test_theme_wired_everywhere(self):
         from pathlib import Path

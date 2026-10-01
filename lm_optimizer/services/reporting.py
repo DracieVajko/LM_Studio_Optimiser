@@ -86,6 +86,180 @@ def _prune_notes(run: OptimizationRun, configs: list) -> list[str]:
     return notes
 
 
+def _failure_classes(configs: list) -> dict:
+    """Count configs by terminal status."""
+    out: dict[str, int] = {}
+    for c in configs:
+        try:
+            key = c.status.value
+        except Exception:
+            key = "unknown"
+        out[key] = out.get(key, 0) + 1
+    return out
+
+
+def _closest_config(configs: list):
+    """Config with the highest quality overall (None-safe)."""
+    scored = []
+    for c in configs:
+        try:
+            q = c.quality_score.overall if c.quality_score else -1.0
+        except Exception:
+            q = -1.0
+        scored.append((float(q if q is not None else -1.0), c))
+    scored.sort(key=lambda t: t[0], reverse=True)
+    return scored[0][1] if scored else None
+
+
+def _failed_guidance(configs: list) -> list[str]:
+    """Top debugging hints from the failure pattern (honest, no guessing)."""
+    hints: list[str] = []
+    zero_tests: dict[str, int] = {}
+    for c in configs:
+        try:
+            qbt = (c.generation or {}).get("quality_by_test") or {}
+        except Exception:
+            qbt = {}
+        for name, entry in qbt.items():
+            try:
+                if float((entry or {}).get("overall", 1.0)) <= 0.0:
+                    zero_tests[name] = zero_tests.get(name, 0) + 1
+            except Exception:
+                continue
+    if zero_tests:
+        worst = sorted(zero_tests.items(), key=lambda kv: kv[1], reverse=True)[0][0]
+        hints.append(
+            f"Single-test blocker: '{worst}' scores 0 on every quality config. "
+            "Check its full outputs below."
+        )
+        if worst == "structured_output":
+            hints.append(
+                "Structured hint: the model thinks aloud instead of emitting JSON. "
+                "A one-shot nudge retry is attempted automatically; if outputs still "
+                "contain no JSON object, the model cannot do strict JSON at these "
+                "settings — lower the bar or accept chat-only use."
+            )
+    loads = sum(1 for c in configs if "load" in str(getattr(c, "status", "")).lower())
+    if loads:
+        hints.append(
+            f"{loads} load failures: verify LM Studio GUI settings the REST API "
+            "cannot set (KV quant, threads, Keep Model in Memory OFF)."
+        )
+    if not hints:
+        hints.append("No single dominant cause; review the per-test table below.")
+    return hints
+
+
+def save_failed_report(
+    run: OptimizationRun,
+    out_dir: str | Path = "results",
+    stamp: str | None = None,
+) -> Path | None:
+    """Save a debug .md for runs WITHOUT a validated winner. Returns path.
+
+    Includes the per-config table, per-test breakdown of the closest config
+    and FULL failed-test outputs so the user (or a later session) can decide
+    or debug. Winner runs return None (save_best_report owns those).
+    """
+    if run.get_best_config() is not None:
+        return None
+    configs = list(run.configurations or [])
+    if not configs:
+        logger.warning("No configurations to report", model=run.model.id)
+        return None
+
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    stamp = stamp or datetime.now().strftime("%Y%m%d-%H%M%S")
+    path = out / f"{sanitize_model_filename(run.model.id)}-failed-{stamp}.md"
+    closest = _closest_config(configs)
+    classes = _failure_classes(configs)
+
+    def _checks_str(c) -> str:
+        try:
+            qs = c.quality_score
+            if qs and qs.checks_total:
+                return f"{qs.checks_passed}/{qs.checks_total}"
+        except Exception:
+            pass
+        return "—"
+
+    lines = [
+        f"# FAILED run: {run.model.id} (no validated winner)",
+        "",
+        f"- Date: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        f"- Profile: {run.profile.value}",
+        f"- Run: {run.id} (status: {run.status.value})",
+        f"- Optimizer: {run.optimizer_version}",
+        f"- Elapsed: {run.duration_seconds:.1f}s" if run.duration_seconds else "- Elapsed: N/A",
+        f"- Configs tested: {len(configs)}",
+        f"- Failure classes: {classes}",
+        "",
+        "## Per-config results",
+        "",
+        "| Ctx | Gen tok/s | Quality | Checks | Status | Error |",
+        "| --- | --- | --- | --- | --- | --- |",
+    ]
+    for c in configs:
+        try:
+            q = c.quality_score.overall if c.quality_score else None
+        except Exception:
+            q = None
+        lines.append(
+            f"| {c.context_length} | {c.get_avg_generation_tok_s():.1f} | "
+            f"{(f'{q:.3f}' if q is not None else '—')} | {_checks_str(c)} | "
+            f"{getattr(c.status, 'value', c.status)} | "
+            f"{str(c.error or '')[:120]} |"
+        )
+    lines += ["", "## Closest config per-test breakdown", ""]
+    if closest is not None:
+        try:
+            qbt = (closest.generation or {}).get("quality_by_test") or {}
+        except Exception:
+            qbt = {}
+        lines += [
+            f"- Config: {closest.id} (ctx {closest.context_length})",
+            "",
+            "| Test | Overall | Checks |",
+            "| --- | --- | --- |",
+        ]
+        for name, entry in qbt.items():
+            try:
+                lines.append(
+                    f"| {name} | {float(entry.get('overall', -1)):.3f} | "
+                    f"{entry.get('checks_passed', '?')}/{entry.get('checks_total', '?')} |"
+                )
+            except Exception:
+                lines.append(f"| {name} | n/a | n/a |")
+        lines += ["", "## Full failed-test outputs (closest config)", ""]
+        failed_names = set()
+        for name, entry in qbt.items():
+            try:
+                if float((entry or {}).get("overall", 1.0)) <= 0.0:
+                    failed_names.add(name)
+            except Exception:
+                continue
+        by_name = {}
+        try:
+            for m in closest.metrics or []:
+                by_name[m.test_name] = m
+        except Exception:
+            pass
+        if not failed_names:
+            lines.append("_No fully-failed tests; closest config failed on aggregate._")
+        for name in sorted(failed_names):
+            m = by_name.get(name)
+            text = (m.output_text if m is not None and m.output_text else "")
+            lines += [f"### {name}", "", "```", text, "```", ""]
+    lines += ["## Guidance", ""]
+    for hint in _failed_guidance(configs):
+        lines.append(f"- {hint}")
+    lines += [""]
+    path.write_text("\n".join(lines), encoding="utf-8")
+    logger.info("Failed report saved", path=str(path))
+    return path
+
+
 def save_fit_report(
     ladder_out: dict,
     out_dir: str | Path = "results",

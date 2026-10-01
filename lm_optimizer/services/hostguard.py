@@ -21,7 +21,20 @@ NVSMI_FIELDS = 4  # index, name, mem.used, mem.total
 
 
 def gpu_free_mb() -> list[dict[str, Any]]:
-    """Per-GPU free/total MB via nvidia-smi (empty-error dict if unavailable)."""
+    """Per-GPU free/total MB via nvidia-smi (empty-error dict if unavailable).
+
+    Apple Silicon has unified memory (no separate VRAM): reported honestly
+    as a unified entry instead of a fake nvidia-smi error.
+    """
+    if platform.system() == "Darwin":
+        return [
+            {
+                "id": 0,
+                "name": "Apple Silicon (unified memory)",
+                "unified_memory": True,
+                "note": "No separate VRAM on Apple Silicon; see RAM figures.",
+            }
+        ]
     try:
         out = subprocess.run(
             [
@@ -200,18 +213,22 @@ def format_snapshot(snap: dict[str, Any]) -> list[str]:
     for g in snap.get("gpus", []):
         if "error" in g:
             lines.append(f"GPU: {g['error']}")
+        elif g.get("unified_memory"):
+            lines.append(f"GPU: {g.get('name', 'unified memory')} (no separate VRAM; see RAM)")
         else:
             lines.append(
                 f"GPU {g['id']} {g['name']}: free {g['free_mb']:.0f}/{g['total_mb']:.0f} MB"
             )
-    m = snap.get("mem", {})
+    m = snap.get("mem", {}) or {}
     if "unavailable" in m:
         lines.append(f"RAM: {m['unavailable']}")
-    else:
+    elif all(k in m for k in ("ram_free_gb", "ram_total_gb", "swap_free_gb", "swap_total_gb")):
         lines.append(
             f"RAM free: {m['ram_free_gb']:.1f}/{m['ram_total_gb']:.1f} GB, "
             f"swap free: {m['swap_free_gb']:.1f}/{m['swap_total_gb']:.1f} GB"
         )
+    else:
+        lines.append("RAM: measurements unavailable on this host.")
     if snap.get("verified_empty"):
         lines.append("Loaded models before start: none (verified).")
     elif "leftovers" in snap:

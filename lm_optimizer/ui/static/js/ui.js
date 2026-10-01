@@ -256,6 +256,19 @@ export const UI = {
                     Select a model to start
                 </button>
                 <p class="text-xs text-center text-gray-400">Optimization will benchmark many configurations — you will see a review before it starts.</p>
+
+                <!-- Optimize all: sequential runs over every model -->
+                <div class="mt-6 p-4 bg-gray-50 rounded-lg border">
+                    <h3 class="font-medium mb-1">Optimize all models, one by one</h3>
+                    <p class="text-xs text-gray-500 mb-2">Runs the same profile through every model sequentially (embedding models excluded). Failures are logged, the queue continues. Uses the profile + quality threshold above.</p>
+                    <label class="form-label">Skip terms (comma-separated, matched against model IDs)</label>
+                    <input type="text" id="all-skip" placeholder="e.g. 27b, ternary, deepseek" class="form-input w-full mb-2">
+                    <div class="flex gap-2">
+                        <button id="start-all" class="btn btn-primary">Start optimize-all</button>
+                        <button id="stop-all" class="btn btn-outline hidden">Stop after current</button>
+                    </div>
+                    <div id="all-progress" class="mt-2 text-sm"></div>
+                </div>
             </div>
         `;
     },

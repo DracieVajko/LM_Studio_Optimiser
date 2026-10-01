@@ -613,6 +613,37 @@ class BenchmarkService:
                     prompt=case.prompt,
                 )
 
+            # Structured nudge: think-aloud SFTs sometimes end the turn without
+            # emitting any JSON (verified live: thinking-only output under the
+            # token budget). Exactly one follow-up asking for JSON only; the
+            # first output becomes thinking. Usage/stats describe the scored
+            # (second) generation.
+            if case.name == "structured_output" and output_text.strip():
+                from lm_optimizer.services.quality import _extract_json_object
+
+                if _extract_json_object(output_text) is None:
+                    try:
+                        nudge = await self.client.chat_completion(
+                            model=model_id,
+                            input_text=(
+                                "Your previous message contained no JSON object. "
+                                "Reply with ONLY the JSON object, no other text."
+                            ),
+                            temperature=case.temperature,
+                            max_output_tokens=case.max_tokens,
+                            reasoning=reasoning,
+                        )
+                        nusage, ntext, nstats = self._extract_response(nudge)
+                        if ntext.strip():
+                            thinking_text = (
+                                (thinking_text + "\n" if thinking_text else "")
+                                + output_text
+                            )
+                            output_text, usage, stats = ntext, nusage, nstats
+                    except Exception as e:
+                        logger.debug("Structured nudge failed", case=case.name,
+                                     error=str(e))
+
             total_time_ms = (time.perf_counter() - start_time) * 1000
 
             prompt_tokens = usage.get("prompt_tokens", 0)

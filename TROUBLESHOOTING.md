@@ -134,6 +134,22 @@
 4. Disable Windows "Game Mode" and GPU scheduling
 5. Set GPU to "Maximum Performance" in NVIDIA Control Panel
 
+### 11. Two Models Loaded at Once (host-dirty stop)
+
+**Symptoms:**
+- Run stops with `host-dirty` / `UnloadNotClean`
+- Two models visible in LM Studio Loaded Models (e.g. previous in GPU, new in RAM)
+- Speeds measured while sharing the GPU are not comparable
+
+**Cause:** the previous model did not unload. Most common trigger: LM Studio
+**Keep Model in Memory** enabled, which makes unload requests not take effect.
+
+**Solutions:**
+1. LM Studio → Settings → Model loading → disable **Keep Model in Memory** for optimizer runs
+2. Or unload manually in LM Studio (Loaded Models → Eject) and resume/retry
+3. The optimizer enforces this fail-closed: no measurements are taken on a
+   dirty host; re-run the affected model after cleaning
+
 ## Debugging
 
 ### Enable Verbose Logging

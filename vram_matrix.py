@@ -41,7 +41,13 @@ async def amain(args: argparse.Namespace) -> int:
                 f"flash={cfg.flash_attention} kv-gpu={cfg.offload_kv_cache_to_gpu} ...",
                 flush=True,
             )
-            r = await run_one(client, args.model, cfg)
+            from lm_optimizer.services.unload_guard import UnloadNotClean
+
+            try:
+                r = await run_one(client, args.model, cfg)
+            except UnloadNotClean as e:
+                print(f"\nSTOPPING: host not clean: {e}")
+                return 2
             results.append(r)
             status = "OK " if r["ok"] else "FAIL"
             print(

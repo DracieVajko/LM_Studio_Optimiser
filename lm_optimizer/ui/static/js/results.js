@@ -31,6 +31,7 @@ const ResultsPage = {
         if (!ok) return; // error card already rendered; never a spinner
         try {
             this.render();
+            this.loadGenerationProfiles();
         } catch (e) {
             console.error('Results render failed:', e);
             document.getElementById('main-content').innerHTML = UI.renderRunError(
@@ -274,6 +275,10 @@ const ResultsPage = {
                     ${this.renderBestConfigDetails(bestConfig)}
                     ${this.renderPhaseABStrip(bestConfig)}
                     ${this.renderAlternatives(bestConfig)}
+                    <div class="mt-4 p-3 bg-gray-50 rounded" id="gen-profiles">
+                        <h4 class="font-medium mb-1">GENERATION PROFILES</h4>
+                        <p class="text-xs text-gray-500">Loading recommendations...</p>
+                    </div>
                 </div>
             </div>
         `;
@@ -664,6 +669,31 @@ const ResultsPage = {
         });
     },
 
+    async loadGenerationProfiles() {
+        const box = document.getElementById('gen-profiles');
+        if (!box) return;
+        const model = this.state.run?.model;
+        if (!model) return;
+        try {
+            const r = await fetch(`/api/generation-profiles?model_id=${encodeURIComponent(model.id)}`);
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            const j = await r.json();
+            const fmt = (v) => v == null ? 'server default' : String(v);
+            const col = (title, d) => d
+                ? `<div><span class="font-medium">${title}</span> <span class="text-xs text-gray-500">(${d.source})</span><br>`
+                  + `<span class="font-mono text-xs">temp ${fmt(d.temperature)} · top_p ${fmt(d.top_p)} · top_k ${fmt(d.top_k)}</span><br>`
+                  + `<span class="text-xs text-gray-500">${d.note || ''}</span></div>`
+                : `<div><span class="font-medium">${title}</span><br><span class="text-xs text-gray-500">check the model card</span></div>`;
+            box.innerHTML = '<h4 class="font-medium mb-1">GENERATION PROFILES</h4>' + Object.entries(j.profiles || {}).map(([name, p]) =>
+                `<div class="mt-2 border-t pt-1"><span class="font-medium capitalize">${name}</span> <span class="text-xs text-gray-500">— ${p.use || ''}</span>`
+                + `<div class="grid md:grid-cols-2 gap-2 mt-1">${col('Measured (benchmark)', p.ours)}${col('Publisher', p.publisher)}</div></div>`
+            ).join('');
+        } catch (e) {
+            box.innerHTML = '<h4 class="font-medium mb-1">GENERATION PROFILES</h4>'
+                + `<p class="text-xs text-gray-500">Unavailable: ${String((e && e.message) || e).slice(0, 160)}</p>`;
+        }
+    },
+
     async loadFullOutput(btn) {
         const slot = document.querySelector(
             `[data-full-out="${btn.dataset.cfg}:${btn.dataset.test}"]`
@@ -679,7 +709,10 @@ const ResultsPage = {
             const m = (detail.metrics || []).find(x => x.test_name === btn.dataset.test);
             if (!m) throw new Error('test not found');
             const q = m.quality_overall != null ? `quality ${m.quality_overall}` : 'quality n/a';
-            slot.innerHTML = `<p class="text-xs text-gray-500">${q} · in ${m.prompt_tokens ?? '—'} / out ${m.completion_tokens ?? '—'} tok</p>`
+            const warn = m.thinking_outside_json
+                ? '<p class="text-xs mt-1"><span class="badge badge-warning" title="Model reasoned outside the JSON object; structure extracted with format penalty">⚠ thinking outside JSON — passed with warning</span></p>'
+                : '';
+            slot.innerHTML = `<p class="text-xs text-gray-500">${q} · in ${m.prompt_tokens ?? '—'} / out ${m.completion_tokens ?? '—'} tok</p>${warn}`
                 + `<div class="text-xs font-medium mt-1">Thinking</div>`
                 + `<pre class="font-mono text-xs bg-gray-50 p-2 rounded overflow-auto max-h-96">${String(m.thinking_text || 'n/a').slice(0, 20000)}</pre>`
                 + `<div class="text-xs font-medium mt-1">Output</div>`

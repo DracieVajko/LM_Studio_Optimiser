@@ -65,16 +65,18 @@ echo  LM Studio Auto Optimizer
 echo ========================================
 echo  [1] Start Web UI - server plus browser
 echo  [2] Optimize one model
-echo  [3] Check LM Studio connection
-echo  [4] List models
-echo  [5] Exit
+echo  [3] Optimize all models one by one
+echo  [4] Check LM Studio connection
+echo  [5] List models
+echo  [6] Exit
 echo.
-set /p choice="Select 1-5: "
+set /p choice="Select 1-6: "
 if "%choice%"=="1" goto webui
 if "%choice%"=="2" goto optimize_one
-if "%choice%"=="3" goto check
-if "%choice%"=="4" goto models
-if "%choice%"=="5" goto end
+if "%choice%"=="3" goto optimize_all
+if "%choice%"=="4" goto check
+if "%choice%"=="5" goto models
+if "%choice%"=="6" goto end
 echo Invalid choice.
 goto menu
 
@@ -133,6 +135,27 @@ set /p oconfirm="Start optimization? Y/n: "
 if /i not "%oconfirm%"=="Y" if not "%oconfirm%"=="" goto menu
 call :log "optimize %omodel% profile %oprofile%"
 "%PYBIN%" -m lm_optimizer optimize "%omodel%" --profile "%oprofile%"
+echo.
+echo Finished with exit code %errorlevel%. Press any key for menu.
+pause >nul
+goto menu
+
+:optimize_all
+"%PYBIN%" -m lm_optimizer models --full-ids > "%TEMP%\lmo_models.txt" 2>nul
+type "%TEMP%\lmo_models.txt"
+echo.
+echo Runs the full pipeline per model, small first. This takes hours.
+set /p oprofile="Profile speed/balanced/context/quality - default balanced: "
+if "%oprofile%"=="" set oprofile=balanced
+set /p oskip="Skip terms, comma-separated, empty for none: "
+if "%oskip%"=="" goto all_noskip
+call :log "optimize-all profile %oprofile% skip %oskip%"
+"%PYBIN%" -m lm_optimizer auto --profile "%oprofile%" --skip "%oskip%"
+goto all_done
+:all_noskip
+call :log "optimize-all profile %oprofile%"
+"%PYBIN%" -m lm_optimizer auto --profile "%oprofile%"
+:all_done
 echo.
 echo Finished with exit code %errorlevel%. Press any key for menu.
 pause >nul

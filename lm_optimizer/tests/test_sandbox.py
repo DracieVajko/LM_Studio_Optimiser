@@ -36,6 +36,8 @@ def _client(text_a="Answer A.", text_b="Answer B.", fail_b=False, tok_a=60.0, to
     c.load_model = AsyncMock(side_effect=_load)
     c.ensure_unloaded = AsyncMock(return_value=True)
     c.chat_completion = AsyncMock(side_effect=_chat)
+    c.unload_all = AsyncMock(return_value={})
+    c.get_loaded_instances = AsyncMock(return_value=[])
     return c
 
 
@@ -242,6 +244,92 @@ class TestSandboxPresets:
         for needle in ("Hash-table explainer", "find_duplicates coding", "Coffee landing page",
                        "Todo app", "Skyblock demo", "Simple spinner", "sb-presets"):
             assert needle in js, f"missing preset: {needle}"
+
+
+class TestStartOptimization:
+    def test_returns_run_immediately(self, monkeypatch):
+        """POST /api/optimize must return the prepared run, never 500."""
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+
+        import lm_optimizer.api.routes as routes
+        from lm_optimizer.api.main import app
+        from lm_optimizer.domain.models import (
+            ModelIdentity,
+            OptimizationProfile,
+            OptimizationRun,
+            RunStatus,
+        )
+        from fastapi.testclient import TestClient
+
+        run = OptimizationRun(
+            model=ModelIdentity(id="m", name="m"), profile=OptimizationProfile.BALANCED,
+            status=RunStatus.RUNNING,
+        )
+
+        class FakeClient:
+            async def get_model(self, model_id):
+                return ModelIdentity(id=model_id, name=model_id)
+
+            async def close(self):
+                pass
+
+        async def fake_get_client(echo_probe=True):
+            return FakeClient()
+
+        calls: list = []
+
+        class FakeOptimizer:
+            # NOTE: no .state here on purpose: the route must use the
+            # prepare_run() return value, never optimizer.state (None
+            # until the background task runs -> the production 500).
+            async def prepare_run(self, *args, **kwargs):
+                calls.append(args)
+                return run, None, {}
+        monkeypatch.setattr(routes, "get_lm_client", fake_get_client)
+        monkeypatch.setattr(routes, "AdaptiveOptimizer", lambda *a, **k: FakeOptimizer())
+        monkeypatch.setattr(routes, "run_optimization_task", AsyncMock())
+        old_opt, old_id = routes._current_optimizer, routes._current_run_id
+        try:
+            with TestClient(app, raise_server_exceptions=False) as c:
+                r = c.post("/api/optimize", json={"model_id": "m"})
+                assert r.status_code == 200, r.text[:300]
+                assert r.json()["id"] == str(run.id)
+                assert r.json()["status"] == "running"
+        finally:
+            routes._current_optimizer, routes._current_run_id = old_opt, old_id
+
+
+class TestOptimizeDirtyHost:
+    def test_dirty_host_rejected_409(self, monkeypatch):
+        """A resident model must refuse new web optimizations (fail-closed)."""
+        from unittest.mock import AsyncMock
+
+        import lm_optimizer.api.routes as routes
+        from lm_optimizer.api.main import app
+        from lm_optimizer.domain.models import ModelIdentity
+        from fastapi.testclient import TestClient
+
+        class StubbornClient:
+            async def get_model(self, model_id):
+                return ModelIdentity(id=model_id, name=model_id)
+
+            async def unload_all(self):
+                return {}
+
+            async def get_loaded_instances(self):
+                return [{"instance_id": "stuck", "model": "other", "config": {}}]
+
+            async def close(self):
+                pass
+
+        async def fake_get_client(echo_probe=True):
+            return StubbornClient()
+
+        monkeypatch.setattr(routes, "get_lm_client", fake_get_client)
+        with TestClient(app, raise_server_exceptions=False) as c:
+            r = c.post("/api/optimize", json={"model_id": "m"})
+            assert r.status_code == 409, r.text[:300]
 
 
 class TestSandboxApi:

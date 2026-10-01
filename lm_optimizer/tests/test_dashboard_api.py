@@ -149,8 +149,8 @@ class TestLauncher:
         for item in ("[1/4]", "[2/4]", "[3/4]", "[4/4]", "startup.log",
                      "/api/status", "127.0.0.1:8080", ".venv",
                      "Press any key", "FAILED",
-                     "Optimize one model", "Check LM Studio",
-                     "List models", "Select 1-5"):
+                     "Optimize one model", "Optimize all models one by one",
+                     "Check LM Studio", "List models", "Select 1-6"):
             assert item in text, f"launcher missing: {item}"
         low = text.lower()
         # Browser opens only after readiness; no bulk auto-runs.

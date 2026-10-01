@@ -31,6 +31,16 @@ results/
 # Pause signal flags (live control files)
 pause_*.flag
 
+# Temporary / backup / merge artifacts (never commit; do NOT broaden to .env.*)
+*.tmp
+*.temp
+*.bak
+*.orig
+*.rej
+*.swp
+*.swo
+*~
+
 # OS / editor noise
 .DS_Store
 Thumbs.db

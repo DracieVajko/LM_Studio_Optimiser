@@ -15,6 +15,9 @@ SPEED_PROBE_NAME = "speed_probe"
 
 DEFAULT_SPEED_CONTEXT = 2048
 DEFAULT_QUALITY_CONTEXT = 8192
+# Speed probes measure RELATIVE lever effects at a frozen context; capping
+# keeps loads and KV allocation cheap. Quality always runs at the user cap.
+SPEED_CONTEXT_MAX = 4096
 
 
 def speed_probe_case() -> BenchmarkCase:
@@ -29,13 +32,15 @@ def speed_probe_case() -> BenchmarkCase:
 
 
 def speed_context_for(user_cap: int | None, model_limit: int | None) -> int:
-    """Fixed Phase-A speed context: user cap wins, else small default.
+    """Fixed Phase-A speed context: small user caps win, large caps clamp.
 
-    Clamped to the model limit so small models stay loadable.
+    Capped at SPEED_CONTEXT_MAX (relative speeds are context-stable, loads
+    and KV stay cheap); always clamped to the model limit so small models
+    stay loadable. Quality context is unaffected (still honors the cap).
     """
     limit = model_limit or DEFAULT_QUALITY_CONTEXT
     if user_cap:
-        return min(int(user_cap), limit)
+        return min(int(user_cap), limit, SPEED_CONTEXT_MAX)
     return min(DEFAULT_SPEED_CONTEXT, limit)
 
 

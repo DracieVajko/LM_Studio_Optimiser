@@ -112,11 +112,10 @@ async def run_one(client: LMStudioClient, model: str, cfg: LoadConfiguration) ->
     else:
         res["ok"] = True
     finally:
-        try:
-            if not await client.ensure_unloaded(model):
-                res["ok"] = False
-                res["error"] += " | model still loaded after unload"
-        except Exception as e:
-            res["ok"] = False
-            res["error"] += f" | unload failed: {e}"
+        # Fail-closed: a dirty row must stop the caller, never silently
+        # contaminate the next measurement (warn-and-continue caused the
+        # qwen-in-GPU/marco-in-RAM incident).
+        from lm_optimizer.services.unload_guard import assert_unloaded
+
+        await assert_unloaded(client, purpose=f"matrix:{model}")
     return res

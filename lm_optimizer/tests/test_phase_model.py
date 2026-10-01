@@ -28,12 +28,18 @@ class TestSpeedContext:
     def test_default_small(self):
         assert speed_context_for(None, 131072) == 2048
 
-    def test_user_cap_wins(self):
-        assert speed_context_for(8192, 131072) == 8192
+    def test_small_user_cap_wins(self):
+        assert speed_context_for(2048, 131072) == 2048
+
+    def test_large_caps_clamped_to_speed_max(self):
+        # Speed measures relative lever effects; 4096 keeps loads/KV cheap.
+        # Quality still runs at the user cap (see quality_context_for).
+        assert speed_context_for(8192, 131072) == 4096
+        assert speed_context_for(32768, 262144) == 4096
+        assert speed_context_for(100000, 32768) == 4096
 
     def test_clamped_to_model_limit(self):
         assert speed_context_for(None, 1024) == 1024
-        assert speed_context_for(100000, 32768) == 32768
 
 
 class TestQualityContext:

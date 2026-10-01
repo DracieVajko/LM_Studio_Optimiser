@@ -89,6 +89,83 @@ def _run(configs):
     return run, best
 
 
+def _failed_cfg(name="structured_output", overall=0.0):
+    from lm_optimizer.domain.models import RunStatus
+
+    r = _result()
+    r.status = ConfigurationStatus.QUALITY_FAILED
+    r.score = None
+    r.error = f"Quality/correctness {overall} below threshold"
+    r.quality_score = _qs(overall=0.8)
+    r.generation = {
+        "stage": "quality_check",
+        "quality_by_test": {
+            "short_instruction": {"overall": 1.0, "checks_passed": 6, "checks_total": 6},
+            "coding_task": {"overall": 1.0, "checks_passed": 6, "checks_total": 6},
+            name: {"overall": overall, "checks_passed": 0, "checks_total": 6},
+        },
+    }
+    r.metrics = [
+        _metric(name="short_instruction", gen=60.0),
+        BenchmarkMetrics(
+            test_name=name, category="format", success=True, generation_tok_s=60.0,
+            prompt_tokens=10, completion_tokens=50, total_tokens=60,
+            output_text="thinking aloud, no JSON here",
+        ),
+    ]
+    return r
+
+
+def _failed_run():
+    from lm_optimizer.domain.models import RunStatus
+
+    run = OptimizationRun(
+        model=ModelIdentity(id="m-9", name="M9"),
+        hardware=_hw(),
+        profile=OptimizationProfile.BALANCED,
+        status=RunStatus.PARTIAL_SUCCESS,
+    )
+    run.configurations = [_failed_cfg(), _failed_cfg()]
+    for c in run.configurations:
+        c.run_id = run.id
+    run.best_config_id = None
+    return run
+
+
+class TestFailedReport:
+    def test_failed_report_created_with_debug_content(self, tmp_path):
+        from lm_optimizer.services.reporting import save_failed_report
+
+        run = _failed_run()
+        path = save_failed_report(run, out_dir=str(tmp_path))
+        assert path is not None and path.exists()
+        assert "failed" in path.name
+        text = path.read_text(encoding="utf-8")
+        assert "structured_output" in text
+        assert "thinking aloud, no JSON here" in text
+        assert "24/30" in text or "0/6" in text
+
+    def test_winner_run_writes_no_failed_report(self, tmp_path):
+        from lm_optimizer.services.reporting import save_failed_report
+
+        run, _best = _run([_result(), _result()])
+        assert save_failed_report(run, out_dir=str(tmp_path)) is None
+
+    def test_no_best_triggers_failed_report(self, monkeypatch, tmp_path):
+        import lm_optimizer.cli.main as _cli
+
+        called = {}
+
+        def _fake(run, out_dir="results", host=None):
+            called["run"] = run
+            return None
+
+        monkeypatch.setattr(_cli, "save_failed_report", _fake)
+        run = _failed_run()
+        assert _cli._save_preset_and_report("m-9", "balanced", run, _hw()) is False
+        assert called.get("run") is run
+
+
 class TestSpeedRange:
     def test_fastest_slowest(self):
         from lm_optimizer.services.run_summary import speed_range

@@ -44,7 +44,8 @@ from lm_optimizer.services.model_recommendations import (
     recommend_for_vram,
     threads_advice,
 )
-from lm_optimizer.services.reporting import save_best_report, save_fit_report
+from lm_optimizer.services.reporting import save_best_report, save_failed_report, save_fit_report
+from lm_optimizer.services.unload_guard import UnloadNotClean, assert_unloaded
 from lm_optimizer.services.optimizer import AdaptiveOptimizer
 from lm_optimizer.services.quality import QualityConfig, QualityEvaluator
 from lm_optimizer.services.search_space import SearchSpaceGenerator
@@ -390,6 +391,12 @@ def _save_preset_and_report(
     best_config = run.get_best_config()
     if best_config is None:
         console.print("[yellow]No successful configuration to save[/yellow]")
+        try:
+            failed_path = save_failed_report(run, out_dir=output)
+            if failed_path:
+                console.print(f"[yellow]Failed-run debug report: {failed_path}[/yellow]")
+        except Exception as e:
+            logger.debug("Failed report save failed", error=str(e))
         return False
     if model_info is not None:
         moe = expert_advice(model_info)
@@ -845,6 +852,14 @@ def optimize(
                 model_info=model_info,
             )
 
+            # Fail-closed post-hygiene: the host must be clean for whatever runs next.
+            try:
+                await assert_unloaded(client, purpose=f"optimize:{model}")
+            except UnloadNotClean as e:
+                logger.error("Host not clean after optimize", model=model)
+                console.print(f"[red]Done, but host not clean:[/red] {e}")
+                sys.exit(1)
+
         except KeyboardInterrupt:
             console.print("\n[yellow]Interrupted — checkpoint saved, resume with:[/yellow]")
             console.print("  lm-optimizer checkpoints")
@@ -1297,6 +1312,7 @@ def auto(
 
             smoke_service = BenchmarkService(client, style=style)
             quality_evaluator = QualityEvaluator(QualityConfig(minimum_score=quality_threshold))
+            host_dirty_stop = False
             for m in targets:
                 row = {
                     "model": m.id,
@@ -1532,6 +1548,23 @@ def auto(
                         await client.ensure_unloaded(m.id)
                     except Exception:
                         pass
+                # Fail-closed boundary: the next model must never inherit a
+                # dirty host (two models sharing the GPU invalidates speeds).
+                try:
+                    await assert_unloaded(client, purpose=f"auto:{m.id}")
+                except UnloadNotClean as e:
+                    logger.error("Host not clean, stopping pipeline", model=m.id)
+                    console.print(f"[red]Stopping pipeline, host not clean:[/red] {e}")
+                    summary.append({
+                        "model": "pipeline",
+                        "stage": "host-dirty",
+                        "detail": str(e)[:200],
+                        "full": str(e),
+                        "t0": time.perf_counter(),
+                        "elapsed_s": 0.0,
+                    })
+                    host_dirty_stop = True
+                    break
 
             table = Table(title="Auto pipeline summary")
             table.add_column("Model", style="cyan")
@@ -1565,6 +1598,13 @@ def auto(
                         f.write(f"### {r['model']} ({r['stage']})\n\n")
                         f.write(f"{r['full']}\n\n")
             console.print(f"[green]Summary saved: {summary_path}[/green]")
+            if host_dirty_stop:
+                console.print(
+                    "[red]Pipeline stopped: host could not be cleaned. "
+                    "Unload models in LM Studio (disable Keep Model in Memory) "
+                    "and resume.[/red]"
+                )
+                sys.exit(1)
 
         except Exception as e:
             logger.exception("Auto pipeline failed")
@@ -1669,6 +1709,14 @@ def fit(
                         await client.ensure_unloaded(m.id)
                     except Exception:
                         pass
+                # Fail-closed boundary (see auto loop): never ladder the next
+                # model on a dirty host.
+                try:
+                    await assert_unloaded(client, purpose=f"fit:{m.id}")
+                except UnloadNotClean as e:
+                    logger.error("Host not clean, stopping fit", model=m.id)
+                    console.print(f"[red]Stopping fit, host not clean:[/red] {e}")
+                    sys.exit(1)
         except Exception as e:
             logger.exception("Fit failed")
             console.print(f"[red]Error: {e}[/red]")
@@ -1803,9 +1851,15 @@ def ctx(
             sys.exit(1)
         finally:
             try:
-                await client.ensure_unloaded(model)
-            except Exception:
-                pass
+                await assert_unloaded(client, purpose=f"ctx:{model}")
+            except UnloadNotClean as e:
+                logger.error("Host not clean after ctx sweep", model=model)
+                console.print(f"[red]Done, but host not clean:[/red] {e}")
+                try:
+                    await client.close()
+                except Exception:
+                    pass
+                sys.exit(1)
             await client.close()
 
     try:

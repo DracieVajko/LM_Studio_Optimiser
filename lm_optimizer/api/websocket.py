@@ -153,9 +153,11 @@ async def send_current_state(run_id: UUID, websocket: WebSocket) -> None:
 
     opt = _routes._current_optimizer
     if opt and opt.state and opt.state.run.id == run_id:
+        from lm_optimizer.services.optimizer import _display_total
+
         state = opt.state
         configs = list(state.tested_configs)
-        total = state.search_space.estimate_size() if state.search_space else len(configs)
+        total = _display_total(state)
         elapsed = (
             (datetime.now() - state.started_at).total_seconds()
             if getattr(state, "started_at", None)

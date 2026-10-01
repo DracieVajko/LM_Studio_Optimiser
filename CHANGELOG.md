@@ -159,6 +159,48 @@ Physical end-to-end LM Studio validation is still pending.
 - **Version**: Bumped `0.1.0 → 1.0.0-beta` (PEP 440 `1.0.0b0` in package) across `pyproject.toml`, `__init__.py`, `api/main.py`, `domain/models.py`.
 - **Tests & CI**: Added smoke tests for URL, disconnected LM Studio, model/profile selection, preset compatibility, DB init; `pytest 61 passed`, `ruff check`, `mypy`, `compileall` clean.
 
+## [1.2.0] - 2026-10-01
+
+### Added
+- **Unload guard (`services/unload_guard.py`)**: fail-closed `assert_unloaded()` on every
+  model boundary (auto/fit/ctx/matrix loops, optimize CLI, sandbox duels, config compare,
+  web optimize start). A stuck model stops the run with a Keep-OFF hint instead of
+  silently contaminating the next model's speed measurements.
+- **Structured-output nudge**: one follow-up call (`Reply with ONLY the JSON object`)
+  when a reasoning model thinks aloud without emitting JSON; original text kept as thinking.
+- **Failed-run reports**: `results/<model>-failed-<stamp>.md` with per-config table,
+  per-test breakdown of the closest config, full failed-test outputs and guidance.
+- **Generation profiles**: measured benchmark settings + publisher recommendations
+  (Precision / Chat / Creative) per architecture family, every value source-tagged;
+  `GET /api/generation-profiles` + Results section.
+- **Optimize-all**: dashboard queue (multi-model sequential runs with skip terms and
+  stop-after-current), CMD menu item `[3]`, `run-model.bat ALL`, Linux passthrough docs.
+- **Installers**: `install.bat` / `install.sh` (venv + `pip install -e .[dev]` + `.env`
+  from example) and `.env.example`.
+- **CI matrix**: GitHub Actions on `ubuntu-latest` + `macos-latest` (pytest + JS syntax).
+- **Apple Silicon honesty**: unified-memory entry instead of fake VRAM errors; hardened
+  snapshot formatting.
+
+### Changed
+- **Speed context capped at 4096** (was: full user cap up to 32768): cheaper loads/KV,
+  quality phase still runs at the user cap.
+- **Progress bar**: planned probe units instead of the Cartesian estimate; recovery
+  budget planned upfront so the bar never dips mid-run.
+- **KV-quant flash lesson persists** across runs (preskips known-impossible flash-off
+  probes; self-heals when a flash-off load serves).
+- **JSON fallback**: think-aloud-before-JSON extracts with `format 0.5` +
+  `thinking_outside_json` flag and UI warning instead of auto-0; stray `</think>`
+  penalized via `no_malformed`.
+- **README rewritten** for v1.1.0+ reality (sandbox, duels, dark mode, per-OS launchers,
+  screenshot slots, platform matrix); Troubleshooting §11 (two-models-loaded); Linux
+  `.sh` launchers; `TROUBLESHOOTING.md` Keep-OFF prerequisite.
+
+### Fixed
+- **HTTP 500 on Start Optimization**: run+state prepared synchronously (`prepare_run()`
+  / `execute()` split); background task continues from the prepared run.
+- Menu batch fall-through in `run-model.bat`; launcher test updated for the new item.
+- Stale `running` rows in `cleanup_test_runs` are listed, never auto-deleted.
+
 ## [1.1.0] - 2026-09-28
 
 ### Added

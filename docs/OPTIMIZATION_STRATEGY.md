@@ -18,9 +18,10 @@ PREPARE → SPEED (fixed small ctx) → FRONTIER → QUALITY (frozen finalists)
 
 ## Phase A — runtime (context frozen)
 
-- `speed_context` = user `--max-context` cap if configured, else **2048**
-  (clamped to the model limit). `quality_context` = user cap if configured,
-  else `min(model limit, 8192)`, never below speed context.
+- `speed_context` = user `--max-context` cap up to **4096** (larger caps
+  clamp; relative lever effects are context-stable, loads/KV stay cheap),
+  else **2048** (clamped to the model limit). `quality_context` = user cap
+  if configured, else `min(model limit, 8192)`, never below speed context.
 - Every speed candidate uses the same context. Context never enters the
   Phase-A score (context weight forced to 0, other weights renormalized).
 

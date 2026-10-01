@@ -181,6 +181,85 @@ const App = {
         if (refreshBtn) {
             refreshBtn.addEventListener('click', () => this.loadDashboard());
         }
+
+        // Optimize-all queue
+        const startAll = document.getElementById('start-all');
+        if (startAll) {
+            startAll.addEventListener('click', () => this.startOptimizeAll());
+        }
+        const stopAll = document.getElementById('stop-all');
+        if (stopAll) {
+            stopAll.addEventListener('click', () => {
+                this.state.stopAllRequested = true;
+                stopAll.disabled = true;
+                stopAll.textContent = 'Stopping after current...';
+            });
+        }
+    },
+
+    _allQueue() {
+        const terms = (document.getElementById('all-skip')?.value || '')
+            .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+        return (this._lastModels || [])
+            .filter(m => !(m.id || '').toLowerCase().includes('embed'))
+            .filter(m => !terms.some(t => (m.id || '').toLowerCase().includes(t)));
+    },
+
+    _allProgressLine(done, total, current, extra) {
+        const el = document.getElementById('all-progress');
+        if (el) el.innerHTML = `<p class="font-medium">${done}/${total} done${current ? ` — now: ${current}` : ''}</p>` + (extra || '');
+    },
+
+    async startOptimizeAll() {
+        const queue = this._allQueue();
+        if (!queue.length) {
+            UI.showToast('No models in queue (all skipped?)', 'error');
+            return;
+        }
+        const profileEl = document.querySelector('input[name="profile"]:checked');
+        const profile = profileEl ? profileEl.value : 'balanced';
+        const qt = document.getElementById('quality-threshold');
+        const quality = qt ? parseFloat(qt.value) : 0.97;
+        const names = queue.map(m => m.id).join(', ');
+        if (!window.confirm(`Run ${queue.length} optimizations one by one?\n${names}\n\nThis takes hours. The page must stay open.`)) return;
+        this.state.stopAllRequested = false;
+        const stopBtn = document.getElementById('stop-all');
+        if (stopBtn) { stopBtn.classList.remove('hidden'); stopBtn.disabled = false; stopBtn.textContent = 'Stop after current'; }
+        const results = [];
+        for (let i = 0; i < queue.length; i++) {
+            if (this.state.stopAllRequested) {
+                results.push({ model: '—', status: 'stopped by user' });
+                break;
+            }
+            const m = queue[i];
+            this._allProgressLine(i, queue.length, m.id, results.map(r =>
+                `<div class="text-xs">${r.model}: ${r.status}</div>`).join(''));
+            try {
+                const started = await API.startOptimization({ model_id: m.id, profile, quality_threshold: quality });
+                const runId = started.id;
+                let status = 'running';
+                for (;;) {
+                    if (this.state.stopAllRequested) break;
+                    await new Promise(res => setTimeout(res, 20000));
+                    try {
+                        const run = await API.getRun(runId);
+                        status = (run.status || 'running').toLowerCase();
+                    } catch (e) {
+                        status = `poll error: ${(e && e.message) || e}`;
+                        break;
+                    }
+                    if (!['running', 'resumed', 'paused', 'pending'].includes(status)) break;
+                }
+                results.push({ model: m.id, status });
+            } catch (e) {
+                results.push({ model: m.id, status: `start failed: ${(e && e.message) || e}` });
+            }
+        }
+        if (stopBtn) stopBtn.classList.add('hidden');
+        this._allProgressLine(results.length, queue.length, '',
+            results.map(r => `<div class="text-xs">${r.model}: ${r.status}</div>`).join('')
+            + '<p class="mt-1"><a class="underline" href="/history">View history</a></p>');
+        UI.showToast('Optimize-all finished', 'success');
     },
 
     _validateWeights() {

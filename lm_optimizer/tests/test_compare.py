@@ -47,6 +47,8 @@ def _mock_client(speed_a: float = 80.0, speed_b: float = 40.0, fail_b_load: bool
     c.load_model = AsyncMock(side_effect=_load)
     c.ensure_unloaded = AsyncMock(return_value=True)
     c.chat_completion = AsyncMock(side_effect=_chat)
+    c.unload_all = AsyncMock(return_value={})
+    c.get_loaded_instances = AsyncMock(return_value=[])
     return c
 
 

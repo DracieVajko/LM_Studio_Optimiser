@@ -7,7 +7,13 @@ from typing import Any
 from uuid import UUID
 
 from lm_optimizer.config import config
-from lm_optimizer.database.repositories import config_repo, hardware_repo, model_repo, run_repo
+from lm_optimizer.database.repositories import (
+    config_repo,
+    hardware_repo,
+    model_repo,
+    run_repo,
+    settings_repo,
+)
 from lm_optimizer.domain.models import (
     DEFAULT_PROFILE_WEIGHTS,
     ConfigurationResult,
@@ -101,6 +107,31 @@ class OptimizationState:
     score_context: bool = True
 
 
+def _display_total(state) -> int:
+    """Progress denominator: planned Phase-A units when known, else estimate.
+
+    `planned_total` grows as phases unfold (speed plan → quality suites →
+    recovery probes → validation reps); never below tested units, minimum 1.
+    Legacy flows without planning fall back to the Cartesian estimate.
+    """
+    try:
+        tested = len(getattr(state, "tested_configs", []) or [])
+    except Exception:
+        tested = 0
+    try:
+        planned = int(getattr(state, "planned_total", 0) or 0)
+    except Exception:
+        planned = 0
+    if planned > 0:
+        return max(planned, tested, 1)
+    try:
+        space = getattr(state, "search_space", None)
+        est = int(space.estimate_size()) if space else 0
+    except Exception:
+        est = 0
+    return max(est, tested, 1)
+
+
 class AdaptiveOptimizer:
     """Adaptive optimizer with 5-stage search, hardware-agnostic scoring."""
 
@@ -133,6 +164,29 @@ class AdaptiveOptimizer:
 
         `progress_cb(stage, tested, total)` is informational only (CLI bars,
         never control flow); None disables it.
+        """
+        run, baseline_config, advanced_settings = await self.prepare_run(
+            model, hardware, profile, profile_weights, quality_threshold,
+            advanced_settings, style, baseline_config, progress_cb,
+        )
+        return await self.execute(model, profile, run, baseline_config, advanced_settings)
+
+    async def prepare_run(
+        self,
+        model: ModelIdentity,
+        hardware: HardwareInfo,
+        profile: OptimizationProfile,
+        profile_weights: ProfileWeights | None = None,
+        quality_threshold: float = 0.97,
+        advanced_settings: dict | None = None,
+        style: str = "balanced",
+        baseline_config: LoadConfiguration | None = None,
+        progress_cb=None,
+    ) -> tuple[OptimizationRun, LoadConfiguration | None, dict]:
+        """Create run + state synchronously (route returns before background work).
+
+        Same steps optimize() always ran first (now shared); returns the run,
+        resolved baseline and normalized settings. execute() continues from here.
         """
         self._progress_cb = progress_cb
         # Save hardware and model
@@ -213,6 +267,8 @@ class AdaptiveOptimizer:
 
         # Initialize state
         self.state = OptimizationState(run=run, search_space=search_space)
+        # Cross-run lesson: preskip flash-off when a previous run learned it.
+        self._apply_persisted_flash_advice()
 
         # Baseline config captured for the Phase A anchor (no expensive
         # baseline benchmark; the S0 speed probe is the anchor reference).
@@ -222,7 +278,17 @@ class AdaptiveOptimizer:
         run.status = RunStatus.RUNNING
         run.started_at = datetime.now()
         run_repo.save(run)
+        return run, baseline_config, advanced_settings or {}
 
+    async def execute(
+        self,
+        model: ModelIdentity,
+        profile: OptimizationProfile,
+        run: OptimizationRun,
+        baseline_config: LoadConfiguration | None,
+        advanced_settings: dict,
+    ) -> OptimizationRun:
+        """Run all phases from a prepared run (background-safe entry point)."""
         # First Ctrl+C arms graceful pause (second aborts); restored on exit.
         self._install_pause_handler()
 
@@ -308,8 +374,8 @@ class AdaptiveOptimizer:
             cb = getattr(self, "_progress_cb", None)
             if cb is None or self.state is None:
                 return
-            total = self.state.search_space.estimate_size() if self.state.search_space else 0
-            cb(self.state.run.stage.value, len(self.state.tested_configs), total)
+            cb(self.state.run.stage.value, len(self.state.tested_configs),
+               _display_total(self.state))
         except Exception:
             pass
 
@@ -340,7 +406,7 @@ class AdaptiveOptimizer:
 
             st = self.state
             tested = len(st.tested_configs)
-            total = st.search_space.estimate_size() if st.search_space else tested
+            total = _display_total(st)
             passed = sum(1 for c in st.tested_configs if c.status == ConfigurationStatus.PASSED)
             failed = sum(
                 1
@@ -1055,13 +1121,52 @@ class AdaptiveOptimizer:
                 weights = {k: v / total for k, v in weights.items()}
         return weights
 
+    FLASH_REQUIRED_SETTING = "flash_required"
+
     def _note_flash_requirement(self, result: ConfigurationResult) -> None:
-        """Remember server-mandated flash attention (prunes flash=False)."""
+        """Remember server-mandated flash attention (prunes flash=False).
+
+        Persists across runs (KV quant is a host-wide GUI setting): the next
+        run preskips flash-off probes instead of re-paying one failed load.
+        """
         if "requires flash attention" in (result.error or "").lower():
             if not self.state.flash_required:
                 logger.warning("Server requires flash attention: pruning flash=False")
                 self.state.errors.append("flash_required: flash=False pruned for this run")
             self.state.flash_required = True
+            try:
+                settings_repo.set(
+                    self.FLASH_REQUIRED_SETTING, "1",
+                    "KV quant requires flash attention (learned, host-wide)",
+                )
+            except Exception as e:
+                logger.debug("Flash lesson persist failed", error=str(e))
+
+    def _apply_persisted_flash_advice(self) -> None:
+        """Preskip flash-off probes from a previous run's lesson."""
+        try:
+            if settings_repo.get(self.FLASH_REQUIRED_SETTING) != "1":
+                return
+        except Exception:
+            return
+        if not self.state.flash_required:
+            logger.info("Applying persisted flash requirement (preskipping flash=False)")
+            self.state.errors.append(
+                "flash_required: learned from previous runs (KV quant needs flash)"
+            )
+        self.state.flash_required = True
+
+    def _clear_flash_requirement(self, load_config: LoadConfiguration) -> None:
+        """A flash-off load that served disproves the lesson: clear it."""
+        if load_config.flash_attention is not False:
+            return
+        if self.state.flash_required:
+            logger.info("Flash-off served: clearing flash requirement")
+        self.state.flash_required = False
+        try:
+            settings_repo.set(self.FLASH_REQUIRED_SETTING, "0", "flash-off served")
+        except Exception:
+            pass
 
     def _check_rope_quality(self, breakdown: dict) -> None:
         """Experimental RoPE guard: never claim faster-is-better below 0.98."""
@@ -1158,10 +1263,15 @@ class AdaptiveOptimizer:
                     status=result.status.value,
                     error=(result.error or "")[:160],
                 )
+                # Learn server-mandated flash here (failures return early and
+                # never reach the passed-path note below).
+                self._note_flash_requirement(result)
                 return result
 
             # LOADED + VERIFIED (benchmark success implies the load served).
             result.status = ConfigurationStatus.PASSED
+            # A served flash-off load disproves any persisted lesson.
+            self._clear_flash_requirement(load_config)
             self._log_event("LOAD_SUCCEEDED", f"ctx={context_length}")
             self._log_event("VERIFY_SUCCEEDED", f"ctx={context_length}")
             preheat = (result.generation or {}).get("preheat") or {}
@@ -2004,6 +2114,7 @@ class AdaptiveOptimizer:
             ordered.append(contrarian)
         limit = self._finalist_limit()
         ordered = ordered[: max(limit + 1, 1)]
+        self.state.planned_total += len(ordered)  # one suite per finalist
         self._log_event("QUALITY validation started", f"ctx={quality_ctx} n={len(ordered)}")
 
         # Resume: reuse already quality-tested configs (never re-run).
@@ -2285,6 +2396,7 @@ class AdaptiveOptimizer:
         if len(speeds) >= 2 or getattr(best, "stability_score", None):
             reps = 2 if stability >= 0.95 else (3 if stability >= 0.85 else reps)
         reps = max(2, min(reps, 5))
+        self.state.planned_total += reps  # one unit per validation repetition
         self._log_event("Final validation", f"reps={reps}")
         validated: list[ConfigurationResult] = []
         for _i in range(reps):
@@ -2410,12 +2522,25 @@ class AdaptiveOptimizer:
         ref_kind: str = "safe",
     ) -> tuple[list, LoadConfiguration | None]:
         """Run bounded recovery for each failed finalist (skips without ref)."""
+        from lm_optimizer.services.recovery import RECOVERY_BUDGET_DEFAULT
+
+        try:
+            _budget = int(
+                (self.state.run.benchmark_params or {}).get(
+                    "recovery_budget", RECOVERY_BUDGET_DEFAULT
+                )
+            )
+        except (TypeError, ValueError):
+            _budget = RECOVERY_BUDGET_DEFAULT
         recovered: list[ConfigurationResult] = []
         kind = ref_kind
         if ref_config is not None:
             for failed_result in failed:
                 if self.state.should_cancel:
                     break
+                # Upper-bound plan upfront (1 reconfirm + budget rollbacks);
+                # finalize snaps any unused remainder away.
+                self.state.planned_total += 1 + max(0, _budget)
                 await self._pause_point()
                 rec, _culprit = await self._run_recovery(failed_result, ref_config, kind)
                 if rec is not None:

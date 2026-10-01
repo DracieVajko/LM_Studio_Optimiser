@@ -433,6 +433,19 @@ async def start_optimization(request: OptimizationRequest, background_tasks: Bac
         await client.close()
         raise HTTPException(status_code=404, detail="Model not found")
 
+    # Fail-closed start: never optimize onto a dirty host (two models
+    # sharing the GPU silently invalidates speed measurements).
+    try:
+        from lm_optimizer.services.unload_guard import UnloadNotClean, assert_unloaded
+
+        await assert_unloaded(client, purpose=f"optimize:{request.model_id}")
+    except UnloadNotClean as e:
+        try:
+            await client.close()
+        except Exception:
+            pass
+        raise HTTPException(status_code=409, detail=str(e)[:300])
+
     # Get hardware
     hardware = hardware_detector.detect()
 
@@ -442,57 +455,61 @@ async def start_optimization(request: OptimizationRequest, background_tasks: Bac
     search_generator = SearchSpaceGenerator(client)
     optimizer = AdaptiveOptimizer(client, benchmark_service, quality_evaluator, search_generator)
 
-    _current_optimizer = optimizer
-    _current_run_id = optimizer.state.run.id if optimizer.state else None
-
     # Merge top-level workload into advanced settings (canonical source).
     from lm_optimizer.services.workload import normalize_workload
 
     adv = request.advanced_settings.dict() if request.advanced_settings else {}
     adv.setdefault("workload_type", normalize_workload(request.workload_type))
     adv["workload_type"] = normalize_workload(adv.get("workload_type"))
+    weights = ProfileWeights(**request.custom_weights.dict()) if request.custom_weights else None
+    profile = OptimizationProfile(request.profile.value)
 
-    # Run in background
+    # Prepare run + state synchronously so the response carries a real run id
+    # (state used to appear only inside the background task -> HTTP 500).
+    try:
+        run, baseline_config, adv = await optimizer.prepare_run(
+            model, hardware, profile, weights, request.quality_threshold, adv,
+        )
+    except Exception as e:
+        try:
+            await client.close()
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=f"Could not start run: {str(e)[:200]}")
+
+    _current_optimizer = optimizer
+    _current_run_id = run.id
+
+    # Run in background from the prepared state (never re-prepares).
     background_tasks.add_task(
         run_optimization_task,
         optimizer,
         model,
-        hardware,
-        request.profile,
-        request.custom_weights,
-        request.quality_threshold,
-        request.advanced_settings,
+        profile,
+        run,
+        baseline_config,
         adv,
     )
 
-    return _convert_run(optimizer.state.run)
+    return _convert_run(run, config_count=0, stale=False)
 
 
 async def run_optimization_task(
     optimizer: AdaptiveOptimizer,
     model: ModelIdentity,
-    hardware: HardwareInfo,
-    profile: OptimizationProfileSchema,
-    custom_weights: ProfileWeightsSchema | None,
-    quality_threshold: float,
-    advanced_settings: AdvancedSettingsSchema | None,
-    merged_advanced: dict | None = None,
+    profile: OptimizationProfile,
+    run,
+    baseline_config,
+    advanced_settings: dict,
 ):
-    """Background task for optimization (shutdown-safe: checkpoint first)."""
-    run_id = None
+    """Background task for optimization (shutdown-safe: checkpoint first).
+
+    Continues from the synchronously prepared run (prepare_run); never
+    re-prepares, so the returned run id stays the executed one.
+    """
+    run_id = run.id
     try:
-        weights = ProfileWeights(**custom_weights.dict()) if custom_weights else None
-        advanced = merged_advanced
-        if advanced is None:
-            advanced = advanced_settings.dict() if advanced_settings else None
-        run = await optimizer.optimize(
-            model,
-            hardware,
-            OptimizationProfile(profile.value),
-            weights,
-            quality_threshold,
-            advanced,
-        )
+        run = await optimizer.execute(model, profile, run, baseline_config, advanced_settings)
         run_id = run.id
         try:
             from lm_optimizer.api.websocket import broadcast_complete
@@ -636,8 +653,10 @@ async def get_optimization_progress(run_id: UUID):
     ):
         from lm_optimizer.services.failure_states import is_terminal_failure
 
+        from lm_optimizer.services.optimizer import _display_total
+
         state = _current_optimizer.state
-        total = state.search_space.estimate_size()
+        total = _display_total(state)
         tested = len(state.tested_configs)
         passed = sum(1 for c in state.tested_configs if c.status == ConfigurationStatus.PASSED)
         failed = sum(
@@ -781,6 +800,11 @@ def _enrich_config_detail(conv: dict, config, model_id: str) -> dict:
                     if full[name]:
                         q = ev.evaluate(model_id, name, full[name])
                         m["quality_overall"] = round(q.overall, 3)
+                        try:
+                            if q.details.get("thinking_outside_json"):
+                                m["thinking_outside_json"] = True
+                        except Exception:
+                            pass
                 src = next((x for x in (config.metrics or []) if x.test_name == name), None)
                 if src is not None:
                     if getattr(src, "thinking_text", ""):
@@ -1192,6 +1216,14 @@ async def start_sandbox(request: SandboxRequest, background_tasks: BackgroundTas
         logger.warning("Duel history save failed (job still runs)", error=str(e)[:160])
     background_tasks.add_task(_run_sandbox_task, job_id, request)
     return SandboxResponse(job_id=job_id, status="running", kind=request.kind.value)
+
+
+@router.get("/generation-profiles")
+async def generation_profiles(model_id: str, architecture: str | None = None):
+    """Measured benchmark settings + publisher recommendations per purpose."""
+    from lm_optimizer.services.generation_profiles import profiles_for
+
+    return {"model_id": model_id, "profiles": profiles_for(model_id, architecture)}
 
 
 @router.get("/sandbox/{job_id}", response_model=SandboxResponse)

@@ -57,6 +57,46 @@ def _words_for_repetition(text: str) -> list[str]:
     return re.sub(r"[*`#_~>|]", " ", text).split()
 
 
+def _extract_json_object(text: str) -> str | None:
+    """Extract the first balanced {...} object (string-aware brace matching).
+
+    Reasoning models often think aloud before the JSON. Strict parsing stays
+    first; this is only the penalized fallback, never the primary path.
+    """
+    start = text.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    in_string = False
+    escaped = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return None
+
+
+def _think_tags_balanced(text: str) -> bool:
+    """False when closing </think> tags outnumber opening <think> tags."""
+    opens = len(re.findall(r"<think(?:\s[^>]*)?>", text, re.IGNORECASE))
+    closes = len(re.findall(r"</think\s*>", text, re.IGNORECASE))
+    return closes <= opens
+
+
 @dataclass
 class QualityConfig:
     """Correctness / quality evaluation configuration (heuristic checks)."""
@@ -120,26 +160,43 @@ class QualityEvaluator:
             parsed = json.loads(doc.strip())
             scores["format_compliance"] = 1.0
             details["json_valid"] = True
+            details["thinking_outside_json"] = False
         except json.JSONDecodeError as e:
-            scores["format_compliance"] = 0.0
-            details["json_valid"] = False
-            details["json_error"] = str(e)
-            # Explicit failed result (0/6), never null checks: invalid output
-            # is evidence, not missing evidence. overall 0.0 preserves the
-            # failure signal in aggregates.
-            return QualityScore(
-                overall=0.0,
-                task_completion=0.0,
-                factual_consistency=1.0,
-                format_compliance=0.0,
-                coding_correctness=1.0,
-                no_truncation=1.0,
-                no_malformed=0.0,
-                confident=True,
-                details=details,
-                checks_passed=0,
-                checks_total=6,
-            )
+            # Penalized fallback: the model thought aloud before the JSON
+            # (reasoning trace outside the object). Extractable structure
+            # still counts, but format is halved and the event is flagged
+            # for the UI warning — never silently treated as clean.
+            fallback = _extract_json_object(doc)
+            if fallback is not None:
+                try:
+                    parsed = json.loads(fallback)
+                except json.JSONDecodeError:
+                    parsed = None
+            else:
+                parsed = None
+            if parsed is None:
+                scores["format_compliance"] = 0.0
+                details["json_valid"] = False
+                details["json_error"] = str(e)
+                # Explicit failed result (0/6), never null checks: invalid output
+                # is evidence, not missing evidence. overall 0.0 preserves the
+                # failure signal in aggregates.
+                return QualityScore(
+                    overall=0.0,
+                    task_completion=0.0,
+                    factual_consistency=1.0,
+                    format_compliance=0.0,
+                    coding_correctness=1.0,
+                    no_truncation=1.0,
+                    no_malformed=0.0,
+                    confident=True,
+                    details=details,
+                    checks_passed=0,
+                    checks_total=6,
+                )
+            scores["format_compliance"] = 0.5
+            details["json_valid"] = True
+            details["thinking_outside_json"] = True
 
         required = ["name", "age", "skills", "address"]
         missing = [f for f in required if f not in parsed]
@@ -247,6 +304,10 @@ class QualityEvaluator:
         has_repetition = self._detect_repetition(output)
         scores["no_malformed"] = 0.0 if has_repetition else 1.0
         details["has_repetition"] = has_repetition
+        if not _think_tags_balanced(output):
+            # Stray </think> without an opener: reasoning leaked as markup.
+            scores["no_malformed"] = min(scores["no_malformed"], 0.5)
+            details["unbalanced_think_tags"] = True
 
         overall = sum(scores.values()) / len(scores)
         passed, total = _checks_from_scores(scores)
