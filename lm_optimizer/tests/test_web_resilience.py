@@ -809,6 +809,18 @@ class TestJsSyntax:
         assert len(versions) == 1, f"mixed asset versions: {sorted(versions)}"
         assert not missing, f"dangling JS references: {missing}"
 
+    def test_no_space_y_grid_collision(self):
+        """space-y-* + grid on one element misaligns form rows (settings bug)."""
+        import re
+        from pathlib import Path
+
+        js_dir = Path(__file__).parent.parent / "ui" / "static" / "js"
+        bad = []
+        for f in sorted(js_dir.glob("*.js")):
+            for m in re.finditer(r'class="[^"]*space-y-\d+[^"]*grid[^"]*"', f.read_text()):
+                bad.append(f"{f.name}: {m.group(0)[:80]}")
+        assert not bad, f"grid/space-y collision: {bad}"
+
 
 class TestConfigDetailRoute:
     def test_single_config_route_has_no_double_prefix(self):

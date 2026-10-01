@@ -28,9 +28,40 @@ Prompt/Thinking/Output transparency, OS-following dark mode, resilient Web UI.
 |-|-|
 | ![Results](docs/screenshots/results.png) | ![Sandbox](docs/screenshots/sandbox.png) |
 
-| Settings |
+| Settings | Optimization Profiles |
+|-|-|
+| ![Settings](docs/screenshots/settings.png) | ![Profiles](docs/screenshots/profiles.png) |
+
+| CMD menu (no UI) |
 |-|
-| ![Settings](docs/screenshots/settings.png) |
+| ![CMD menu](docs/screenshots/cmd-menu.png) |
+
+## Example report (success `.md`)
+
+Every validated run writes `results/<model>-best.md` (excerpt, host details omitted):
+
+```markdown
+# Best settings: qwen3.8-9b-distill
+* Profile: balanced (style: balanced) | Elapsed: 1004.4s
+
+## Best load configuration (REST-settable)
+|Parameter|Value|Verdict|
+|context_length|8192|tested (8192)|
+|flash_attention|yes|verified best of tested (False, True)|
+|offload_kv_cache_to_gpu (KV on GPU)|yes|verified best of tested (False, True)|
+|eval_batch_size|128|verified best of tested (128, 1024, 2048)|
+
+## Requested vs applied (winner load verification)
+* Load channel: REST | Verification: MATCH
+
+## Winner: every test explicitly
+|Test|Gen tok/s|Quality|Status|
+|short_instruction|22.8|1.0 (6/6)|PASS|
+|medium_reasoning|32.2|1.0 (6/6)|PASS|
+|long_context|30.4|1.0 (6/6)|PASS|
+|coding_task|26.9|1.0 (6/6)|PASS|
+|structured_output|34.2|1.0 (6/6)|PASS|
+```
 
 ## Measured results (RTX 3060 6 GB, Phase-A campaign, Phase B OFF)
 

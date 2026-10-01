@@ -548,7 +548,7 @@ export const UI = {
                         <div class="card-header">
                             <h3 class="font-semibold text-gray-900">Web UI</h3>
                         </div>
-                        <div class="card-body space-y-4 grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div class="card-body grid grid-cols-1 md:grid-cols-2 gap-4">
                             <div>
                                 <label class="form-label">Host</label>
                                 <input type="text" id="web-host" name="web_host" value="${settings.web_host}" class="form-input">
@@ -565,7 +565,7 @@ export const UI = {
                         <div class="card-header">
                             <h3 class="font-semibold text-gray-900">Default Optimization Settings</h3>
                         </div>
-                        <div class="card-body space-y-4 grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div class="card-body grid grid-cols-1 md:grid-cols-2 gap-4">
                             <div>
                                 <label class="form-label">Default Profile</label>
                                 <select name="default_profile" class="form-input form-select">

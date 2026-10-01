@@ -66,7 +66,7 @@ const SettingsPage = {
                         <div class="card-header">
                             <h2 class="text-lg font-semibold text-gray-900">Web UI</h2>
                         </div>
-                        <div class="card-body space-y-4 grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div class="card-body grid grid-cols-1 md:grid-cols-2 gap-4">
                             <div>
                                 <label class="form-label">Host</label>
                                 <input type="text" id="web-host" name="web_host" value="${this.state.settings.web_host}" class="form-input">
@@ -83,7 +83,7 @@ const SettingsPage = {
                         <div class="card-header">
                             <h2 class="text-lg font-semibold text-gray-900">Default Optimization Settings</h2>
                         </div>
-                        <div class="card-body space-y-4 grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div class="card-body grid grid-cols-1 md:grid-cols-2 gap-4">
                             <div>
                                 <label class="form-label">Default Profile</label>
                                 <select name="default_profile" class="form-input form-select">
@@ -130,7 +130,7 @@ const SettingsPage = {
                         <div class="card-header">
                             <h2 class="text-lg font-semibold text-gray-900">Hardware Overrides (Optional)</h2>
                         </div>
-                        <div class="card-body space-y-4 grid grid-cols-1 md:grid-cols-3 gap-4">
+                        <div class="card-body grid grid-cols-1 md:grid-cols-3 gap-4">
                             <div>
                                 <label class="form-label">GPU VRAM (GB) - Auto if empty</label>
                                 <input type="number" name="gpu_vram_gb" value="" step="0.1" min="0" class="form-input" placeholder="Auto-detect">

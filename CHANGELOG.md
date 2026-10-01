@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.3.2] - 2026-10-02
+
+### Fixed
+- **Settings layout**: `space-y-*` removed from grid containers (it offset form
+  rows); Host/Port and settings pairs align in clean 2-col grids.
+- **README**: screenshot slots for Profiles + CMD menu, trimmed success-report
+  example, `docs/screenshots/` dir.
+
 ## [1.3.1] - 2026-10-02
 
 ### Fixed
