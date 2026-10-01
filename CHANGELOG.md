@@ -2,22 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
-## [1.3.2] - 2026-10-02
+## [1.3.0] - 2026-10-02
 
 ### Fixed
 - **Settings layout**: `space-y-*` removed from grid containers (it offset form
   rows); Host/Port and settings pairs align in clean 2-col grids.
 - **README**: screenshot slots for Profiles + CMD menu, trimmed success-report
   example, `docs/screenshots/` dir.
-
-## [1.3.1] - 2026-10-02
-
-### Fixed
 - **macOS CI**: `get_cpu_info()` no longer crashes where `psutil.cpu_freq` is
   missing (AttributeError on some runners) — frequency degrades to None,
   detection never fails. Regression tests included.
-
-## [1.3.0] - 2026-10-01
 
 ### Added
 - **Denser speed grid**: eval batch {64, 128, 256, 1024, 2048}, MoE experts {2, 4, 8},
