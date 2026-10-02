@@ -224,10 +224,10 @@ class SearchSpaceGenerator:
             return [256]
 
         if advanced.get("auto_batch", True):
-            return [64, 128, 256, 512, 1024]
+            return [64, 128, 256, 512, 1024, 2048]
 
         min_batch = advanced.get("min_batch", 64)
-        max_batch = advanced.get("max_batch", 1024)
+        max_batch = advanced.get("max_batch", 2048)
 
         # Generate powers of 2
         sizes = []
@@ -258,7 +258,7 @@ class SearchSpaceGenerator:
         from lm_optimizer.services.workload import apply_to_space
 
         return apply_to_space(
-            [1, 2, 4],
+            [1, 2, 4, 8],
             advanced.get("workload_type", "interactive"),
             explicit_override=None,
         )

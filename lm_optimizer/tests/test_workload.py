@@ -296,4 +296,4 @@ class TestPersistence:
             model, hw, OptimizationProfile.BALANCED, {"workload_type": "throughput"}
         )
         assert s_inter.parallels == [1]
-        assert s_thr.parallels == [1, 2, 4]
+        assert s_thr.parallels == [1, 2, 4, 8]
