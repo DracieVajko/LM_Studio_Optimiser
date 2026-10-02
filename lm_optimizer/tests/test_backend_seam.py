@@ -5,6 +5,7 @@ import pytest
 from lm_optimizer.backends.base import assert_conforms
 from lm_optimizer.backends.ollama.client import OllamaClient
 from lm_optimizer.cli.main import get_backend_client
+from lm_optimizer.config import config
 from lm_optimizer.services.lm_studio import LMStudioClient
 
 
@@ -23,6 +24,12 @@ def test_backend_factory_ollama():
 def test_backend_factory_llama_cpp_is_phase2():
     with pytest.raises(NotImplementedError, match="llama.cpp backend is phase 2"):
         get_backend_client("llama-cpp")
+
+
+def test_backend_factory_explicit_arg_beats_global_config(monkeypatch):
+    monkeypatch.setattr(config, "backend", "ollama")
+    assert isinstance(get_backend_client("lm-studio"), LMStudioClient)
+    assert isinstance(get_backend_client(), OllamaClient)
 
 
 def test_config_backend_defaults():

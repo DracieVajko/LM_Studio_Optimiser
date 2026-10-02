@@ -64,16 +64,10 @@ if TYPE_CHECKING:
     from lm_optimizer.services.lm_studio import LMStudioClient
 
 
-def get_client(base_url: str | None = None) -> "LMStudioClient | OllamaClient":
-    """Create backend client, optionally overriding URL (without persisting).
-
-    Default backend is lm-studio; that path is byte-identical to the legacy
-    behavior. Select another backend via config or the ``--backend`` option.
-    """
+def _lm_studio_client(base_url: str | None = None) -> "LMStudioClient":
+    """Construct an LM Studio client (legacy behavior: validate + build)."""
     from lm_optimizer.services.lm_studio import LMStudioClient
 
-    if (config.backend or "lm-studio") != "lm-studio":
-        return get_backend_client(config.backend, base_url)
     # Validate URL if provided
     if base_url:
         base_url = base_url.strip().rstrip("/")
@@ -84,6 +78,17 @@ def get_client(base_url: str | None = None) -> "LMStudioClient | OllamaClient":
             sys.exit(1)
     client = LMStudioClient(base_url=base_url)
     return client
+
+
+def get_client(base_url: str | None = None) -> "LMStudioClient | OllamaClient":
+    """Create backend client, optionally overriding URL (without persisting).
+
+    Default backend is lm-studio; that path is byte-identical to the legacy
+    behavior. Select another backend via config or the ``--backend`` option.
+    """
+    if (config.backend or "lm-studio") != "lm-studio":
+        return get_backend_client(config.backend, base_url)
+    return _lm_studio_client(base_url)
 
 
 _VALID_BACKENDS = ("lm-studio", "ollama", "llama-cpp")
@@ -104,14 +109,15 @@ def get_backend_client(
 ) -> "LMStudioClient | OllamaClient":
     """Create a backend client by name (default: configured backend, lm-studio).
 
-    The ``lm-studio`` path delegates to :func:`get_client`, preserving its
-    behavior byte-for-byte. ``llama-cpp`` is phase 2 and raises explicitly.
+    The ``lm-studio`` path uses the legacy construction byte-for-byte.
+    An explicit ``backend`` argument always wins over global config.
+    ``llama-cpp`` is phase 2 and raises explicitly.
     """
     from lm_optimizer.backends.ollama.client import OllamaClient
 
     resolved = _require_backend(backend or config.backend or "lm-studio")
     if resolved == "lm-studio":
-        return get_client(base_url=base_url)
+        return _lm_studio_client(base_url=base_url)
     if resolved == "ollama":
         return OllamaClient(base_url=base_url or config.ollama_base_url)
     raise NotImplementedError("llama.cpp backend is phase 2")
