@@ -741,6 +741,140 @@ def benchmark(
     asyncio.run(_benchmark())
 
 
+@app.command(name="manual-memory-duel")
+def manual_memory_duel(
+    model: str = typer.Option(
+        ..., "--model", help="Model ID (must match results/<model>-best.md)"
+    ),
+    stage: str = typer.Option(..., "--stage", help="Manual toggle to duel: mmap|keep"),
+    repetitions: int = typer.Option(
+        3, "--repetitions", "-r", help="Benchmark repetitions per re-measure"
+    ),
+    style: str = typer.Option(
+        "balanced", "--style", help="Benchmark style (precise/balanced/creative)"
+    ),
+    output: Path = typer.Option(
+        Path("results"), "--output", help="Report output directory"
+    ),
+):
+    """Duel a MANUAL GUI toggle (mmap OFF / Keep OFF) against the auto best.
+
+    Prints the auto best, pauses for the GUI toggle + Enter, re-measures the
+    SAME LoadConfiguration (this tool never toggles mmap/keep itself), then
+    prints a keep/revert verdict. Fail-closed unload before and after.
+    """
+    from lm_optimizer.services import manual_memory_duel as _duel
+
+    setup_logging()
+    style = _require_style(style)
+    if stage not in ("mmap", "keep"):
+        console.print("[red]Invalid --stage (mmap|keep)[/red]")
+        sys.exit(2)
+    try:
+        interactive = sys.stdin.isatty()
+    except Exception:
+        interactive = False
+    if not interactive:
+        console.print(
+            "[red]manual-memory-duel needs an interactive terminal: the GUI "
+            "toggle + Enter confirmation cannot be verified otherwise. "
+            "Re-measuring without it could compare the wrong setting.[/red]"
+        )
+        sys.exit(2)
+
+    async def _duel_run():
+        client = get_client()
+        try:
+            await client.connect()
+            snap = await prepare_host(client, purpose="manual-memory-duel")
+            for line in format_snapshot(snap):
+                console.print(f"  {line}")
+            if not snap.get("verified_empty") and snap.get("leftovers"):
+                console.print("[red]Stale models loaded, aborting. Unload them first.[/red]")
+                sys.exit(1)
+            try:
+                await assert_unloaded(client, purpose=f"manual-memory-duel:{model}:pre")
+            except UnloadNotClean as e:
+                console.print(f"[red]Host not clean, aborting:[/red] {e}")
+                sys.exit(1)
+
+            try:
+                auto = _duel.load_auto_best(output, model, results_dir=str(output))
+            except ValueError as e:
+                console.print(f"[red]{e}[/red]")
+                sys.exit(1)
+            if auto.get("load_config") is None or not auto.get("context_length"):
+                console.print(
+                    "[red]No re-measurable auto best: the run DB has no load "
+                    "configuration for this model (run auto/optimize first). "
+                    "Refusing to guess a config.[/red]"
+                )
+                sys.exit(1)
+
+            console.print(
+                f"[bold]Auto best for {model}[/bold] (source: {auto['source']})"
+            )
+            console.print(
+                f"  gen {auto['gen_tok_s']:.1f} tok/s | "
+                f"est. TTFT {auto['ttft_ms']:.0f} ms | ctx {auto['context_length']}"
+            )
+
+            prompt = _duel.MMAP_PROMPT if stage == "mmap" else _duel.KEEP_PROMPT
+            try:
+                typer.prompt(prompt, default="")
+            except Exception:
+                console.print(
+                    "[red]Confirmation aborted; nothing was re-measured "
+                    "(this tool toggles nothing itself).[/red]"
+                )
+                sys.exit(1)
+
+            benchmark_service = BenchmarkService(
+                client,
+                benchmark_config=_benchmark_config_obj(repetitions),
+                style=style,
+            )
+            with console.status(f"Re-measuring with manual {stage} OFF..."):
+                result = await benchmark_service.run_benchmark(
+                    model, auto["load_config"], auto["context_length"], style=style
+                )
+            manual_gen = result.get_avg_generation_tok_s()
+            manual_ttft = result.get_avg_estimated_ttft_ms()
+            console.print(
+                f"  manual ({stage} OFF): {manual_gen:.1f} tok/s | "
+                f"est. TTFT {manual_ttft:.0f} ms"
+            )
+            v = _duel.verdict(auto["gen_tok_s"], manual_gen, auto["ttft_ms"], manual_ttft)
+            if v["decision"] == "keep":
+                console.print(f"[green]{_duel.GUIDANCE_KEEP}[/green] {v['reason']}")
+            else:
+                console.print(f"[yellow]{_duel.GUIDANCE_REVERT}[/yellow] {v['reason']}")
+            other = "keep" if stage == "mmap" else "mmap"
+            console.print(f"  Repeat for the other lever with: --stage {other}")
+
+            try:
+                await client.ensure_unloaded(model)
+            except Exception:
+                pass
+            try:
+                await assert_unloaded(
+                    client, purpose=f"manual-memory-duel:{model}:{stage}:post"
+                )
+            except UnloadNotClean as e:
+                console.print(f"[red]Done, but host not clean:[/red] {e}")
+                sys.exit(1)
+        except SystemExit:
+            raise
+        except Exception as e:
+            logger.exception("Manual memory duel failed")
+            console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
+        finally:
+            await client.close()
+
+    asyncio.run(_duel_run())
+
+
 @app.command()
 def optimize(
     model: str = typer.Argument(..., help="Model ID to optimize"),
