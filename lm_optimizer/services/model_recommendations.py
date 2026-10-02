@@ -29,6 +29,12 @@ def manual_checklist(vram_gb: float) -> list[str]:
         "Context: 8192 default; 4096 for 8-14B models; 2048 + KV-on-CPU for 20B+",
         "GPU offload -> max via `lms load <model> --gpu max` (REST only toggles KV placement)",
         "CPU threads -> maximum logical cores in LM Studio GUI (REST cannot set n_threads)",
+        "mmap -> toggle OFF in LM Studio GUI (default ON), then re-measure one "
+        "lever with `manual-memory-duel --model <id> --stage mmap` (keeps only on "
+        ">= +5% gen tok/s; Nechaj OFF on win, else Vrat spat na ON)",
+        "Keep Model in Memory -> toggle OFF in LM Studio GUI, then re-measure one "
+        "lever with `manual-memory-duel --model <id> --stage keep` (same keep/revert "
+        "verdict; run each --stage in its own invocation)",
         "Weights: prefer Q4_K_M <=4B (~3GB); Q3_*/IQ3_XXS for 8-14B; check with "
         "`lms load <model> --estimate-only` before testing",
         "Small models first (<12B, 4B preferred); large (>12B) only on explicit request",
