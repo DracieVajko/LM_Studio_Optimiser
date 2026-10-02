@@ -33,6 +33,12 @@ three copied projects.
 - Backend capabilities verified live against the actual server version;
   anything unverified is manual-only guidance, never claimed as tuned.
 - `MAX_PLAN_PROBES = 25` discipline carries over to new backends.
+- Split-ready boundaries: each backend is one self-contained package
+  (client + registry + exporter + its tests) talking to the core only
+  through the `BackendClient` interface — no cross-backend imports. A later
+  split into separate git repos (subtree/filter-repo) must not require
+  refactoring, only a decision on the shared core (duplicate vs pip vs
+  submodule).
 
 ## Approach
 
