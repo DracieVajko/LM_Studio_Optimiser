@@ -60,13 +60,20 @@ console = Console()
 logger = get_logger(__name__)
 
 if TYPE_CHECKING:
+    from lm_optimizer.backends.ollama.client import OllamaClient
     from lm_optimizer.services.lm_studio import LMStudioClient
 
 
-def get_client(base_url: str | None = None) -> "LMStudioClient":
-    """Create LM Studio client, optionally overriding URL (without persisting)."""
+def get_client(base_url: str | None = None) -> "LMStudioClient | OllamaClient":
+    """Create backend client, optionally overriding URL (without persisting).
+
+    Default backend is lm-studio; that path is byte-identical to the legacy
+    behavior. Select another backend via config or the ``--backend`` option.
+    """
     from lm_optimizer.services.lm_studio import LMStudioClient
 
+    if (config.backend or "lm-studio") != "lm-studio":
+        return get_backend_client(config.backend, base_url)
     # Validate URL if provided
     if base_url:
         base_url = base_url.strip().rstrip("/")
@@ -77,6 +84,37 @@ def get_client(base_url: str | None = None) -> "LMStudioClient":
             sys.exit(1)
     client = LMStudioClient(base_url=base_url)
     return client
+
+
+_VALID_BACKENDS = ("lm-studio", "ollama", "llama-cpp")
+
+
+def _require_backend(backend: str) -> str:
+    """Validate a backend name, exiting with usage hint on error."""
+    normalized = (backend or "").strip().lower()
+    if normalized not in _VALID_BACKENDS:
+        console.print(f"[red]Invalid --backend: {backend}[/red]")
+        console.print(f"Expected one of: {', '.join(_VALID_BACKENDS)}")
+        sys.exit(2)
+    return normalized
+
+
+def get_backend_client(
+    backend: str | None = None, base_url: str | None = None
+) -> "LMStudioClient | OllamaClient":
+    """Create a backend client by name (default: configured backend, lm-studio).
+
+    The ``lm-studio`` path delegates to :func:`get_client`, preserving its
+    behavior byte-for-byte. ``llama-cpp`` is phase 2 and raises explicitly.
+    """
+    from lm_optimizer.backends.ollama.client import OllamaClient
+
+    resolved = _require_backend(backend or config.backend or "lm-studio")
+    if resolved == "lm-studio":
+        return get_client(base_url=base_url)
+    if resolved == "ollama":
+        return OllamaClient(base_url=base_url or config.ollama_base_url)
+    raise NotImplementedError("llama.cpp backend is phase 2")
 
 
 def _handle_connection_error(url: str, error: Exception) -> None:
@@ -483,12 +521,19 @@ def _save_preset_and_report(
 def callback(
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable verbose logging"),
     config_file: Path | None = typer.Option(None, "--config", "-c", help="Config file path"),
+    backend: str | None = typer.Option(
+        None,
+        "--backend",
+        help="Inference backend: lm-studio (default), ollama, llama-cpp (phase 2)",
+    ),
 ):
     """LM Studio Auto Optimizer."""
     if verbose:
         import logging
 
         logging.getLogger().setLevel(logging.DEBUG)
+    if backend is not None:
+        config.backend = _require_backend(backend)
 
 
 @app.command()
