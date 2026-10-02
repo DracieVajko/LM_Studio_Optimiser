@@ -132,6 +132,9 @@ def _is_reasoning_error(exc: httpx.HTTPStatusError) -> bool:
 class LMStudioClient:
     """LM Studio API client with capability discovery."""
 
+    # BackendClient seam identifier (no behavior change).
+    backend_name: str = "lm-studio"
+
     def __init__(self, base_url: str | None = None, timeout: float | None = None):
         self.base_url = (base_url or config.lm_studio.base_url).rstrip("/")
         self.timeout = timeout or config.lm_studio.timeout
@@ -624,6 +627,30 @@ class LMStudioClient:
             return False
         self._loaded_models.pop(model_id, None)
         return True
+
+    # --- BackendClient seam (thin aliases only, no logic change) ---
+
+    async def unload(self, model_id: str) -> bool:
+        """Unload a model, verified gone (delegates to ensure_unloaded)."""
+        return await self.ensure_unloaded(model_id)
+
+    async def generate(
+        self, model_id: str, prompt: str, options: dict | None = None
+    ) -> dict:
+        """Generate a completion (delegates to chat_completion)."""
+        opts = options or {}
+        max_tokens = opts.get("max_output_tokens", opts.get("max_tokens", 512))
+        return await self.chat_completion(
+            model=model_id,
+            input_text=prompt,
+            temperature=opts.get("temperature", 0.7),
+            max_output_tokens=max_tokens,
+            top_p=opts.get("top_p"),
+            top_k=opts.get("top_k"),
+            min_p=opts.get("min_p"),
+            presence_penalty=opts.get("presence_penalty"),
+            reasoning=opts.get("reasoning"),
+        )
 
     async def chat_completion(
         self,
