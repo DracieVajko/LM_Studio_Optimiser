@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.5.0b1] - 2026-10-03 - BETA
+
+Ollama backend is beta (implemented, mocked-test evidence only, no live
+server verification yet). llama.cpp backend is not implemented (explicit
+phase-2 stub). LM Studio path is stable and unchanged by default.
+
+### Added
+- **Backend switch**: `--backend lm-studio|ollama|llama-cpp` (default
+  `lm-studio`, byte-identical behavior), `BackendClient` seam.
+- **Ollama (beta)**: options sweep (`num_ctx`, `num_batch`, `num_thread`,
+  `num_gpu`, sampling), `ollama-export` / `ollama-apply` with editable
+  `<model>-best.modelfile.md`, new-tag-only confirmed `/api/create`.
+
 ## [1.4.0] - 2026-10-02
 
 ### Added
