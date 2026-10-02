@@ -267,6 +267,43 @@ def _optimize_advanced(
     }
 
 
+EXPERIMENTAL_PROMPT = "Testovat experimentalne RoPE / CPU-MoE / speculative? [nie]"
+
+
+def _prompt_experimental_optins() -> dict:
+    """Interactive experimental opt-in (default: all off). Never raises."""
+    from lm_optimizer.services.optimizer import parse_experimental_flags
+
+    try:
+        answer = typer.prompt(EXPERIMENTAL_PROMPT, default="nie")
+    except Exception:
+        return parse_experimental_flags()
+    if str(answer).strip().lower() in ("ano", "a", "yes", "y", "true", "1"):
+        return parse_experimental_flags(True, True, True)
+    return parse_experimental_flags()
+
+
+def _resolve_experimental_flags(
+    enable_rope: bool, enable_cpu_moe: bool, enable_speculative: bool
+) -> dict:
+    """Merge CLI flags with the interactive opt-in prompt.
+
+    Explicit CLI flags win; the prompt appears only when no flag was given
+    and stdin is interactive. Defaults stay OFF everywhere.
+    """
+    from lm_optimizer.services.optimizer import parse_experimental_flags
+
+    flags = parse_experimental_flags(enable_rope, enable_cpu_moe, enable_speculative)
+    if not any(flags.values()):
+        try:
+            interactive = sys.stdin.isatty()
+        except Exception:
+            interactive = False
+        if interactive:
+            flags = _prompt_experimental_optins()
+    return flags
+
+
 def _phase_transparency_table(run, best):
     """PHASE A/B TRANSPARENCY table (None for legacy runs without phase_ab)."""
     pab = (run.benchmark_params or {}).get("phase_ab") or {}
@@ -751,6 +788,21 @@ def optimize(
         "--optimize-context",
         help="Phase B opt-in: max-context sweep on the frozen runtime winner",
     ),
+    enable_rope: bool = typer.Option(
+        False,
+        "--enable-rope",
+        help="Experimental tail opt-in: RoPE probes after the FINAL winner",
+    ),
+    enable_cpu_moe: bool = typer.Option(
+        False,
+        "--enable-cpu-moe",
+        help="Experimental tail opt-in: CPU-MoE probes after the FINAL winner",
+    ),
+    enable_speculative: bool = typer.Option(
+        False,
+        "--enable-speculative",
+        help="Experimental tail opt-in: speculative probes after the FINAL winner",
+    ),
 ):
     """Optimize a model configuration."""
     setup_logging()
@@ -802,6 +854,10 @@ def optimize(
                     client, model_info, max_context, gpu_via_cli, optimize_context
                 )
                 return
+
+            advanced.update(
+                _resolve_experimental_flags(enable_rope, enable_cpu_moe, enable_speculative)
+            )
 
             console.print(f"[bold]Starting optimization for {model}[/bold]")
             console.print(f"  Profile: {profile}")
@@ -1255,6 +1311,21 @@ def auto(
         "--max-tokens-scale",
         help="Scale case max-tokens 0.25-1.0 for slow models (may fail quality gates)",
     ),
+    enable_rope: bool = typer.Option(
+        False,
+        "--enable-rope",
+        help="Experimental tail opt-in: RoPE probes after the FINAL winner",
+    ),
+    enable_cpu_moe: bool = typer.Option(
+        False,
+        "--enable-cpu-moe",
+        help="Experimental tail opt-in: CPU-MoE probes after the FINAL winner",
+    ),
+    enable_speculative: bool = typer.Option(
+        False,
+        "--enable-speculative",
+        help="Experimental tail opt-in: speculative probes after the FINAL winner",
+    ),
 ):
     """Unattended pipeline: smoke -> precision -> ladder(ctx max) -> matrix -> optimize."""
     setup_logging()
@@ -1309,6 +1380,10 @@ def auto(
                         f"profile={profile} style={style}"
                     )
                 return
+
+            experimental_flags = _resolve_experimental_flags(
+                enable_rope, enable_cpu_moe, enable_speculative
+            )
 
             smoke_service = BenchmarkService(client, style=style)
             quality_evaluator = QualityEvaluator(QualityConfig(minimum_score=quality_threshold))
@@ -1455,6 +1530,7 @@ def auto(
                             "workload_type": normalize_workload(workload),
                             "selection_threshold": 0.05,
                             "gpu_via_cli": gpu_via_cli,
+                            **experimental_flags,
                         }
                         run = await _run_optimization(
                             client,
