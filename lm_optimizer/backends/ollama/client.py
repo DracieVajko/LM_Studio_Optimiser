@@ -295,6 +295,33 @@ class OllamaClient:
             raw=data,
         )
 
+    async def create(
+        self, name: str, *, from_: str, parameters: dict | None = None
+    ) -> dict:
+        """Persist a new tag via ``POST /api/create`` (``{model, from}`` + params).
+
+        Only new tags — callers must list first and refuse taken names
+        (see ``ensure_tag_free`` in ``modelfile.py``); the server has no
+        dry-run, so validation happens client-side before this call.
+        """
+        target = (name or "").strip()
+        base = (from_ or "").strip()
+        if not target:
+            raise ValueError("create: target model name must be non-empty")
+        if not base:
+            raise ValueError("create: base model (from_) must be non-empty")
+        body: dict = {"model": target, "from": base, "stream": False}
+        if parameters:
+            body["parameters"] = dict(parameters)
+        response = await self._request_with_retry(
+            "POST", "/api/create", json_data=body, timeout_s=GENERATE_TIMEOUT_S
+        )
+        try:
+            data = response.json()
+        except Exception:
+            data = {}
+        return data if isinstance(data, dict) else {"status": data}
+
     async def unload(self, model_id: str) -> bool:
         """Unload a model via ``keep_alive: 0``, verified empty (fail-closed).
 

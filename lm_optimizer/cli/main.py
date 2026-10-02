@@ -2909,5 +2909,137 @@ def sample_sweep(
     asyncio.run(_sweep())
 
 
+@app.command(name="ollama-export")
+def ollama_export(
+    model: str = typer.Option(..., "--model", help="Base Ollama model tag for the FROM line"),
+    param: list[str] | None = typer.Option(
+        None, "--param", help="Option override KEY=VALUE (repeatable)"
+    ),
+    output: Path | None = typer.Option(
+        None, "--output", "-o", help="Write the Modelfile here (default: print only)"
+    ),
+):
+    """Render an editable Ollama Modelfile from a base tag + options (no server calls)."""
+    from lm_optimizer.backends.ollama.modelfile import parse_param_assignment, render_modelfile
+
+    setup_logging()
+    params: dict = {}
+    for item in param or []:
+        try:
+            key, value = parse_param_assignment(item)
+        except ValueError as e:
+            console.print(f"[red]Invalid --param: {e}[/red]")
+            sys.exit(2)
+        params[key] = value
+    try:
+        text = render_modelfile(model, params)
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        sys.exit(2)
+    if output is not None:
+        try:
+            output.write_text(text, encoding="utf-8")
+        except OSError as e:
+            console.print(f"[red]Cannot write {output}: {e}[/red]")
+            sys.exit(1)
+        console.print(f"[green]Modelfile written: {output}[/green]")
+    console.print(text, highlight=False)
+
+
+@app.command(name="ollama-apply")
+def ollama_apply(
+    file: Path = typer.Option(..., "--file", help="Edited Modelfile (.md) to apply"),
+    as_tag: str | None = typer.Option(
+        None, "--as", help="New model tag (default: <base>:opt, never overwrite)"
+    ),
+    yes: bool = typer.Option(
+        False, "--yes", help="Confirm without prompting (required when non-interactive)"
+    ),
+    base_url: str | None = typer.Option(
+        None, "--base-url", help="Ollama URL (default http://127.0.0.1:11434)"
+    ),
+):
+    """Validate a Modelfile and persist it as a NEW Ollama tag via POST /api/create.
+
+    Refuses when the target tag already exists; creating a model is a
+    server-side write, so interactive confirmation (or --yes) is required.
+    """
+    from lm_optimizer.backends.ollama.client import OLLAMA_DEFAULT_URL, OllamaClient
+    from lm_optimizer.backends.ollama.modelfile import (
+        apply_modelfile_text,
+        default_tag_for,
+        ensure_tag_free,
+        parse_modelfile,
+    )
+
+    setup_logging()
+    try:
+        text = file.read_text(encoding="utf-8")
+    except OSError as e:
+        console.print(f"[red]Cannot read {file}: {e}[/red]")
+        sys.exit(1)
+    try:
+        parsed = parse_modelfile(text)
+    except ValueError as e:
+        console.print(f"[red]Invalid Modelfile: {e}[/red]")
+        sys.exit(1)
+    tag = (as_tag or "").strip() or default_tag_for(str(parsed["from"]))
+
+    async def _apply():
+        client = OllamaClient(base_url=base_url or OLLAMA_DEFAULT_URL)
+        try:
+            try:
+                await ensure_tag_free(client, tag)
+            except ValueError as e:
+                console.print(f"[red]{e}[/red]")
+                sys.exit(1)
+            except Exception as e:
+                console.print(
+                    f"[red]Cannot reach Ollama at {client.base_url}: "
+                    f"{type(e).__name__}[/red]"
+                )
+                sys.exit(1)
+            if not yes:
+                try:
+                    interactive = sys.stdin.isatty()
+                except Exception:
+                    interactive = False
+                if not interactive:
+                    console.print(
+                        "[red]Refusing without --yes on a non-interactive terminal: "
+                        "creating a model is a server-side write. "
+                        "Re-run with --yes to confirm.[/red]"
+                    )
+                    sys.exit(2)
+                if not typer.confirm(
+                    f"Create new Ollama model {tag!r} from {parsed['from']!r}?",
+                    default=False,
+                ):
+                    console.print("[yellow]Aborted: nothing was created.[/yellow]")
+                    sys.exit(1)
+            try:
+                result = await apply_modelfile_text(client, text, tag)
+            except ValueError as e:
+                console.print(f"[red]{e}[/red]")
+                sys.exit(1)
+            except Exception as e:
+                console.print(f"[red]Create failed: {type(e).__name__} ({e})[/red]")
+                sys.exit(1)
+            console.print(f"[green]Created {tag}[/green]")
+            status = result.get("status") if isinstance(result, dict) else None
+            if status:
+                console.print(f"  status: {status}")
+        except SystemExit:
+            raise
+        except Exception as e:
+            logger.exception("Ollama apply failed")
+            console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
+        finally:
+            await client.close()
+
+    asyncio.run(_apply())
+
+
 if __name__ == "__main__":
     app()
