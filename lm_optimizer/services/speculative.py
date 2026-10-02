@@ -15,10 +15,54 @@ from lm_optimizer.services.hostguard import gpu_free_mb
 
 logger = get_logger(__name__)
 
-DRAFT_HINTS = ("draft", "medusa", "eagle", "speculative")
+DRAFT_HINTS = ("draft", "medusa", "eagle", "speculative", "0.6b", "0.5b", "1b", "tiny")
 PROBE_PROMPT = "Say hi in 5 words."
 PROBE_TOKENS = 30
 PROBE_REPS = 3
+
+# Recommended draft model names per family (names only — never downloaded;
+# used purely for local lookup via find_local_draft).
+RECOMMENDED_DRAFTS: dict[str, list[str]] = {"qwen": ["Qwen3-0.6B"], "default": []}
+
+
+def _family_of(target_id: str) -> str:
+    """Family key for the recommended-draft lookup (qwen vs default)."""
+    if "qwen" in (target_id or "").lower():
+        return "qwen"
+    return "default"
+
+
+def find_local_draft(models, target_id: str) -> str | None:
+    """Local draft model id for target_id, or None when absent.
+
+    Pure local lookup (id/name match, case-insensitive; never downloads):
+    first a recommended name for the target's family, then any discovered
+    draft. The target itself is never returned as its own draft.
+    """
+    target = target_id or ""
+    wanted: list[str] = []
+    for family in (_family_of(target), "default"):
+        for name in RECOMMENDED_DRAFTS.get(family, []):
+            if name not in wanted:
+                wanted.append(name)
+    local: list[tuple[str, str]] = []
+    for mod in models or []:
+        mid = getattr(mod, "id", "") or ""
+        if not mid or mid == target:
+            continue
+        hay = f"{mid} {getattr(mod, 'name', '') or ''}".lower()
+        local.append((mid, hay))
+    for name in wanted:
+        want = name.lower()
+        for mid, hay in local:
+            if want == mid.lower() or want in hay:
+                return mid
+    others = [mod for mod in models or [] if (getattr(mod, "id", "") or "") != target]
+    for draft in discover_drafts(others):
+        key = getattr(draft, "id", "") or ""
+        if key:
+            return key
+    return None
 
 
 def discover_drafts(models) -> list:
@@ -53,8 +97,16 @@ async def _probe_toks(client, model_id: str) -> list[float]:
 
 
 async def ab_compare(client, model_id: str, base_cfg: LoadConfiguration,
-                     draft_key: str, use_mtp: bool = True) -> dict:
-    """Baseline vs speculative A/B at a fixed config. Never raises fatally."""
+                     draft_key: str | None, use_mtp: bool = True) -> dict:
+    """Baseline vs speculative A/B at a fixed config. Never raises fatally.
+
+    Gate: runs only when draft_key (from find_local_draft) names a model
+    present locally; otherwise returns {"ran": False, ...} without loading
+    anything (a recommended-but-absent draft is skipped, never downloaded).
+    """
+    if not draft_key:
+        return {"model": model_id, "draft": draft_key, "ran": False,
+                "reason": "no local draft"}
     result: dict = {"model": model_id, "draft": draft_key, "ran": False}
     try:
         vram_before = _vram_used_mb()
