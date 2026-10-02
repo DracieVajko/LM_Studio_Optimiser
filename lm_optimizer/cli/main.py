@@ -60,11 +60,12 @@ console = Console()
 logger = get_logger(__name__)
 
 if TYPE_CHECKING:
+    from lm_optimizer.backends.ollama.client import OllamaClient
     from lm_optimizer.services.lm_studio import LMStudioClient
 
 
-def get_client(base_url: str | None = None) -> "LMStudioClient":
-    """Create LM Studio client, optionally overriding URL (without persisting)."""
+def _lm_studio_client(base_url: str | None = None) -> "LMStudioClient":
+    """Construct an LM Studio client (legacy behavior: validate + build)."""
     from lm_optimizer.services.lm_studio import LMStudioClient
 
     # Validate URL if provided
@@ -77,6 +78,49 @@ def get_client(base_url: str | None = None) -> "LMStudioClient":
             sys.exit(1)
     client = LMStudioClient(base_url=base_url)
     return client
+
+
+def get_client(base_url: str | None = None) -> "LMStudioClient | OllamaClient":
+    """Create backend client, optionally overriding URL (without persisting).
+
+    Default backend is lm-studio; that path is byte-identical to the legacy
+    behavior. Select another backend via config or the ``--backend`` option.
+    """
+    if (config.backend or "lm-studio") != "lm-studio":
+        return get_backend_client(config.backend, base_url)
+    return _lm_studio_client(base_url)
+
+
+_VALID_BACKENDS = ("lm-studio", "ollama", "llama-cpp")
+
+
+def _require_backend(backend: str) -> str:
+    """Validate a backend name, exiting with usage hint on error."""
+    normalized = (backend or "").strip().lower()
+    if normalized not in _VALID_BACKENDS:
+        console.print(f"[red]Invalid --backend: {backend}[/red]")
+        console.print(f"Expected one of: {', '.join(_VALID_BACKENDS)}")
+        sys.exit(2)
+    return normalized
+
+
+def get_backend_client(
+    backend: str | None = None, base_url: str | None = None
+) -> "LMStudioClient | OllamaClient":
+    """Create a backend client by name (default: configured backend, lm-studio).
+
+    The ``lm-studio`` path uses the legacy construction byte-for-byte.
+    An explicit ``backend`` argument always wins over global config.
+    ``llama-cpp`` is phase 2 and raises explicitly.
+    """
+    from lm_optimizer.backends.ollama.client import OllamaClient
+
+    resolved = _require_backend(backend or config.backend or "lm-studio")
+    if resolved == "lm-studio":
+        return _lm_studio_client(base_url=base_url)
+    if resolved == "ollama":
+        return OllamaClient(base_url=base_url or config.ollama_base_url)
+    raise NotImplementedError("llama.cpp backend is phase 2")
 
 
 def _handle_connection_error(url: str, error: Exception) -> None:
@@ -483,12 +527,19 @@ def _save_preset_and_report(
 def callback(
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable verbose logging"),
     config_file: Path | None = typer.Option(None, "--config", "-c", help="Config file path"),
+    backend: str | None = typer.Option(
+        None,
+        "--backend",
+        help="Inference backend: lm-studio (default), ollama, llama-cpp (phase 2)",
+    ),
 ):
     """LM Studio Auto Optimizer."""
     if verbose:
         import logging
 
         logging.getLogger().setLevel(logging.DEBUG)
+    if backend is not None:
+        config.backend = _require_backend(backend)
 
 
 @app.command()
@@ -2907,6 +2958,138 @@ def sample_sweep(
             await client.close()
 
     asyncio.run(_sweep())
+
+
+@app.command(name="ollama-export")
+def ollama_export(
+    model: str = typer.Option(..., "--model", help="Base Ollama model tag for the FROM line"),
+    param: list[str] | None = typer.Option(
+        None, "--param", help="Option override KEY=VALUE (repeatable)"
+    ),
+    output: Path | None = typer.Option(
+        None, "--output", "-o", help="Write the Modelfile here (default: print only)"
+    ),
+):
+    """Render an editable Ollama Modelfile from a base tag + options (no server calls)."""
+    from lm_optimizer.backends.ollama.modelfile import parse_param_assignment, render_modelfile
+
+    setup_logging()
+    params: dict = {}
+    for item in param or []:
+        try:
+            key, value = parse_param_assignment(item)
+        except ValueError as e:
+            console.print(f"[red]Invalid --param: {e}[/red]")
+            sys.exit(2)
+        params[key] = value
+    try:
+        text = render_modelfile(model, params)
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        sys.exit(2)
+    if output is not None:
+        try:
+            output.write_text(text, encoding="utf-8")
+        except OSError as e:
+            console.print(f"[red]Cannot write {output}: {e}[/red]")
+            sys.exit(1)
+        console.print(f"[green]Modelfile written: {output}[/green]")
+    console.print(text, highlight=False)
+
+
+@app.command(name="ollama-apply")
+def ollama_apply(
+    file: Path = typer.Option(..., "--file", help="Edited Modelfile (.md) to apply"),
+    as_tag: str | None = typer.Option(
+        None, "--as", help="New model tag (default: <base>:opt, never overwrite)"
+    ),
+    yes: bool = typer.Option(
+        False, "--yes", help="Confirm without prompting (required when non-interactive)"
+    ),
+    base_url: str | None = typer.Option(
+        None, "--base-url", help="Ollama URL (default http://127.0.0.1:11434)"
+    ),
+):
+    """Validate a Modelfile and persist it as a NEW Ollama tag via POST /api/create.
+
+    Refuses when the target tag already exists; creating a model is a
+    server-side write, so interactive confirmation (or --yes) is required.
+    """
+    from lm_optimizer.backends.ollama.client import OLLAMA_DEFAULT_URL, OllamaClient
+    from lm_optimizer.backends.ollama.modelfile import (
+        apply_modelfile_text,
+        default_tag_for,
+        ensure_tag_free,
+        parse_modelfile,
+    )
+
+    setup_logging()
+    try:
+        text = file.read_text(encoding="utf-8")
+    except OSError as e:
+        console.print(f"[red]Cannot read {file}: {e}[/red]")
+        sys.exit(1)
+    try:
+        parsed = parse_modelfile(text)
+    except ValueError as e:
+        console.print(f"[red]Invalid Modelfile: {e}[/red]")
+        sys.exit(1)
+    tag = (as_tag or "").strip() or default_tag_for(str(parsed["from"]))
+
+    async def _apply():
+        client = OllamaClient(base_url=base_url or OLLAMA_DEFAULT_URL)
+        try:
+            try:
+                await ensure_tag_free(client, tag)
+            except ValueError as e:
+                console.print(f"[red]{e}[/red]")
+                sys.exit(1)
+            except Exception as e:
+                console.print(
+                    f"[red]Cannot reach Ollama at {client.base_url}: "
+                    f"{type(e).__name__}[/red]"
+                )
+                sys.exit(1)
+            if not yes:
+                try:
+                    interactive = sys.stdin.isatty()
+                except Exception:
+                    interactive = False
+                if not interactive:
+                    console.print(
+                        "[red]Refusing without --yes on a non-interactive terminal: "
+                        "creating a model is a server-side write. "
+                        "Re-run with --yes to confirm.[/red]"
+                    )
+                    sys.exit(2)
+                if not typer.confirm(
+                    f"Create new Ollama model {tag!r} from {parsed['from']!r}?",
+                    default=False,
+                ):
+                    console.print("[yellow]Aborted: nothing was created.[/yellow]")
+                    sys.exit(1)
+            try:
+                result = await apply_modelfile_text(client, text, tag)
+            except ValueError as e:
+                console.print(f"[red]{e}[/red]")
+                sys.exit(1)
+            except Exception as e:
+                console.print(f"[red]Create failed: {type(e).__name__} ({e})[/red]")
+                sys.exit(1)
+            console.print(f"[green]Created {tag}[/green]")
+            status = result.get("status") if isinstance(result, dict) else None
+            if status:
+                console.print(f"  status: {status}")
+        except SystemExit:
+            raise
+        except Exception as e:
+            logger.exception("Ollama apply failed")
+            console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
+        finally:
+            await client.close()
+
+    asyncio.run(_apply())
 
 
 if __name__ == "__main__":

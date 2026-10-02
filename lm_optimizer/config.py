@@ -150,6 +150,27 @@ class Config(BaseSettings):
     web_ui: WebUIConfig = Field(default_factory=WebUIConfig)
     safety: SafetyConfig = Field(default_factory=SafetyConfig)
 
+    backend: Literal["lm-studio", "ollama", "llama-cpp"] = Field(
+        default="lm-studio", description="Inference backend (llama-cpp is phase 2)"
+    )
+    ollama_base_url: str = Field(
+        default="http://127.0.0.1:11434", description="Ollama API base URL"
+    )
+    llamacpp_base_url: str = Field(
+        default="http://127.0.0.1:8080", description="llama.cpp server base URL (phase 2)"
+    )
+
+    @field_validator("ollama_base_url", "llamacpp_base_url", mode="before")
+    @classmethod
+    def validate_backend_url(cls, v: str) -> str:
+        """Validate backend URL is http(s) and not empty."""
+        if not v or not isinstance(v, str):
+            raise ValueError("Backend URL must be a non-empty string")
+        v = v.strip().rstrip("/")
+        if not (v.startswith("http://") or v.startswith("https://")):
+            raise ValueError("Backend URL must start with http:// or https://")
+        return v
+
     def ensure_directories(self) -> None:
         """Create all configured directories."""
         for dir_path in [

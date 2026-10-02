@@ -466,3 +466,109 @@ No remaining constant assumes `6 GB`, `RTX 3060`, `50 tok/s`, `1000 prompt tok/s
 - **v0.1.1**: correctness pass — hardware-agnostic scoring, estimated TTFT labeling, deterministic sampling, RoPE experimental, baseline measurement, explainable scores, comprehensive tests.
 
 For implementation details, see `lm_optimizer/scoring/normalization.py`, `lm_optimizer/services/optimizer.py`, and `lm_optimizer/tests/test_optimization_correctness.py`.
+
+---
+
+## 14. Ollama Backend (Phase 1)
+
+Second inference backend behind the `BackendClient` seam
+(`lm_optimizer/backends/base.py`; spec
+`docs/specs/2026-10-02-multi-backend-design.md`). Code lives in
+`lm_optimizer/backends/` (split-ready: one subpackage per backend).
+`LMStudioClient` stays at `lm_optimizer/services/lm_studio.py`; it gains
+interface conformance only (no behavior change).
+
+### 14.1 Seam contract
+
+`BackendClient` is an async `Protocol`: `backend_name: str`, async
+`connect()`, `list_models()`, `load_model(model_id, config)`,
+`generate(model_id, prompt, options)`, `unload(model_id)`, `close()`, plus
+`capabilities`, which may be a **property or a method** (`LMStudioClient`
+exposes a property — generic call sites must not blindly use parens).
+`assert_conforms(client)` checks presence/types only via
+`inspect.getattr_static`: it never performs I/O and never invokes the
+`capabilities` getter (the LM Studio property raises when unconnected).
+`load_model`'s second parameter is accepted under alias names
+(`config` / `load_config` / ...); callers should pass it positionally.
+`LMStudioClient.generate` / `.unload` are thin shims over
+`chat_completion` / `ensure_unloaded` (fail-closed).
+
+### 14.2 Ollama client (`lm_optimizer/backends/ollama/client.py`)
+
+`OllamaClient(base_url="http://127.0.0.1:11434")`, mocked-httpx tested:
+
+- Discovery/details: `GET /api/tags`, `POST /api/show`.
+- Sweep: `POST /api/generate` (`stream=false`) with per-request `options`.
+- Metrics normalized to `{gen_tok_s, prompt_tok_s, load_ms}` as
+  `eval_count/eval_duration*1e9` etc. (durations are ns server-side);
+  zero durations yield `0.0`, never NaN/inf. `done_reason` is preserved.
+- Unload = generate with empty prompt + `keep_alive: 0`, then
+  **verified empty via `GET /api/ps` (fail-closed: returns `True` only
+  when the model is gone)**. Servers without `/api/ps` (404) fall back to
+  trusting `done_reason == "unload"`.
+- Slow-operation allowances: 600 s timeout on generate/create, 60 s on
+  show; retries (3×, transient network errors only). A mid-sweep
+  unreachable server surfaces as a recorded failure, never a hang.
+- No probing: unknown `options` keys are silently ignored server-side, so
+  the supported set is a static table (§14.3), never a probe claim.
+
+### 14.3 Options registry (`lm_optimizer/backends/ollama/registry.py`)
+
+`OLLAMA_OPTIONS` (exact static set the optimizer may set):
+
+| Key | Role |
+|---|---|
+| `num_ctx` | load/perf — swept, capped by `llama.context_length` from `/api/show` |
+| `num_batch` | load/perf — swept |
+| `num_thread` | load/perf — swept |
+| `num_gpu` | load/perf — swept |
+| `use_mmap` | load/perf — in table, not swept |
+| `temperature`, `top_k`, `top_p`, `min_p`, `repeat_penalty` | sampling — NOT swept here; pass through to the existing generation profiles |
+
+Space defaults from `ollama_space(model_info, hardware)`: `num_ctx`
+`[2048, 4096, 8192]` (filter-only cap: values above the show-reported
+limit are dropped, the cap itself is never appended),
+`num_batch` `[64, 256, 512]`, `num_thread` `[logical CPU count]`,
+`num_gpu` `[0]` on CPU-only hosts else `[0, max]`. `num_ctx` changes force
+a server-side reload; that load cost surfaces in `load_duration` metrics.
+Backend-aware branch: `SearchSpaceGenerator.generate_ollama()`; the LM
+Studio `generate()` path is untouched.
+
+### 14.4 Modelfile export + apply (`modelfile.py`, CLI)
+
+- `render_modelfile(base, params)` → exactly one `FROM <base>` line plus
+  one `PARAMETER <key> <value>` per option (insertion order, trailing
+  newline). `parse_modelfile(text)` is strict: every non-blank,
+  non-comment line must be `FROM` or `PARAMETER`; all problems are
+  collected and raised together as one `ValueError("line N: ...")`, so an
+  edited file reports everything at once. Known keys are type-checked
+  (int / float / true-false); unknown keys pass through leniently.
+- `ollama-export --model <tag> [--param KEY=VALUE ...] [--output F]`:
+  offline render, no server calls.
+- `ollama-apply --file <md> [--as <tag>] [--yes]`: validates, lists first,
+  and **refuses when the target tag already exists** (case-insensitive —
+  never overwrite; default target `<name>:opt` with registry prefix
+  stripped). Creating a model is a server-side write: interactive
+  confirmation is required, `--yes` for non-interactive use (refuses
+  without it off-TTY).
+
+### 14.5 Backend switch
+
+`config.backend` (`"lm-studio"` default; `ollama_base_url` default
+`http://127.0.0.1:11434`, `llamacpp_base_url` default
+`http://127.0.0.1:8080`), global `--backend` option on the CLI callback,
+`get_backend_client(backend, base_url)` factory. The default path is
+byte-identical to legacy behavior; **an explicit argument always wins
+over global config**; `llama-cpp` raises
+`NotImplementedError("llama.cpp backend is phase 2")` — explicit, never
+silent.
+
+### 14.6 Phase-1 scope (what is NOT yet wired)
+
+- `SearchSpaceGenerator.generate_ollama()` has no production caller yet:
+  the space branch exists and is tested, but the sweep loop is not driven
+  by it. End-to-end Ollama sweep wiring is the next step after the live
+  checklist (`docs/OLLAMA_LIVE_CHECK.md`) passes on owner hardware.
+- Capability snapshots carry a backend string; `OptimizationRun` itself
+  has no backend field — do not mix runs from different backends in one
+  comparison until per-run tagging lands.
