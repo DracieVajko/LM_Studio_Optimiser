@@ -47,7 +47,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="LM Studio Auto Optimizer",
     description="Finds empirically validated configurations optimized for your hardware, model and selected goal",
-    version="1.3.0",
+    version="1.4.0",
     lifespan=lifespan,
 )
 

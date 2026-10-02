@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.4.0] - 2026-10-02
+
+### Added
+- **Stage-4 grid unification**: eval batch default `[64, 128, 256, 512, 1024, 2048]`,
+  parallels `[1, 2, 4, 8]` throughput-gated (interactive collapses to `[1]`);
+  physical/checkpoints extended values opt-in only via `advanced_settings`.
+- **MoE minimal gating**: max 3 derived expert variations (`default, /2, /4`),
+  only when `is_moe`; `n-cpu-moe` documented manual (no verified channel).
+- **Experimental opt-ins** (default OFF): `--enable-rope` / `--enable-cpu-moe` /
+  `--enable-speculative` on `optimize` + `auto`, tty-gated prompt, run marked
+  `is_experimental`.
+- **Draft discovery**: extended hints + `RECOMMENDED_DRAFTS` (names only, never
+  downloaded), `find_local_draft()`, skip-with-reason when absent.
+- **Manual memory duel**: new `manual-memory-duel --model --stage mmap|keep` CLI —
+  guided re-measure of the auto best after a manual GUI toggle, keep/revert
+  verdict at +5% gen tok/s (TTFT tiebreak), fail-closed unload before+after.
+
 ## [1.3.0] - 2026-10-02
 
 ### Fixed
