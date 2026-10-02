@@ -54,7 +54,7 @@ class TestHardwareDetection:
     def test_cpu_freq_none_degrades_to_none(self, monkeypatch):
         import psutil as _psutil
 
-        monkeypatch.setattr(_psutil, "cpu_freq", lambda: None)
+        monkeypatch.setattr(_psutil, "cpu_freq", lambda: None, raising=False)
         cpu = get_cpu_info()
         assert cpu.frequency_ghz is None
 
