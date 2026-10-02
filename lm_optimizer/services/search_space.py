@@ -61,6 +61,24 @@ class SearchSpaceGenerator:
     def __init__(self, client: LMStudioClient):
         self.client = client
 
+    def generate_ollama(
+        self,
+        model_info: dict,
+        hardware: HardwareInfo,
+        advanced_settings: dict | None = None,
+    ) -> dict:
+        """Ollama backend branch: per-request ``options`` space from ``/api/show``.
+
+        ``model_info`` is the raw ``POST /api/show`` details dict (as
+        returned by ``OllamaClient.show()``). The LM Studio ``generate()``
+        path below is untouched; sampling keys stay owned by the existing
+        generation profiles. Lazy import keeps the core importable without
+        the Ollama backend package (split-ready boundary).
+        """
+        from lm_optimizer.backends.ollama.registry import ollama_space
+
+        return ollama_space(model_info, hardware, advanced_settings)
+
     def generate(
         self,
         model: ModelIdentity,
