@@ -46,6 +46,47 @@ class PauseRequested(Exception):
     """Graceful user-requested pause: state already persisted, not a failure."""
 
 
+EXPERIMENTAL_REASONS = {
+    "enable_rope": "RoPE parameters enabled (experimental)",
+    "enable_cpu_moe": "CPU-MoE offload enabled (experimental)",
+    "enable_speculative": "Speculative decoding enabled (experimental)",
+}
+
+
+def parse_experimental_flags(
+    enable_rope: bool = False,
+    enable_cpu_moe: bool = False,
+    enable_speculative: bool = False,
+) -> dict:
+    """Experimental tail opt-ins. All default OFF.
+
+    RoPE / CPU-MoE / speculative probes run only as a tail after the FINAL
+    winner, never inside the main sweep.
+    """
+    return {
+        "enable_rope": bool(enable_rope),
+        "enable_cpu_moe": bool(enable_cpu_moe),
+        "enable_speculative": bool(enable_speculative),
+    }
+
+
+def apply_experimental_mark(run: OptimizationRun, flags: dict | None) -> OptimizationRun:
+    """Mark a run experimental when any opt-in flag is set.
+
+    Any True flag sets `run.is_experimental = True` with a reason string;
+    all-False (or missing) flags leave the run clean.
+    """
+    flags = flags or {}
+    active = [key for key in EXPERIMENTAL_REASONS if flags.get(key)]
+    if active:
+        run.is_experimental = True
+        run.experimental_reason = "; ".join(EXPERIMENTAL_REASONS[key] for key in active)
+    else:
+        run.is_experimental = False
+        run.experimental_reason = None
+    return run
+
+
 def format_diagnostic(exc: BaseException) -> dict:
     """Diagnostic record for unexpected failures.
 
@@ -196,22 +237,22 @@ class AdaptiveOptimizer:
         advanced_settings = advanced_settings or {}
         self.benchmark.style = style
 
-        # Handle RoPE experimental flag - DISABLED by default
-        enable_rope = advanced_settings.get("enable_rope", False)
-        is_experimental = False
-        experimental_reason = None
-        if enable_rope:
-            is_experimental = True
-            experimental_reason = "RoPE parameters enabled (experimental)"
+        # Experimental tail opt-ins - ALL DISABLED by default.
+        # RoPE / CPU-MoE / speculative probes run only as a tail after the
+        # FINAL winner, never inside the main sweep.
+        exp_flags = parse_experimental_flags(
+            enable_rope=advanced_settings.get("enable_rope", False),
+            enable_cpu_moe=advanced_settings.get("enable_cpu_moe", False),
+            enable_speculative=advanced_settings.get("enable_speculative", False),
+        )
+        advanced_settings.update(exp_flags)
+        if exp_flags["enable_rope"]:
             # RoPE requires stronger quality validation
             quality_threshold = max(quality_threshold, 0.98)
             logger.warning(
                 "RoPE experimental enabled - applying stronger quality validation",
                 threshold=quality_threshold,
             )
-        else:
-            # Ensure RoPE params are not in search space by stripping them
-            advanced_settings["enable_rope"] = False
 
         # Use profile's default threshold if not explicitly overridden
         # Profiles have intentional thresholds: speed 0.95, balanced 0.97, context/quality higher
@@ -241,8 +282,8 @@ class AdaptiveOptimizer:
             profile_weights=weights_dict,
             quality_threshold=quality_threshold,
             search_space={},
-            is_experimental=is_experimental,
-            experimental_reason=experimental_reason,
+            is_experimental=False,
+            experimental_reason=None,
             benchmark_params={
                 "benchmark_repetitions": config.optimization.benchmark_runs,
                 "validation_repetitions": 5,
@@ -260,6 +301,8 @@ class AdaptiveOptimizer:
                 "optimize_context": bool(advanced_settings.get("optimize_context", False)),
             },
         )
+        # Any experimental opt-in marks the run (single marking path).
+        apply_experimental_mark(run, exp_flags)
 
         # Generate search space
         search_space = self.search_generator.generate(model, hardware, profile, advanced_settings)

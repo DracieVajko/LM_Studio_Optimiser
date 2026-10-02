@@ -99,9 +99,17 @@ def _plan_s1(anchor: LoadConfiguration, caps: SpeedCaps, rest: set, add) -> list
     elif caps.flash_required:
         notes.append("flash_attention: server requires flash — off not probed")
     if caps.is_moe and "num_experts" in rest:
-        for n in (2, 4, 8):
-            if n != anchor.num_experts:
-                add("S1", f"MoE expert count {n} (REST)", num_experts=n)
+        # MoE minimal gated: probe at most 3 expert counts derived from the
+        # anchor (default, default//2, default//4), deduped, anchor excluded.
+        # n-cpu-moe (num_cpu_expert_layers_ratio) stays manual: no verified
+        # REST/CLI channel exists, so it is never injected here.
+        default = anchor.num_experts or 8
+        seen: list[int] = []
+        for value in (default, default // 2, default // 4):
+            if value >= 1 and value not in seen and value != anchor.num_experts:
+                seen.append(value)
+        for n in seen[:3]:
+            add("S1", f"MoE expert count {n} (REST)", num_experts=n)
     if caps.has_draft_model:
         add("S1", "speculative draft path (REST)", speculative_draft_mtp=True)
         for n in (3, 8):

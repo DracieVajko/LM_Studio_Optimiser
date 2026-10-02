@@ -425,6 +425,31 @@ class TestPerTestSection:
         assert result.generation["quality_by_test"]["t"]["checks_total"] == 6
 
 
+class TestManualDuelNotes:
+    def test_prune_notes_mention_manual_duel(self):
+        from lm_optimizer.services.reporting import _prune_notes
+
+        run, _ = _run([_result()])
+        notes = _prune_notes(run, run.configurations)
+        assert any("manual-memory-duel" in n for n in notes)
+
+    def test_prune_notes_experimental_tail_marked(self):
+        from lm_optimizer.services.reporting import _prune_notes
+
+        run, _ = _run([_result()])
+        run.is_experimental = True
+        run.experimental_reason = "RoPE parameters enabled (experimental)"
+        notes = _prune_notes(run, run.configurations)
+        assert any("experimental" in n.lower() for n in notes)
+
+    def test_prune_notes_stage4_sweep_described(self):
+        from lm_optimizer.services.reporting import _prune_notes
+
+        run, _ = _run([_result()])
+        notes = _prune_notes(run, run.configurations)
+        assert any("stage-4" in n.lower() or "stage 4" in n.lower() for n in notes)
+
+
 class TestTypical:
     def test_typical_flags_slow_window(self, tmp_path):
         from lm_optimizer.services.reporting import save_best_report

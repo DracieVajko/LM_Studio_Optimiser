@@ -80,6 +80,32 @@ def _prune_notes(run: OptimizationRun, configs: list) -> list[str]:
             "(`lms load <model> --gpu 0.5|max|off`); never sent via REST."
         )
     notes.append(
+        "stage-4 sweep (batch/concurrency tail): eval batch alts "
+        "64,128,256,1024,2048; physical batch 256,1024; checkpoints 16,64; "
+        "parallel 1,2,8 (8 is throughput-workload only, interactive stays 1); "
+        "see the Tried values table for what actually ran."
+    )
+    if getattr(run, "is_experimental", False):
+        reason = getattr(run, "experimental_reason", None) or "experimental opt-in"
+        notes.append(
+            f"experimental tail ({reason}): RoPE / CPU-MoE / speculative run "
+            "only after the FINAL winner as opt-in "
+            "(--enable-rope/--enable-cpu-moe/--enable-speculative); "
+            "not part of the main sweep."
+        )
+    else:
+        notes.append(
+            "experimental tail skipped: RoPE / CPU-MoE / speculative run only "
+            "as opt-in after the FINAL winner "
+            "(--enable-rope/--enable-cpu-moe/--enable-speculative, all default OFF)."
+        )
+    notes.append(
+        "try_mmap / keep_model_in_memory are MANUAL_ONLY (GUI): re-measure one "
+        "lever at a time with `manual-memory-duel --model <id> --stage "
+        "mmap|keep` (auto best sourced DB-primary, .md identity; keeps only on "
+        ">= +5% gen tok/s, TTFT tiebreak only)."
+    )
+    notes.append(
         "rope_freq_*, n_threads, try_mmap, keep_model_in_memory, unified_kv_cache, "
         "ttl, num_layers are rejected via REST (GUI/CLI-only or unsupported)."
     )

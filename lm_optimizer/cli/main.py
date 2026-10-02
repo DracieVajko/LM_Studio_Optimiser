@@ -267,6 +267,43 @@ def _optimize_advanced(
     }
 
 
+EXPERIMENTAL_PROMPT = "Testovat experimentalne RoPE / CPU-MoE / speculative? [nie]"
+
+
+def _prompt_experimental_optins() -> dict:
+    """Interactive experimental opt-in (default: all off). Never raises."""
+    from lm_optimizer.services.optimizer import parse_experimental_flags
+
+    try:
+        answer = typer.prompt(EXPERIMENTAL_PROMPT, default="nie")
+    except Exception:
+        return parse_experimental_flags()
+    if str(answer).strip().lower() in ("ano", "a", "yes", "y", "true", "1"):
+        return parse_experimental_flags(True, True, True)
+    return parse_experimental_flags()
+
+
+def _resolve_experimental_flags(
+    enable_rope: bool, enable_cpu_moe: bool, enable_speculative: bool
+) -> dict:
+    """Merge CLI flags with the interactive opt-in prompt.
+
+    Explicit CLI flags win; the prompt appears only when no flag was given
+    and stdin is interactive. Defaults stay OFF everywhere.
+    """
+    from lm_optimizer.services.optimizer import parse_experimental_flags
+
+    flags = parse_experimental_flags(enable_rope, enable_cpu_moe, enable_speculative)
+    if not any(flags.values()):
+        try:
+            interactive = sys.stdin.isatty()
+        except Exception:
+            interactive = False
+        if interactive:
+            flags = _prompt_experimental_optins()
+    return flags
+
+
 def _phase_transparency_table(run, best):
     """PHASE A/B TRANSPARENCY table (None for legacy runs without phase_ab)."""
     pab = (run.benchmark_params or {}).get("phase_ab") or {}
@@ -704,6 +741,140 @@ def benchmark(
     asyncio.run(_benchmark())
 
 
+@app.command(name="manual-memory-duel")
+def manual_memory_duel(
+    model: str = typer.Option(
+        ..., "--model", help="Model ID (must match results/<model>-best.md)"
+    ),
+    stage: str = typer.Option(..., "--stage", help="Manual toggle to duel: mmap|keep"),
+    repetitions: int = typer.Option(
+        3, "--repetitions", "-r", help="Benchmark repetitions per re-measure"
+    ),
+    style: str = typer.Option(
+        "balanced", "--style", help="Benchmark style (precise/balanced/creative)"
+    ),
+    output: Path = typer.Option(
+        Path("results"), "--output", help="Report output directory"
+    ),
+):
+    """Duel a MANUAL GUI toggle (mmap OFF / Keep OFF) against the auto best.
+
+    Prints the auto best, pauses for the GUI toggle + Enter, re-measures the
+    SAME LoadConfiguration (this tool never toggles mmap/keep itself), then
+    prints a keep/revert verdict. Fail-closed unload before and after.
+    """
+    from lm_optimizer.services import manual_memory_duel as _duel
+
+    setup_logging()
+    style = _require_style(style)
+    if stage not in ("mmap", "keep"):
+        console.print("[red]Invalid --stage (mmap|keep)[/red]")
+        sys.exit(2)
+    try:
+        interactive = sys.stdin.isatty()
+    except Exception:
+        interactive = False
+    if not interactive:
+        console.print(
+            "[red]manual-memory-duel needs an interactive terminal: the GUI "
+            "toggle + Enter confirmation cannot be verified otherwise. "
+            "Re-measuring without it could compare the wrong setting.[/red]"
+        )
+        sys.exit(2)
+
+    async def _duel_run():
+        client = get_client()
+        try:
+            await client.connect()
+            snap = await prepare_host(client, purpose="manual-memory-duel")
+            for line in format_snapshot(snap):
+                console.print(f"  {line}")
+            if not snap.get("verified_empty") and snap.get("leftovers"):
+                console.print("[red]Stale models loaded, aborting. Unload them first.[/red]")
+                sys.exit(1)
+            try:
+                await assert_unloaded(client, purpose=f"manual-memory-duel:{model}:pre")
+            except UnloadNotClean as e:
+                console.print(f"[red]Host not clean, aborting:[/red] {e}")
+                sys.exit(1)
+
+            try:
+                auto = _duel.load_auto_best(output, model, results_dir=str(output))
+            except ValueError as e:
+                console.print(f"[red]{e}[/red]")
+                sys.exit(1)
+            if auto.get("load_config") is None or not auto.get("context_length"):
+                console.print(
+                    "[red]No re-measurable auto best: the run DB has no load "
+                    "configuration for this model (run auto/optimize first). "
+                    "Refusing to guess a config.[/red]"
+                )
+                sys.exit(1)
+
+            console.print(
+                f"[bold]Auto best for {model}[/bold] (source: {auto['source']})"
+            )
+            console.print(
+                f"  gen {auto['gen_tok_s']:.1f} tok/s | "
+                f"est. TTFT {auto['ttft_ms']:.0f} ms | ctx {auto['context_length']}"
+            )
+
+            prompt = _duel.MMAP_PROMPT if stage == "mmap" else _duel.KEEP_PROMPT
+            try:
+                typer.prompt(prompt, default="")
+            except Exception:
+                console.print(
+                    "[red]Confirmation aborted; nothing was re-measured "
+                    "(this tool toggles nothing itself).[/red]"
+                )
+                sys.exit(1)
+
+            benchmark_service = BenchmarkService(
+                client,
+                benchmark_config=_benchmark_config_obj(repetitions),
+                style=style,
+            )
+            with console.status(f"Re-measuring with manual {stage} OFF..."):
+                result = await benchmark_service.run_benchmark(
+                    model, auto["load_config"], auto["context_length"], style=style
+                )
+            manual_gen = result.get_avg_generation_tok_s()
+            manual_ttft = result.get_avg_estimated_ttft_ms()
+            console.print(
+                f"  manual ({stage} OFF): {manual_gen:.1f} tok/s | "
+                f"est. TTFT {manual_ttft:.0f} ms"
+            )
+            v = _duel.verdict(auto["gen_tok_s"], manual_gen, auto["ttft_ms"], manual_ttft)
+            if v["decision"] == "keep":
+                console.print(f"[green]{_duel.GUIDANCE_KEEP}[/green] {v['reason']}")
+            else:
+                console.print(f"[yellow]{_duel.GUIDANCE_REVERT}[/yellow] {v['reason']}")
+            other = "keep" if stage == "mmap" else "mmap"
+            console.print(f"  Repeat for the other lever with: --stage {other}")
+
+            try:
+                await client.ensure_unloaded(model)
+            except Exception:
+                pass
+            try:
+                await assert_unloaded(
+                    client, purpose=f"manual-memory-duel:{model}:{stage}:post"
+                )
+            except UnloadNotClean as e:
+                console.print(f"[red]Done, but host not clean:[/red] {e}")
+                sys.exit(1)
+        except SystemExit:
+            raise
+        except Exception as e:
+            logger.exception("Manual memory duel failed")
+            console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
+        finally:
+            await client.close()
+
+    asyncio.run(_duel_run())
+
+
 @app.command()
 def optimize(
     model: str = typer.Argument(..., help="Model ID to optimize"),
@@ -750,6 +921,21 @@ def optimize(
         False,
         "--optimize-context",
         help="Phase B opt-in: max-context sweep on the frozen runtime winner",
+    ),
+    enable_rope: bool = typer.Option(
+        False,
+        "--enable-rope",
+        help="Experimental tail opt-in: RoPE probes after the FINAL winner",
+    ),
+    enable_cpu_moe: bool = typer.Option(
+        False,
+        "--enable-cpu-moe",
+        help="Experimental tail opt-in: CPU-MoE probes after the FINAL winner",
+    ),
+    enable_speculative: bool = typer.Option(
+        False,
+        "--enable-speculative",
+        help="Experimental tail opt-in: speculative probes after the FINAL winner",
     ),
 ):
     """Optimize a model configuration."""
@@ -802,6 +988,10 @@ def optimize(
                     client, model_info, max_context, gpu_via_cli, optimize_context
                 )
                 return
+
+            advanced.update(
+                _resolve_experimental_flags(enable_rope, enable_cpu_moe, enable_speculative)
+            )
 
             console.print(f"[bold]Starting optimization for {model}[/bold]")
             console.print(f"  Profile: {profile}")
@@ -1255,6 +1445,21 @@ def auto(
         "--max-tokens-scale",
         help="Scale case max-tokens 0.25-1.0 for slow models (may fail quality gates)",
     ),
+    enable_rope: bool = typer.Option(
+        False,
+        "--enable-rope",
+        help="Experimental tail opt-in: RoPE probes after the FINAL winner",
+    ),
+    enable_cpu_moe: bool = typer.Option(
+        False,
+        "--enable-cpu-moe",
+        help="Experimental tail opt-in: CPU-MoE probes after the FINAL winner",
+    ),
+    enable_speculative: bool = typer.Option(
+        False,
+        "--enable-speculative",
+        help="Experimental tail opt-in: speculative probes after the FINAL winner",
+    ),
 ):
     """Unattended pipeline: smoke -> precision -> ladder(ctx max) -> matrix -> optimize."""
     setup_logging()
@@ -1309,6 +1514,10 @@ def auto(
                         f"profile={profile} style={style}"
                     )
                 return
+
+            experimental_flags = _resolve_experimental_flags(
+                enable_rope, enable_cpu_moe, enable_speculative
+            )
 
             smoke_service = BenchmarkService(client, style=style)
             quality_evaluator = QualityEvaluator(QualityConfig(minimum_score=quality_threshold))
@@ -1455,6 +1664,7 @@ def auto(
                             "workload_type": normalize_workload(workload),
                             "selection_threshold": 0.05,
                             "gpu_via_cli": gpu_via_cli,
+                            **experimental_flags,
                         }
                         run = await _run_optimization(
                             client,

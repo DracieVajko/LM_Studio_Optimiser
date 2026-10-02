@@ -224,10 +224,10 @@ class SearchSpaceGenerator:
             return [256]
 
         if advanced.get("auto_batch", True):
-            return [64, 128, 256, 512, 1024]
+            return [64, 128, 256, 512, 1024, 2048]
 
         min_batch = advanced.get("min_batch", 64)
-        max_batch = advanced.get("max_batch", 1024)
+        max_batch = advanced.get("max_batch", 2048)
 
         # Generate powers of 2
         sizes = []
@@ -258,7 +258,7 @@ class SearchSpaceGenerator:
         from lm_optimizer.services.workload import apply_to_space
 
         return apply_to_space(
-            [1, 2, 4],
+            [1, 2, 4, 8],
             advanced.get("workload_type", "interactive"),
             explicit_override=None,
         )
@@ -276,24 +276,26 @@ class SearchSpaceGenerator:
     def _generate_expert_counts(
         self, model: ModelIdentity, caps: LMStudioCapabilities, advanced: dict
     ) -> list[int]:
-        """Generate expert count candidates for MoE models."""
+        """Generate expert count candidates for MoE models (max 3).
+
+        Gated on ``model.is_moe and caps.supports_num_experts``. The probe set
+        is ``(default, default // 2, default // 4)``, deduped, at most 3 values.
+        ``n-cpu-moe`` (``num_cpu_expert_layers_ratio``) stays manual /
+        experimental: no verified REST/CLI channel exists, so it is never
+        injected here (see parameter_registry: SDK/schema-known only).
+        """
         if not caps.supports_num_experts or not model.is_moe:
             return []
 
         # Default expert count from model
         default = model.num_experts or 8
 
-        # Common configurations
-        candidates = [default]
+        candidates = []
+        for value in (default, default // 2, default // 4):
+            if value >= 1 and value not in candidates:
+                candidates.append(value)
 
-        if default > 1:
-            # Try reduced expert counts
-            for div in [2, 4, 8]:
-                reduced = default // div
-                if reduced >= 1 and reduced not in candidates:
-                    candidates.append(reduced)
-
-        return sorted(candidates)
+        return sorted(candidates[:3])
 
     def _estimate_model_vram(self, model: ModelIdentity) -> float:
         """Estimate VRAM requirement for model."""

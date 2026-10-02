@@ -44,8 +44,8 @@ A `SearchSpace` is generated from:
 - **Context candidates**: `[2048, 4096, 8192, 12288, 16384, 24576, 32768, 65536, 131072]`  
   *Reason*: standard powers-of-two and common LLM context sizes. Filtered to `[min_context, max_context]` and always includes `model_max_context`. Not used for scoring, only as test points.
 
-- **Batch sizes**: `[64, 128, 256, 512, 1024]`  
-  *Reason*: powers of two covering typical `eval_batch_size` range. Used when `auto_batch=True`; otherwise user-defined range.
+- **Batch sizes**: `[64, 128, 256, 512, 1024, 2048]`
+  *Reason*: powers of two covering typical `eval_batch_size` range. Used when `auto_batch=True`; otherwise user-defined range. `2048` included since the stage-4 unification (see §2.5).
 
 - **GPU ratio steps**: `0.1` default, `0.05` for refinement  
   *Reason*: granularity for offload ratio sweep, hardware-relative (filtered to `[min_gpu_ratio, max_gpu_ratio]`).
@@ -102,6 +102,58 @@ Batch optimization (Stage 4) separately sweeps all batch sizes for the best conf
   - UI and reports label the run “Experimental”
 
 This prevents accidental inclusion of poorly validated RoPE configs in normal searches.
+
+### 2.5 Stage-4 Grid, MoE Minimal Gate, Experimental Tail, Manual Memory Duel
+
+**Stage-4 grid** (`lm_optimizer/services/search_space.py`, `speed_search.py`):
+
+- Eval batch default `[64, 128, 256, 512, 1024, 2048]`; S2 alternates probe
+  `64, 128, 256, 1024, 2048` around the anchor.
+- Physical batch default `[256, 512, 1024]` (server default 512); S2 alternates
+  `256, 1024`.
+- Context checkpoints default `[16, 32, 64]` (server default 32); S2 alternates
+  `16, 64`.
+- Parallels default `[1, 2, 4, 8]` filtered through workload gating:
+  `parallel=8` runs for `throughput` workload (or explicit override) only;
+  `interactive` stays `[1]`.
+- `build_speed_plan()` stays within `MAX_PLAN_PROBES = 25`.
+
+**MoE minimal gate**: expert probes run only when `model.is_moe` and the
+server supports `num_experts`; the derived set is
+`(default, default//2, default//4)`, deduped, anchor excluded — at most 3
+probes. `num_cpu_expert_layers_ratio` (n-cpu-moe) stays manual/experimental:
+no verified REST/CLI channel exists, so it is never injected.
+
+**Experimental tail** (opt-in, all default OFF):
+
+- CLI flags `--enable-rope` / `--enable-cpu-moe` / `--enable-speculative` on
+  `auto`/`optimize`, plus the interactive prompt
+  `"Testovat experimentalne RoPE / CPU-MoE / speculative? [nie]"`.
+- Any True flag sets `run.is_experimental = True` with a reason string; the
+  tail runs only after the FINAL winner, never inside the main sweep.
+- Draft discovery (`lm_optimizer/services/speculative.py`): extended hints
+  (`0.6b, 0.5b, 1b, tiny, draft`, ...), `RECOMMENDED_DRAFTS`
+  (e.g. `qwen -> [Qwen3-0.6B]`, names only), `find_local_draft()` returns
+  `None` when absent — never auto-downloads; `ab_compare` reports
+  `{"ran": false, "reason": "no local draft"}` in that case.
+
+**Manual memory duel** (`manual-memory-duel --model <id> --stage mmap|keep`):
+
+- `try_mmap` / `keep_model_in_memory` are MANUAL_ONLY (GUI/CLI-only); this
+  command never toggles anything. Flow: print auto best summary → pause
+  (`"Prepnite mmap OFF v LM Studio GUI (default ON), potom Enter"` or the
+  Keep equivalent) → re-measure the SAME `LoadConfiguration` → `verdict()`.
+- Auto-best sourcing is DB-primary: machine-readable numbers (gen tok/s,
+  TTFT, load config, context, style) come from the run DB
+  (`run_repo.get_by_model` newest-first); the best `.md`
+  (`results/<model>-best.md`) supplies model-identity match + canonical path
+  and its Typical medians are only a fallback. Filename or Model-ID mismatch
+  refuses with "no matching auto best" instead of comparing across models.
+- One lever per invocation; the output prints a hint to run the other
+  `--stage`. Verdict: keep requires `>= +5%` generation tok/s (TTFT is
+  tiebreak only); otherwise `"Nechaj OFF"` on win, `"Vrat spat na ON"` on
+  revert. Fail-closed unload guard before and after; non-interactive shells
+  refuse rather than re-measure blind.
 
 ---
 
@@ -397,7 +449,7 @@ Pareto does not use weights; it shows **trade-offs** independent of profile.
 | Constant | Location | Purpose | Justification |
 |----------|----------|---------|---------------|
 | `[2048,4096,…,131072]` | `search_space`, `discovery` | Benchmark test points for context | Standard LLM context sizes; filtered to model max, not used for scoring. |
-| `[64,128,256,512,1024]` | `search_space` | Eval batch candidates | Powers of two covering typical `eval_batch_size` range. |
+| `[64,128,256,512,1024,2048]` | `search_space` | Eval batch candidates | Powers of two covering typical `eval_batch_size` range (2048 since stage-4 unification, §2.5). |
 | `MEMORY_HEADROOM_THRESHOLD = 0.15` | `scoring/normalization` | Memory headroom for hardware-relative scoring | 15% free VRAM as “comfortable” — relative fraction, not fixed GB. |
 | `EPSILON = 1e-9` | `scoring/normalization` | Zero-range guard | Numerical epsilon, not hardware-specific. |
 | `seed = 42` | `benchmark` | Deterministic generation | Fixed seed for reproducibility, not a performance assumption. |
