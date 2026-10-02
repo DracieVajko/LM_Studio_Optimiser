@@ -50,14 +50,16 @@ Run against the live server (Python REPL or a scratch script, never a test):
 
 ## 4. Export-edit-apply cycle
 
-- [ ] `python -m lm_optimizer.cli.main ollama-export --model <tag> --param num_ctx=4096 -o /tmp/check.md`
+- [ ] `python -m lm_optimizer ollama-export --model <tag> --param num_ctx=4096 -o /tmp/check.md`
       prints exactly `FROM <tag>` + `PARAMETER num_ctx 4096` lines.
 - [ ] Edit `/tmp/check.md`: change `4096` → `8192`, add a bad line
       `PARAMETER num_ctx abc` on line 3. Run apply **expecting refusal**:
       `... ollama-apply --file /tmp/check.md --as <tag>:opt --yes`
       must fail with `Invalid Modelfile: line 3: ...` and create nothing
       (`ollama list` unchanged).
-- [ ] Fix the file (remove the bad line). Run apply for real; confirm the
+- [ ] Fix the file (remove the bad line). Run apply for real
+      (`python -m lm_optimizer ollama-apply --file /tmp/check.md --as <tag>:opt [--yes]`);
+      confirm the
       interactive prompt names the new tag, or use `--yes`. New tag
       `<tag>:opt` (default `<name>:opt`) appears in `ollama list`.
 - [ ] Re-run apply with the same `--as` tag: must refuse with
