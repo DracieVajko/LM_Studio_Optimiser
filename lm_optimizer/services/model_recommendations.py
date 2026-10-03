@@ -31,7 +31,7 @@ def manual_checklist(vram_gb: float) -> list[str]:
         "CPU threads -> maximum logical cores in LM Studio GUI (REST cannot set n_threads)",
         "mmap -> toggle OFF in LM Studio GUI (default ON), then re-measure one "
         "lever with `manual-memory-duel --model <id> --stage mmap` (keeps only on "
-        ">= +5% gen tok/s; Nechaj OFF on win, else Vrat spat na ON)",
+        ">= +5% gen tok/s; Keep OFF on win, else Revert to ON)",
         "Keep Model in Memory -> toggle OFF in LM Studio GUI, then re-measure one "
         "lever with `manual-memory-duel --model <id> --stage keep` (same keep/revert "
         "verdict; run each --stage in its own invocation)",

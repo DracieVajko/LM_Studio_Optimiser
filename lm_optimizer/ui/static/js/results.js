@@ -538,7 +538,7 @@ const ResultsPage = {
                                                         <div class="text-xs font-medium mt-1">Prompt</div>
                                                         <pre class="font-mono text-xs bg-gray-50 p-2 rounded overflow-auto max-h-40">${String(m.prompt || '(prompt not stored for this run)').slice(0, 4000)}</pre>
                                                         <div class="text-xs font-medium mt-1">Thinking</div>
-                                                        <pre class="font-mono text-xs bg-gray-50 p-2 rounded overflow-auto max-h-40">${String(m.thinking_text || 'n/a (starý beh alebo nereasoning model)').slice(0, 4000)}</pre>
+                                                        <pre class="font-mono text-xs bg-gray-50 p-2 rounded overflow-auto max-h-40">${String(m.thinking_text || 'n/a (old run or non-reasoning model)').slice(0, 4000)}</pre>
                                                         <div class="text-xs font-medium mt-1">Output</div>
                                                         <pre class="font-mono text-xs bg-gray-50 p-2 rounded overflow-auto max-h-40">${String(m.output_text || '—').slice(0, 2000)}</pre>
                                                         <button class="btn btn-outline btn-sm cfg-full-output-btn" data-cfg="${c.id}" data-test="${m.test_name}">Full output + quality</button>

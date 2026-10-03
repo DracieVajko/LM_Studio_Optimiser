@@ -311,7 +311,7 @@ def _optimize_advanced(
     }
 
 
-EXPERIMENTAL_PROMPT = "Testovat experimentalne RoPE / CPU-MoE / speculative? [nie]"
+EXPERIMENTAL_PROMPT = "Test experimental RoPE / CPU-MoE / speculative?"
 
 
 def _prompt_experimental_optins() -> dict:
@@ -319,10 +319,10 @@ def _prompt_experimental_optins() -> dict:
     from lm_optimizer.services.optimizer import parse_experimental_flags
 
     try:
-        answer = typer.prompt(EXPERIMENTAL_PROMPT, default="nie")
+        answer = typer.prompt(EXPERIMENTAL_PROMPT, default="no")
     except Exception:
         return parse_experimental_flags()
-    if str(answer).strip().lower() in ("ano", "a", "yes", "y", "true", "1"):
+    if str(answer).strip().lower() in ("yes", "y", "true", "1", "ano", "a"):
         return parse_experimental_flags(True, True, True)
     return parse_experimental_flags()
 

@@ -1,123 +1,124 @@
-# Benchmarky do detailu: čo sa testuje, ako a prečo
+# Benchmarks in detail: what is tested, how, and why
 
-> CURRENT: od Phase A/B stratégie beží najprv lacný speed probe (kap. 9)
-> a plný 5-testový suite až na finalistoch. Popis 5 testov nižšie platí
-> pre QUALITY fázu bez zmien. Aktuálna stratégia: `docs/OPTIMIZATION_STRATEGY.md`.
+> CURRENT: since the Phase A/B strategy, a cheap speed probe runs first (ch. 9)
+> and the full 5-test suite only on finalists. The 5-test description below
+> applies to the QUALITY phase unchanged. Current strategy:
+> `docs/OPTIMIZATION_STRATEGY.md`.
 
-Zdroj pravdy: `lm_optimizer/benchmark/suite.py`, `lm_optimizer/services/benchmark.py`,
+Source of truth: `lm_optimizer/benchmark/suite.py`, `lm_optimizer/services/benchmark.py`,
 `lm_optimizer/services/quality.py`, `lm_optimizer/services/optimizer.py`.
-Bez spustených modelov — len čítanie kódu.
+No running models — code reading only.
 
-## 1. Život jedného kandidáta (presný postup)
+## 1. Life of one candidate (exact procedure)
 
-Každá testovaná konfigurácia (`LoadConfiguration`: context, gpu_ratio, flash,
-KV on/off, eval/physical batch, parallel, checkpoints, MoE) prejde týmto:
+Every tested configuration (`LoadConfiguration`: context, gpu_ratio, flash,
+KV on/off, eval/physical batch, parallel, checkpoints, MoE) goes through this:
 
-| # | Krok | Čo sa deje | Nastavenia |
+| # | Step | What happens | Settings |
 |---|---|---|---|
-| 0 | Príprava hostiteľa | unload všetkého, snapshot VRAM/RAM/swap, overenie prázdneho servera | `prepare_host()` |
-| 1 | LOAD | načítanie modelu danou konfiguráciou (REST, alebo `lms load --gpu` pri `--gpu-via-cli`) | timeout až 600 s |
-| 2 | VERIFY | echo-load konfigurácia vs. aplikovaná (`MATCH/PARTIAL/MISMATCH/UNKNOWN`) | `echo_load_config=true` |
-| 3 | PREHEAT | 1× overovací + N× zahrievací chat (výsledky sa ZAHADZUJÚ) | prompt "Say hi in 5 words.", max 30 tok., temp 0.3; meria sa len `warmup_time_ms` |
-| 4 | MERANÉ BEHY | každý z 5 testov × `repetitions` (default 3) | teploty a max_tokens podľa testu (kap. 5) |
-| 5 | UNLOAD | vyloženie + overenie prázdneho servera | vždy vo `finally` |
-| 6 | AGREGÁCIA | z opakovaní medián; kvalita z najkompletnejšej vzorky | medián rýchlostí, stabilita = 1 − CV |
-| 7 | QUALITY GATE | 6 heuristických kontrol, priemer ≥ threshold profilu (speed 0.95 / balanced 0.97 / quality 0.99), inak `QUALITY_FAILED` bez skóre | `QualityConfig(minimum_score)` |
-| 8 | SKÓRE | vážený súčet normalizovaných zložiek × váhy profilu | 7 komponentov (kap. 4) |
+| 0 | Host preparation | unload everything, snapshot VRAM/RAM/swap, verify empty server | `prepare_host()` |
+| 1 | LOAD | load the model with the given configuration (REST, or `lms load --gpu` with `--gpu-via-cli`) | timeout up to 600 s |
+| 2 | VERIFY | echo-load configuration vs. applied (`MATCH/PARTIAL/MISMATCH/UNKNOWN`) | `echo_load_config=true` |
+| 3 | PREHEAT | 1× verification + N× warmup chats (results are DISCARDED) | prompt "Say hi in 5 words.", max 30 tok., temp 0.3; only `warmup_time_ms` is measured |
+| 4 | MEASURED RUNS | each of the 5 tests × `repetitions` (default 3) | temperatures and max_tokens per test (ch. 5) |
+| 5 | UNLOAD | unload + verify empty server | always in `finally` |
+| 6 | AGGREGATION | median across repetitions; quality from the most complete sample | median of speeds, stability = 1 − CV |
+| 7 | QUALITY GATE | 6 heuristic checks, average ≥ profile threshold (speed 0.95 / balanced 0.97 / quality 0.99), otherwise `QUALITY_FAILED` with no score | `QualityConfig(minimum_score)` |
+| 8 | SCORE | weighted sum of normalized components × profile weights | 7 components (ch. 4) |
 
-Pri zlyhaní loadu: stav `LOAD_FAILED`, `score=None`, `quality=None`, do histórie áno, do výberu víťaza nikdy.
+On load failure: status `LOAD_FAILED`, `score=None`, `quality=None`, kept in history, never eligible to win.
 
-## 2. Čo sa mení v ktorej fáze
+## 2. What changes in each phase
 
-| Fáza | Mení sa | Nemení sa |
+| Phase | Changes | Stays fixed |
 |---|---|---|
 | Coarse (≤20) | context, gpu_ratio, flash, KV, eval batch | physical/parallel/checkpoints |
-| Refinement | okolie víťazov + flash/KV interakcie | — |
-| Stage 4 | po jednom: eval batch, physical batch, parallel, checkpoints | ostatné |
-| Micro (≤6) | susedstvo podľa profilu | teplota NIKDY |
-| Validation (5×) | nič — ten istý config opakovane | všetko |
-| `ctx` sweep | len context (KV cesta zvlášť) | runtime |
+| Refinement | winner neighborhood + flash/KV interactions | — |
+| Stage 4 | one at a time: eval batch, physical batch, parallel, checkpoints | everything else |
+| Micro (≤6) | neighborhood per profile | temperature NEVER |
+| Validation (5×) | nothing — the same config repeatedly | everything |
+| `ctx` sweep | only context (KV path separately) | runtime |
 
-Teplota sa neladí nikdy: je fixná na test (0.0–0.3, creative výnimka 0.9) a
-precision probe (0.2 vs default) je len informatívny.
+Temperature is never tuned: it is fixed per test (0.0–0.3, creative exception 0.9) and
+the precision probe (0.2 vs default) is informational only.
 
-## 3. Čo sa počas testu sleduje (každý jeden beh)
+## 3. What is tracked during a test (every single run)
 
-Z `BenchmarkMetrics` + obálky výsledku:
+From `BenchmarkMetrics` + the result envelope:
 
-- `load_time_ms` — len samotný load (warmup ho nekontaminuje)
-- `warmup_time_ms` — zvlášť, do metrík nevstupuje
-- `prompt_tokens / completion_tokens / total_tokens` — zo servera (`usage`)
+- `load_time_ms` — the load alone (warmup does not contaminate it)
+- `warmup_time_ms` — separate, does not enter the metrics
+- `prompt_tokens / completion_tokens / total_tokens` — from the server (`usage`)
 - `prompt_tok_s` — prompt_tokens / prompt_processing_ms
-- `generation_tok_s` — zo servera (`tokens_per_second`), inak completion/generation_ms
-- `estimated_ttft_ms` — reálny `time_to_first_token_seconds` zo servera, inak heuristika 10 % celkového času (preto "estimated")
-- `prompt_processing_ms / generation_ms` — rozdelenie celkového času
-- `peak_vram_gb / peak_ram_gb` — nvidia-smi + psutil pred/po (total − min free); `None` = nemerateľné, nikdy odhad
-- `output_text` — plný text odpovede (v DB skrátený), `error`, `success`
-- Eventy: `LOAD_REQUESTED/SUCCEEDED/FAILED`, `PREHEAT_STARTED` (+ms), `BENCHMARK_*`, `QUALITY_*`, `CONFIG_ELIGIBLE/REJECTED`
-- Verifikácia: kanál (`REST`/`CLI`), `requested vs applied`, `MATCH/...`
+- `generation_tok_s` — from the server (`tokens_per_second`), otherwise completion/generation_ms
+- `estimated_ttft_ms` — real `time_to_first_token_seconds` from the server, otherwise the 10%-of-total-time heuristic (hence "estimated")
+- `prompt_processing_ms / generation_ms` — split of total time
+- `peak_vram_gb / peak_ram_gb` — nvidia-smi + psutil before/after (total − min free); `None` = unmeasurable, never estimated
+- `output_text` — full answer text (truncated in DB), `error`, `success`
+- Events: `LOAD_REQUESTED/SUCCEEDED/FAILED`, `PREHEAT_STARTED` (+ms), `BENCHMARK_*`, `QUALITY_*`, `CONFIG_ELIGIBLE/REJECTED`
+- Verification: channel (`REST`/`CLI`), `requested vs applied`, `MATCH/...`
 
-## 4. Speed testy — mechanika (`_run_single_case`)
+## 4. Speed tests — mechanics (`_run_single_case`)
 
-1. Stopky `perf_counter()` → `POST /api/v1/chat` (prompt testu, jeho teplota, jeho `max_tokens`, `reasoning="off"`).
-2. Prázdny výstup + reasoning off → **presne jeden** retry s `reasoning="on"` (niektoré modely bez myslenia neodpovedajú); stále prázdne → `success=False, "Empty output"` (nekazí štatistiku absurdnými tok/s).
-3. Čas sa delí: ak server dal `tokens_per_second`, `generation_ms = completion / tok_s`, zvyšok je prompt; inak pomerné delenie podľa tokenov.
-4. TTFT: reálne číslo zo servera, inak 10 % času (označené estimated).
-5. Agregácia: **medián** cez opakovania (odolný voči výkyvom); stabilita = `1 − stdev/mean` rýchlostí; text pre kvalitu = **najkompletnejšia** vzorka (nie medián — jeden useknutý beh nesmie zabiť dobrý config).
+1. `perf_counter()` stopwatch → `POST /api/v1/chat` (test prompt, its temperature, its `max_tokens`, `reasoning="off"`).
+2. Empty output + reasoning off → **exactly one** retry with `reasoning="on"` (some models do not answer without thinking); still empty → `success=False, "Empty output"` (does not corrupt statistics with absurd tok/s).
+3. Time is split: if the server gave `tokens_per_second`, `generation_ms = completion / tok_s`, the rest is prompt; otherwise proportional split by tokens.
+4. TTFT: real number from the server, otherwise 10% of time (marked estimated).
+5. Aggregation: **median** across repetitions (outlier-robust); stability = `1 − stdev/mean` of speeds; text for quality = the **most complete** sample (not median — one truncated run must not kill a good config).
 
-## 5. Accuracy testy — mechanika (`QualityEvaluator`)
+## 5. Accuracy tests — mechanics (`QualityEvaluator`)
 
-Šesť dimenzií 0.0–1.0, `overall` = priemer; **check = dimenzia ≥ 0.9**
-(`28/30` = 28 prejdených kontrol z 30). Agregát = priemer cez testy,
-`súčet passed / súčet total`. Evaluátor je deterministický (žiadny random);
-variabilita medzi behmi je sampling modelu, nie chyba merania.
+Six dimensions 0.0–1.0, `overall` = average; **check = dimension ≥ 0.9**
+(`28/30` = 28 passed checks out of 30). Aggregate = average across tests,
+`sum of passed / sum of total`. The evaluator is deterministic (no randomness);
+run-to-run variability is model sampling, not measurement error.
 
-**`structured_output` (format):** strihne ``` fence; neplatný JSON → okamžite
-`overall=0.0`. Inak: povinné kľúče `name/age/skills/address` (chýbajúci −0.25
-každý), typy (`age` int, `skills` list, `address` dict, inak 0.5), koniec na
-`}` (inak 0.5).
+**`structured_output` (format):** strips ``` fences; invalid JSON → immediately
+`overall=0.0`. Otherwise: required keys `name/age/skills/address` (missing −0.25
+each), types (`age` int, `skills` list, `address` dict, else 0.5), ends with
+`}` (else 0.5).
 
-**`coding_task` (coding):** strihne fence; `def find_duplicates` v kóde
-(0/1); zmienka `O(n)/O(1)/linear/constant` (1.0/0.7); žiadne `class /`
-`if __name__` (1.0/0.7); riadny koniec (1.0/0.5); `coding_correctness` =
+**`coding_task` (coding):** strips fences; `def find_duplicates` in code
+(0/1); mention of `O(n)/O(1)/linear/constant` (1.0/0.7); no `class /`
+`if __name__` (1.0/0.7); proper ending (1.0/0.5); `coding_correctness` =
 `task_completion`.
 
-**Všeobecné (`instruction/reasoning/context`):** dĺžka vs `min_tokens`
-(pomer, max 1.0); reasoning: musí obsahovať niečo z
-`difference/pattern/add/sequence/72` (inak 0.5); context: kľúčové slová
-`solar/wind/hydro/geothermal/biomass`, skóre `min(1.0, found/5*1.5)`;
-instruction factual vždy 1.0. Riadny koniec: posledný znak po ostrihaní
-markdownu v `. ! ? ) " ' ] }` (inak 0.5). **Repetícia:** 2–4-gramy slov
-(bez `*` `` ` `` `# _ ~ > |`); ak unikátnych < 70 % → `no_malformed = 0.0`.
+**General (`instruction/reasoning/context`):** length vs `min_tokens`
+(ratio, max 1.0); reasoning: must contain something from
+`difference/pattern/add/sequence/72` (else 0.5); context: keywords
+`solar/wind/hydro/geothermal/biomass`, score `min(1.0, found/5*1.5)`;
+instruction factual always 1.0. Proper ending: last character after
+stripping markdown in `. ! ? ) " ' ] }` (else 0.5). **Repetition:** word
+2–4-grams (without `*` `` ` `` `# _ ~ > |`); if unique < 70% → `no_malformed = 0.0`.
 
-## 6. Presné prompty a nastavenia (doslovne zo `suite.py`)
+## 6. Exact prompts and settings (verbatim from `suite.py`)
 
-Styly menia len teploty: precise `{coding: 0.1, reasoning: 0.1}`,
-creative `{context: 0.9}`, balanced bezo zmeny. `max_tokens` sa škáluje
-`--max-tokens-scale` (min 32) a stropuje `context_length // 4`.
-Poctivo: `seed = 42` je len zaznamenaný v `benchmark_params`, REST ho
-odmieta, takže sa neposiela — determinizmus stojí na fixných nízkych
-teplotách. Rovnako `stop_sequences` sú definované v suite, ale server
-`stop` odmieta, preto sa neposielajú a fence sa strihá v evaluátore.
+Styles change only temperatures: precise `{coding: 0.1, reasoning: 0.1}`,
+creative `{context: 0.9}`, balanced unchanged. `max_tokens` scales with
+`--max-tokens-scale` (min 32) and is capped at `context_length // 4`.
+Honestly: `seed = 42` is only recorded in `benchmark_params`, REST rejects
+it, so it is never sent — determinism rests on fixed low temperatures.
+Likewise `stop_sequences` are defined in the suite, but the server rejects
+`stop`, so they are never sent and fences are stripped in the evaluator.
 
 **T1 `short_instruction` [instruction]** — temp 0.3, max 256:
 > Write a concise explanation of how a hash table works in 3-4 sentences.
-Účel: základná inštrukcia + plynulosť; lacný (krátky).
+Purpose: basic instruction + fluency; cheap (short).
 
 **T2 `medium_reasoning` [reasoning]** — temp 0.3, max 768:
 > You are given a sequence: 2, 6, 12, 20, 30, 42, 56. What is the next number
 > in the sequence? Explain your reasoning step by step.
-Účel: reťazec úvah + správna odpoveď (72); kľúčové slová vyššie.
+Purpose: reasoning chain + correct answer (72); keywords above.
 
 **T3 `long_context` [context]** — temp 0.3, max 1024:
 > Below is a document about renewable energy. Please read it carefully and
-> answer the question at the end. DOCUMENT: [~350-slovný dokument o solárnej,
-> veternej, vodnej, geotermálnej energii a biomase + úložiská, sieť, politiky,
-> náklady, trendy] QUESTION: Summarize the main renewable energy sources,
+> answer the question at the end. DOCUMENT: [~350-word document on solar,
+> wind, hydro, geothermal energy and biomass + storage, grid, policies,
+> costs, trends] QUESTION: Summarize the main renewable energy sources,
 > their key advantages, primary challenges, and two future trends mentioned
 > in the document.
-Účel: porozumenie dlhému vstupu + pokrytie kľúčových slov; najdrahší test
-(1024 tokenov) — pri 1 tok/s modeloch ~17 min/opakovanie.
+Purpose: long-input understanding + keyword coverage; most expensive test
+(1024 tokens) — ~17 min/repetition on 1 tok/s models.
 
 **T4 `coding_task` [coding]** — temp 0.1, max 768, stop `["```", "def ", "class "]`:
 > Write a Python function `find_duplicates(nums: list[int]) -> list[int]`
@@ -127,49 +128,49 @@ teplotách. Rovnako `stop_sequences` sú definované v suite, ale server
 > 3. Handle negative numbers
 > 4. Return duplicates in ascending order
 > Provide only the function definition with docstring.
-Účel: kódová korektnosť; nízka teplota = determinizmus. (Server `stop`
-odmieta, preto sa fence strihá v evaluátore.)
+Purpose: code correctness; low temperature = determinism. (The server
+rejects `stop`, so fences are stripped in the evaluator.)
 
 **T5 `structured_output` [format]** — temp 0.0, max 256, stop `["}"]`:
 > Output a JSON object with the following structure exactly:
 > { "name": "string", "age": integer, "skills": ["string", "string", "string"],
 >   "address": { "city": "string", "country": "string" } }
 > Use realistic data for a software engineer. No extra text, just the JSON.
-Účel: striktný formát; teplota 0.0 = maximálna determinovanosť.
+Purpose: strict format; temperature 0.0 = maximum determinism.
 
-**Precision probe** (len `auto --precision`): T4+T2+`structured_output` pri
-suite teplote vs 0.2, jeden load — informatívne, do skóre nevstupuje.
+**Precision probe** (`auto --precision` only): T4+T2+`structured_output` at
+suite temperature vs 0.2, one load — informational, does not enter the score.
 
-## 7. Ostatné behy (nastavenia)
+## 7. Other runs (settings)
 
 - **smoke_test**: load + 1 chat ("Say hi in 5 words.", 30 tok., 0.3) + unload.
-- **measure_throughput**: 1 load + N súbežných 32-tokenových chatov
-  (`asyncio.gather`); agregát = tokeny / wall-clock.
-- **matrix.run_one**: 1 load + 1×30-token chat (bunka ctx×flash×KV).
-- **fit ladder / ctx sweep**: smoke na bod + `ctx` bisect refinement (krok
-  500/1000, max 8 sond).
-- **speculative.ab_compare**: opt-in, draft vs baseline na víťaznej konfigurácii.
+- **measure_throughput**: 1 load + N concurrent 32-token chats
+  (`asyncio.gather`); aggregate = tokens / wall-clock.
+- **matrix.run_one**: 1 load + 1×30-token chat (ctx×flash×KV cell).
+- **fit ladder / ctx sweep**: smoke per point + `ctx` bisect refinement (step
+  500/1000, max 8 probes).
+- **speculative.ab_compare**: opt-in, draft vs baseline on the winning configuration.
 
-## 8. Cenový model a páky pre pomalé modely
+## 8. Cost model and levers for slow models
 
-Cena kandidáta ≈ load + preheat + `repetitions` × Σ(max_tokens) / tok_s.
-Pri 1 tok/s: T3 sám ~17 min × 3 opakovania ≈ 1 h/kandidát.
-Páky: `--repetitions 1 --validation 1` (3–5× dole),
-`--max-tokens-scale 0.5|0.25` (s rizikom truncation-failov, varovanie sa
-vypíše), užší `--min/max-context`, `--dry-run` ukáže počet kandidátov vopred.
-Report (`-best.md`) obsahuje každú tabuľku vyššie + per-test riadky s teplotou,
-tokenmi, rýchlosťami a kvalitou.
+Candidate cost ≈ load + preheat + `repetitions` × Σ(max_tokens) / tok_s.
+At 1 tok/s: T3 alone ~17 min × 3 repetitions ≈ 1 h/candidate.
+Levers: `--repetitions 1 --validation 1` (3–5× down),
+`--max-tokens-scale 0.5|0.25` (with truncation-failure risk, warning is
+printed), narrower `--min/max-context`, `--dry-run` shows the candidate count upfront.
+The report (`-best.md`) contains every table above + per-test rows with temperature,
+tokens, speeds, and quality.
 
-## 9. Speed probe (Phase A) — proti čomu sa 5-testový suite nebeží
+## 9. Speed probe (Phase A) — what the 5-test suite does NOT run against
 
-- Jeden prompt: "Explain in one or two short sentences what a hash table is.",
-  max 64 tokenov, teplota 0.1, reasoning off, minimálny preheat.
-- Žiadna quality evaluácia. Výsledok nesie `generation.phase = "SPEED"`,
-  skóre ostáva None až po prejdenú kvalitu.
-- Opakovania podľa budget triedy z prvého (S0) merania: FAST 3, NORMAL 2,
-  SLOW 1, VERY_SLOW 1. Pomalé modely sa nikdy neodmietajú.
-- Kontext: `speed_context` (user cap alebo 2048) pre všetky sondy;
-  `quality_context` (user cap alebo min(limit, 8192)) pre finalistov.
-  Kontext do Phase-A skóre nevstupuje (váha 0, renormalizácia zvyšku).
-- Throughput sondy (parallel) merajú agregát do separátneho bloku
-  `generation.throughput`; primárna metrika ostáva single-stream tok/s.
+- One prompt: "Explain in one or two short sentences what a hash table is.",
+  max 64 tokens, temperature 0.1, reasoning off, minimal preheat.
+- No quality evaluation. The result carries `generation.phase = "SPEED"`,
+  score stays None until quality passes.
+- Repetitions by budget class from the first (S0) measurement: FAST 3, NORMAL 2,
+  SLOW 1, VERY_SLOW 1. Slow models are never rejected.
+- Context: `speed_context` (user cap or 2048) for all probes;
+  `quality_context` (user cap or min(limit, 8192)) for finalists.
+  Context does not enter the Phase-A score (weight 0, rest renormalized).
+- Throughput probes (parallel) measure the aggregate into a separate
+  `generation.throughput` block; the primary metric stays single-stream tok/s.

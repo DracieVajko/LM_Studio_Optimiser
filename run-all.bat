@@ -1,39 +1,39 @@
 @echo off
 REM =====================================================================
-REM  LM Studio Optimizer - OPTIMALIZUJ UPLNE VSETKO (cez noc)
-REM  Malé modely: plný tuning. Veľké modely (>=5GB): fit-stropy.
-REM  Výsledky: results\*.md   Logy: logs\
+REM  LM Studio Optimizer - OPTIMIZE EVERYTHING (overnight)
+REM  Small models: full tuning. Large models (>=5GB): fit ceilings.
+REM  Results: results\*.md   Logs: logs\
 REM =====================================================================
 cd /d "%~dp0"
 
-echo [1/4] Kontrola LM Studio (127.0.0.1:1234)...
-python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:1234/api/v1/models', timeout=10); print('LM Studio bezi')" 2>nul
+echo [1/4] Checking LM Studio (127.0.0.1:1234)...
+python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:1234/api/v1/models', timeout=10); print('LM Studio is running')" 2>nul
 if errorlevel 1 (
-    echo CHYBA: LM Studio nebezi alebo nema zapnuty Developer server.
-    echo        Zapni LM Studio - Settings - Developer - Start server.
+    echo ERROR: LM Studio is not running or Developer server is off.
+    echo        Open LM Studio - Settings - Developer - Start server.
     pause
     exit /b 1
 )
 
-echo [2/4] Rýchle testy...
+echo [2/4] Quick tests...
 python -m pytest -q
 if errorlevel 1 (
-    echo CHYBA: testy nepresli, koncim.
+    echo ERROR: tests failed, aborting.
     pause
     exit /b 1
 )
 
-echo [3/4] AUTO pipeline - male modely do 6GB, plny tuning...
+echo [3/4] AUTO pipeline - small models up to 6GB, full tuning...
 python -m lm_optimizer auto --max-size-gb 6 --max-context 8192
 if errorlevel 1 (
-    echo VAROVANIE: auto skoncilo s chybou, pokracujem na fit...
+    echo WARNING: auto finished with an error, continuing to fit...
 )
 
-echo [4/4] FIT ladder - velke modely, max kontext stropy...
+echo [4/4] FIT ladder - large models, max context ceilings...
 python -m lm_optimizer fit
 
 echo.
-echo HOTOVO. Pozri vysledky:
-echo   - per-model reporty: results\*-best.md a results\*-fit.md
-echo   - suhrny: results\auto-summary-*.md
+echo DONE. See results:
+echo   - per-model reports: results\*-best.md and results\*-fit.md
+echo   - summaries: results\auto-summary-*.md
 pause

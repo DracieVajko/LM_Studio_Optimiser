@@ -128,7 +128,7 @@ no verified REST/CLI channel exists, so it is never injected.
 
 - CLI flags `--enable-rope` / `--enable-cpu-moe` / `--enable-speculative` on
   `auto`/`optimize`, plus the interactive prompt
-  `"Testovat experimentalne RoPE / CPU-MoE / speculative? [nie]"`.
+  `"Test experimental RoPE / CPU-MoE / speculative?"`.
 - Any True flag sets `run.is_experimental = True` with a reason string; the
   tail runs only after the FINAL winner, never inside the main sweep.
 - Draft discovery (`lm_optimizer/services/speculative.py`): extended hints
@@ -141,7 +141,7 @@ no verified REST/CLI channel exists, so it is never injected.
 
 - `try_mmap` / `keep_model_in_memory` are MANUAL_ONLY (GUI/CLI-only); this
   command never toggles anything. Flow: print auto best summary → pause
-  (`"Prepnite mmap OFF v LM Studio GUI (default ON), potom Enter"` or the
+  (`"Switch mmap OFF in LM Studio GUI (default ON), then press Enter"` or the
   Keep equivalent) → re-measure the SAME `LoadConfiguration` → `verdict()`.
 - Auto-best sourcing is DB-primary: machine-readable numbers (gen tok/s,
   TTFT, load config, context, style) come from the run DB
@@ -151,7 +151,7 @@ no verified REST/CLI channel exists, so it is never injected.
   refuses with "no matching auto best" instead of comparing across models.
 - One lever per invocation; the output prints a hint to run the other
   `--stage`. Verdict: keep requires `>= +5%` generation tok/s (TTFT is
-  tiebreak only); otherwise `"Nechaj OFF"` on win, `"Vrat spat na ON"` on
+  tiebreak only); otherwise `"Keep OFF"` on win, `"Revert to ON"` on
   revert. Fail-closed unload guard before and after; non-interactive shells
   refuse rather than re-measure blind.
 

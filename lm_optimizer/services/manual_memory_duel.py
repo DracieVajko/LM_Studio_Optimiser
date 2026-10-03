@@ -25,11 +25,11 @@ logger = get_logger(__name__)
 
 KEEP_THRESHOLD = 0.05
 
-MMAP_PROMPT = "Prepnite mmap OFF v LM Studio GUI (default ON), potom Enter"
-KEEP_PROMPT = "Vypnite Keep Model in Memory v LM Studio GUI, potom Enter"
+MMAP_PROMPT = "Switch mmap OFF in LM Studio GUI (default ON), then press Enter"
+KEEP_PROMPT = "Turn OFF Keep Model in Memory in LM Studio GUI, then press Enter"
 
-GUIDANCE_KEEP = "Nechaj OFF"
-GUIDANCE_REVERT = "Vrat spat na ON"
+GUIDANCE_KEEP = "Keep OFF"
+GUIDANCE_REVERT = "Revert to ON"
 
 _MODEL_ID_RE = re.compile(r"^- Model ID:\s*(.+?)\s*$", re.MULTILINE)
 _TYPICAL_GEN_RE = re.compile(r"Typical generation:\s*([\d.]+)\s*tok/s\s*\(median\)")
