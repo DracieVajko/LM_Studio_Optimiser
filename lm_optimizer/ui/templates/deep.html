@@ -3,9 +3,8 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Optimization Results - LM Studio Auto Optimizer</title>
+    <title>Deep Benchmark - LM Studio Auto Optimizer</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="/static/css/app.css">
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%232563eb' stroke-width='2'%3E%3Cpath stroke-linecap='round' stroke-linejoin='round' d='M13 10V3L4 14h7v7l9-11h-7z'/%3E%3C/svg%3E">
@@ -28,7 +27,7 @@
                             <a href="/" class="nav-link text-gray-600 hover:text-blue-600 font-medium">Dashboard</a>
                             <a href="/history" class="nav-link text-gray-600 hover:text-blue-600 font-medium">History</a>
                             <a href="/sandbox" class="nav-link text-gray-600 hover:text-blue-600 font-medium">Sandbox</a>
-                            <a href="/deep" class="nav-link text-gray-600 hover:text-blue-600 font-medium">Deep</a>
+                            <a href="/deep" class="nav-link text-blue-600 font-medium">Deep</a>
                             <a href="/settings" class="nav-link text-gray-600 hover:text-blue-600 font-medium">Settings</a>
                         </div>
                     </div>
@@ -53,7 +52,7 @@
         var stillLoading = main && main.querySelector('.spinner');
         if (stillLoading) {
             main.innerHTML = '<div class="card"><div class="card-body text-center py-12">'
-                + '<h3 class="text-lg font-medium text-gray-900">Results failed to start.</h3>'
+                + '<h3 class="text-lg font-medium text-gray-900">Deep leaderboard failed to start.</h3>'
                 + '<p class="text-sm text-gray-500 mt-1">JavaScript error: '
                 + String((e && e.message) || 'script error').slice(0, 300) + '</p>'
                 + '<div class="mt-4 flex justify-center gap-2">'
@@ -67,7 +66,7 @@
         var stillLoading = main && main.querySelector('.spinner');
         if (stillLoading) {
             main.innerHTML = '<div class="card"><div class="card-body text-center py-12">'
-                + '<h3 class="text-lg font-medium text-gray-900">Result is taking too long.</h3>'
+                + '<h3 class="text-lg font-medium text-gray-900">Deep leaderboard is taking too long.</h3>'
                 + '<p class="text-sm text-gray-500 mt-1">No data arrived within 25 seconds.</p>'
                 + '<div class="mt-4 flex justify-center gap-2">'
                 + '<button class="btn btn-outline" onclick="window.location.reload()">Retry</button>'
@@ -76,6 +75,6 @@
         }
     }, 25000);
     </script>
-    <script type="module" src="/static/js/results.js?v=6"></script>
+    <script type="module" src="/static/js/deep.js?v=6"></script>
 </body>
 </html>

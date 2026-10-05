@@ -1459,3 +1459,350 @@ async def _run_sandbox_task(job_id: str, request: SandboxRequest) -> None:
 import structlog
 
 logger = structlog.get_logger(__name__)
+
+
+# ============================================================
+# Deep benchmark (leaderboard + preview)
+# ============================================================
+
+# Preview pagination: outputs over this many chars are split into pages
+# (server flags, browser paginates); full text stays in the exported .md.
+DEEP_PREVIEW_PAGE_CHARS = 50000
+
+
+def _deep_dir():
+    """Deep report dir under the configured results dir (call-time lookup)."""
+    from pathlib import Path
+
+    from lm_optimizer.config import config as _cfg
+
+    return Path(_cfg.storage.results_dir) / "deep"
+
+
+def _deep_id_ok(run_id: str) -> bool:
+    """Batch ids are filename stamps: no slashes, no traversal."""
+    import re
+
+    return bool(re.fullmatch(r"[A-Za-z0-9_-]{1,64}", run_id or ""))
+
+
+def _strip_fenced_blocks(text: str) -> str:
+    """Remove ```...``` spans so verbatim outputs can't fake table rows."""
+    out = []
+    in_fence = False
+    for line in text.splitlines():
+        if line.strip() == "```":
+            in_fence = not in_fence
+            continue
+        if not in_fence:
+            out.append(line)
+    return "\n".join(out)
+
+
+def _pipe_rows(text: str) -> list[list[str]]:
+    """All markdown table rows (fenced code excluded)."""
+    rows = []
+    for line in _strip_fenced_blocks(text).splitlines():
+        s = line.strip()
+        if s.startswith("|") and s.endswith("|"):
+            rows.append([c.strip() for c in s[1:-1].split("|")])
+    return rows
+
+
+def _table_after_header(text: str, first_cell: str) -> list[list[str]]:
+    """Data rows under the table whose first header cell matches (case-insensitive)."""
+    rows = _pipe_rows(text)
+    for i, cells in enumerate(rows):
+        if cells and cells[0].lower() == first_cell.lower():
+            data = []
+            for row in rows[i + 1:]:
+                if len(row) != len(cells):
+                    break
+                if all(set(c) <= set("-: ") and c.strip("-: ") == "" for c in row):
+                    continue  # separator row
+                if not any(row):
+                    break
+                data.append(row)
+            return data
+    return []
+
+
+def _fnum(cell: str):
+    try:
+        return float(cell)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_deep_task_table(text: str) -> list[dict]:
+    """Per-task rows from a per-model deep report (Score/Recall N/A -> None)."""
+    tasks = []
+    for row in _table_after_header(text, "task"):
+        if len(row) < 8:
+            continue
+        try:
+            thinking = int(float(row[5]))
+        except (TypeError, ValueError):
+            thinking = 0
+        tasks.append({
+            "name": row[0],
+            "status": row[1],
+            "recall_accuracy": _fnum(row[2]),
+            "gen_tok_s": _fnum(row[3]) or 0.0,
+            "elapsed_s": _fnum(row[4]) or 0.0,
+            "thinking_chars": thinking,
+            "score": _fnum(row[6]),
+            "error": row[7],
+        })
+    return tasks
+
+
+def _parse_deep_outputs(text: str) -> dict[str, dict[str, str]]:
+    """Per-task Prompt/Thinking/Output sections from a deep report.
+
+    Only the 'Full outputs' appendix is scanned; headings inside fenced
+    blocks are ignored so model text can never fake a section boundary.
+    """
+    idx = text.find("## Full outputs")
+    body = text[idx:] if idx >= 0 else text
+    tasks: dict[str, dict[str, str]] = {}
+    current: str | None = None
+    mode: str | None = None
+    in_fence = False
+    buf: list[str] = []
+
+    def _flush():
+        if current is not None and mode in ("prompt", "thinking", "output"):
+            tasks[current][mode] = "\n".join(buf).strip("\n")
+        buf.clear()
+
+    for line in body.splitlines():
+        s = line.strip()
+        if not in_fence and line.startswith("### ") and len(line) > 4:
+            _flush()
+            current = line[4:].strip()
+            tasks[current] = {"prompt": "", "thinking": "", "output": ""}
+            mode = None
+            continue
+        if not in_fence and current is not None and s in ("Prompt:", "Thinking:", "Output:"):
+            _flush()
+            mode = s[:-1].lower()
+            continue
+        if s == "```":
+            if in_fence:
+                _flush()
+                mode = None
+            in_fence = not in_fence
+            continue
+        if in_fence and current is not None and mode is not None:
+            buf.append(line)
+    _flush()
+    return tasks
+
+
+def _preview_entry(name: str, prompt: str, thinking: str, output: str) -> dict:
+    """One task preview with prompt/output/thinking tabs + 50k pagination flag."""
+    chars = len(output or "")
+    paginated = chars > DEEP_PREVIEW_PAGE_CHARS
+    return {
+        "name": name,
+        "prompt": prompt or "",
+        "thinking": thinking or "",
+        "output": output or "",
+        "chars": chars,
+        "paginated": paginated,
+        "note": (
+            f"Output exceeds {DEEP_PREVIEW_PAGE_CHARS} chars; preview paginates "
+            "into pages (full log in exported .md)."
+            if paginated else None
+        ),
+    }
+
+
+def _deep_batch_stamps() -> list[str]:
+    """Completed batch stamps on disk, newest first (never raises)."""
+    try:
+        files = sorted(_deep_dir().glob("deep-batch-*.md"),
+                       key=lambda p: p.name, reverse=True)
+    except OSError:
+        return []
+    return [p.name[len("deep-batch-"): -len(".md")] for p in files]
+
+
+def _deep_batch_info(stamp: str) -> dict | None:
+    """Summary counts for one batch stamp; None when unreadable."""
+    path = _deep_dir() / f"deep-batch-{stamp}.md"
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    rows = _table_after_header(text, "model")
+    completed = sum(1 for r in rows if len(r) > 1 and r[1] == "completed")
+    failed = sum(1 for r in rows if len(r) > 1 and r[1] == "failed")
+    skipped = sum(1 for r in rows if len(r) > 1 and r[1] not in ("completed", "failed"))
+    try:
+        from datetime import datetime
+
+        created = datetime.fromtimestamp(path.stat().st_mtime).isoformat()
+    except OSError:
+        created = ""
+    return {
+        "id": stamp,
+        "models": len(rows),
+        "completed": completed,
+        "failed": failed,
+        "skipped": skipped,
+        "created_at": created,
+        "summary_file": path.name,
+    }
+
+
+def _deep_model_detail(stamp: str, model: str, status: str,
+                       reason: str, report: str) -> dict:
+    """Leaderboard aggregates + tabbed preview for one model (never raises)."""
+    tasks: list[dict] = []
+    preview: list[dict] = []
+    if report and report != "-":
+        try:
+            text = (_deep_dir() / report).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            text = ""
+        if text:
+            tasks = _parse_deep_task_table(text)
+            outputs = _parse_deep_outputs(text)
+            for t in tasks:
+                parts = outputs.get(t["name"], {})
+                preview.append(_preview_entry(
+                    t["name"], parts.get("prompt", ""),
+                    parts.get("thinking", ""), parts.get("output", "")))
+    scores = [t["score"] for t in tasks if t["score"] is not None]
+    score = (sum(scores) / len(scores)) if scores else None
+    gens = [t["gen_tok_s"] for t in tasks
+            if t["status"] == "ok" and (t["gen_tok_s"] or 0) > 0]
+    return {
+        "model": model,
+        "status": status,
+        "reason": reason,
+        "report": report,
+        "score": score,
+        "quality": score,  # deep suite has no separate quality reference;
+        # recall_accuracy is the mechanically checked score
+        "gen_tok_s": (sum(gens) / len(gens)) if gens else 0.0,
+        "thinking_chars": sum(t["thinking_chars"] for t in tasks),
+        "elapsed_s": round(sum(t["elapsed_s"] for t in tasks), 3),
+        "tasks_ok": sum(1 for t in tasks if t["status"] == "ok"),
+        "tasks_total": len(tasks),
+        "tasks": tasks,
+        "preview": preview,
+    }
+
+
+def _sort_deep_leaderboard(rows: list[dict]) -> list[dict]:
+    """Deterministic order: score desc, gen tok/s desc, elapsed asc, model asc.
+
+    The deep suite records elapsed per task (not TTFT); elapsed stands in as
+    the time tiebreak. The trailing model-id key keeps full ties stable
+    instead of random.
+    """
+    def _key(r: dict):
+        s = r.get("score")
+        return (
+            s is None,
+            -(s if s is not None else 0.0),
+            -float(r.get("gen_tok_s") or 0.0),
+            float(r.get("elapsed_s") or 0.0),
+            str(r.get("model") or ""),
+        )
+
+    return sorted(rows, key=_key)
+
+
+def _deep_batch_detail(stamp: str) -> dict | None:
+    """Full batch detail: sorted leaderboard + per-model preview. None if missing."""
+    path = _deep_dir() / f"deep-batch-{stamp}.md"
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    entries = []
+    for row in _table_after_header(text, "model"):
+        if len(row) < 4:
+            continue
+        entries.append(_deep_model_detail(stamp, row[0], row[1], row[2], row[3]))
+    ranked = _sort_deep_leaderboard(entries)
+    leaderboard = []
+    for i, e in enumerate(ranked, 1):
+        leaderboard.append({
+            "rank": i,
+            "model": e["model"],
+            "status": e["status"],
+            "score": e["score"],
+            "quality": e["quality"],
+            "gen_tok_s": round(e["gen_tok_s"], 1),
+            "thinking_chars": e["thinking_chars"],
+            "elapsed_s": e["elapsed_s"],
+            "tasks_ok": e["tasks_ok"],
+            "tasks_total": e["tasks_total"],
+            "verdict": ("winner" if i == 1 and e["status"] == "completed"
+                        else e["status"]),
+        })
+    return {
+        "id": stamp,
+        "leaderboard": leaderboard,
+        "models": {e["model"]: {k: e[k] for k in (
+            "status", "reason", "report", "score", "quality", "gen_tok_s",
+            "thinking_chars", "elapsed_s", "tasks_ok", "tasks_total",
+            "tasks", "preview")} for e in entries},
+        "export_url": f"/api/deep/runs/{stamp}/export",
+    }
+
+
+@router.get("/deep/runs")
+async def list_deep_runs():
+    """Completed deep batches on disk (unreadable summaries skipped)."""
+    runs = []
+    for stamp in _deep_batch_stamps():
+        info = _deep_batch_info(stamp)
+        if info is not None:
+            runs.append(info)
+    return {"runs": runs}
+
+
+@router.get("/deep/runs/{run_id}")
+async def get_deep_run(run_id: str):
+    """One batch: deterministic leaderboard + per-model prompt/output/thinking preview."""
+    if not _deep_id_ok(run_id):
+        raise HTTPException(status_code=404, detail="Deep batch not found")
+    detail = _deep_batch_detail(run_id)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="Deep batch not found")
+    return detail
+
+
+@router.get("/deep/runs/{run_id}/export")
+async def export_deep_run(run_id: str):
+    """Combined .md export: batch summary followed by every per-model report."""
+    from fastapi.responses import Response
+
+    if not _deep_id_ok(run_id):
+        raise HTTPException(status_code=404, detail="Deep batch not found")
+    deep_dir = _deep_dir()
+    try:
+        summary = (deep_dir / f"deep-batch-{run_id}.md").read_text(encoding="utf-8")
+    except OSError:
+        raise HTTPException(status_code=404, detail="Deep batch not found")
+    parts = [summary.rstrip()]
+    for row in _table_after_header(summary, "model"):
+        name = row[3] if len(row) > 3 else ""
+        if not name or name == "-" or "/" in name or "\\" in name:
+            continue
+        try:
+            parts.append((deep_dir / name).read_text(encoding="utf-8").rstrip())
+        except OSError:
+            continue
+    combined = "\n\n---\n\n".join(parts) + "\n"
+    return Response(
+        content=combined,
+        media_type="text/markdown",
+        headers={"Content-Disposition": f"attachment; filename=deep-{run_id}.md"},
+    )

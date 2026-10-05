@@ -148,6 +148,12 @@ async def sandbox_page(request: Request):
     return templates.TemplateResponse(request, "sandbox.html")
 
 
+@app.get("/deep", response_class=HTMLResponse)
+async def deep_page(request: Request):
+    """Deep-research benchmark leaderboard + output preview."""
+    return templates.TemplateResponse(request, "deep.html")
+
+
 @app.get("/sandbox/files/{job_id}/{side}/index.html")
 async def sandbox_file(job_id: str, side: str):
     """Serve a duel-generated index.html. Fixed name + A/B only: no traversal."""

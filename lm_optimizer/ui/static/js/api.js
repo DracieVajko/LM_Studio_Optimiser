@@ -207,6 +207,15 @@ export const API = {
         return this.request(`/runs/${runId}`, { method: 'DELETE' });
     },
 
+    // Deep benchmark batches
+    async getDeepRuns() {
+        return this.request('/deep/runs');
+    },
+
+    async getDeepRun(runId) {
+        return this.request(`/deep/runs/${runId}`);
+    },
+
     async abandonRun(runId) {
         return this.request(`/runs/${runId}/abandon`, { method: 'POST' });
     },

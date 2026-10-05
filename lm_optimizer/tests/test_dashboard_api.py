@@ -1,6 +1,106 @@
 """Dashboard/API route truth: every documented path exists (§29)."""
 
+import pytest
 from fastapi.testclient import TestClient
+
+
+@pytest.fixture
+def client():
+    """Plain TestClient (no lifespan side effects; requests work regardless)."""
+    from lm_optimizer.api.main import app
+
+    return TestClient(app)
+
+
+def _seed_best_run(model_id):
+    from lm_optimizer.database import repositories as _repo
+    from lm_optimizer.domain.models import (
+        BenchmarkMetrics,
+        ConfigurationResult,
+        ConfigurationStatus,
+        HardwareInfo,
+        LoadConfiguration,
+        ModelIdentity,
+        OptimizationProfile,
+        OptimizationRun,
+        QualityScore,
+    )
+
+    hw = HardwareInfo(os="T", cpu_name="C", cpu_cores_physical=1,
+                      cpu_cores_logical=2, total_ram_gb=8, gpu_count=0)
+    model = ModelIdentity(id=model_id, name=model_id, context_limit=131072)
+    _repo.hardware_repo.save(hw)
+    _repo.model_repo.save(model)
+    run = OptimizationRun(model=model, hardware=hw,
+                          profile=OptimizationProfile.BALANCED)
+    _repo.run_repo.save(run)
+    best = ConfigurationResult(
+        config=LoadConfiguration(context_length=4096, flash_attention=True,
+                                 offload_kv_cache_to_gpu=True,
+                                 eval_batch_size=256),
+        context_length=4096,
+        status=ConfigurationStatus.PASSED,
+        metrics=[BenchmarkMetrics(test_name="seed", category="instruction",
+                                  success=True, generation_tok_s=30.0,
+                                  prompt_tok_s=500.0, estimated_ttft_ms=100.0,
+                                  prompt_tokens=10, completion_tokens=50,
+                                  total_tokens=60, output_text="seeded best")],
+        quality_score=QualityScore(overall=1.0, task_completion=1.0,
+                                   factual_consistency=1.0,
+                                   format_compliance=1.0,
+                                   coding_correctness=1.0, no_truncation=1.0,
+                                   no_malformed=1.0, checks_passed=6,
+                                   checks_total=6),
+        score=9.1,
+    )
+    best.run_id = run.id
+    _repo.config_repo.save(best)
+    run.configurations = [best]
+    run.best_config_id = best.id
+    _repo.run_repo.save(run)
+
+
+def _deep_mock_client():
+    from unittest.mock import AsyncMock, MagicMock
+
+    c = MagicMock()
+    ok = MagicMock()
+    ok.success = True
+    ok.identifier = "mock-id"
+    ok.loaded_config = None
+    ok.error = None
+    c.load_model = AsyncMock(return_value=ok)
+    c.ensure_unloaded = AsyncMock(return_value=True)
+    c.unload_all = AsyncMock(return_value={})
+    c.get_loaded_instances = AsyncMock(return_value=[])
+    c.model_known_no_reasoning = lambda model_id: False
+
+    async def _chat(**kwargs):
+        return {
+            "choices": [
+                {"message": {"content": "Line 1\nLine 2 compass\nLine 3\nLine 4."}}
+            ],
+            "usage": {"prompt_tokens": 50, "completion_tokens": 20,
+                      "total_tokens": 70},
+            "_stats": {"tokens_per_second": 25.0,
+                       "time_to_first_token_seconds": 0.05},
+            "thinking_text": "mock reasoning trace",
+        }
+
+    c.chat_completion = AsyncMock(side_effect=_chat)
+    return c
+
+
+@pytest.fixture
+def seeded_deep():
+    """One real completed deep batch on disk; returns its batch stamp id."""
+    from lm_optimizer.services.deep import run_deep_batch
+
+    _seed_best_run("deep-ui-m")
+    out = run_deep_batch(_deep_mock_client(), ["deep-ui-m"],
+                         stamp="20261005-000000")
+    assert out["models"]["deep-ui-m"]["status"] == "completed"
+    return out["batch_stamp"]
 
 
 def _paths():
@@ -267,3 +367,75 @@ class TestAllConfigsWebTable:
         assert "no configurations recorded" in text
         assert "showing " in text and " of " in text  # 200-row cap note
         assert "/configs/${" in text or "/configs/" in text  # JSON detail link
+
+
+class TestDeepLeaderboard:
+    """Task 4: deep leaderboard + preview UI and API (TDD: must FAIL before impl)."""
+
+    def test_deep_runs_endpoint_lists_completed_batches(self, client, seeded_deep):
+        data = client.get("/api/deep/runs").json()
+        assert seeded_deep in [r["id"] for r in data["runs"]]
+
+    def test_deep_run_detail_has_leaderboard_preview_and_export(self, client, seeded_deep):
+        data = client.get(f"/api/deep/runs/{seeded_deep}").json()
+        assert data["id"] == seeded_deep
+        lb = data["leaderboard"]
+        assert lb, "expected at least one leaderboard row"
+        row = lb[0]
+        for col in ("model", "gen_tok_s", "quality", "thinking_chars",
+                    "elapsed_s", "verdict"):
+            assert col in row, f"leaderboard row missing column: {col}"
+        assert "export_url" in data and data["export_url"].endswith("/export")
+        model_id = row["model"]
+        assert model_id in data["models"]
+        preview_tasks = data["models"][model_id]["preview"]
+        assert preview_tasks, "expected per-task preview"
+        for tab in ("prompt", "output", "thinking"):
+            assert tab in preview_tasks[0], f"preview task missing tab: {tab}"
+
+    def test_deep_leaderboard_tiebreak_is_deterministic(self):
+        from lm_optimizer.api.routes import _sort_deep_leaderboard
+
+        rows = [
+            {"model": "b-model", "score": 1.0, "gen_tok_s": 10.0,
+             "elapsed_s": 5.0, "quality": 1.0, "thinking_chars": 3,
+             "status": "completed"},
+            {"model": "a-model", "score": 1.0, "gen_tok_s": 10.0,
+             "elapsed_s": 5.0, "quality": 1.0, "thinking_chars": 3,
+             "status": "completed"},
+            {"model": "fast-model", "score": 1.0, "gen_tok_s": 99.0,
+             "elapsed_s": 50.0, "quality": 1.0, "thinking_chars": 3,
+             "status": "completed"},
+        ]
+        ordered = [r["model"] for r in _sort_deep_leaderboard(rows)]
+        assert ordered[0] == "fast-model"  # gen tok/s breaks the score tie
+        assert ordered[1:] == ["a-model", "b-model"]  # model id breaks full tie
+
+    def test_deep_preview_flags_outputs_over_50k_chars(self, client):
+        from lm_optimizer.api import routes as routes_mod
+
+        big = "x" * 60000
+        entry = routes_mod._preview_entry("t", "p", "th", big)
+        assert entry["paginated"] is True
+        assert entry["chars"] == 60000
+        assert "50000" in (entry["note"] or "")
+
+    def test_deep_unknown_batch_is_json_404(self, client):
+        resp = client.get("/api/deep/runs/no-such-batch")
+        assert resp.status_code == 404
+        assert "detail" in resp.json()
+
+    def test_deep_page_renders_with_boot_reporter(self, client):
+        html = client.get("/deep").text
+        assert 'src="/static/js/deep.js?v=' in html
+        assert "addEventListener('error'" in html
+        assert "main-content" in html
+
+    def test_deep_js_paginates_and_links_history(self):
+        from pathlib import Path
+
+        text = Path("lm_optimizer/ui/static/js/deep.js").read_text(encoding="utf-8")
+        assert "50000" in text  # 50k-char preview pagination
+        assert "Back to History" in text or 'href="/history"' in text
+        assert "spinner" in text  # results-page loading pattern
+        assert "document.readyState" in text  # readyState-safe boot
