@@ -30,6 +30,7 @@ from lm_optimizer.services.reporting import (
     _config_outputs,
     sanitize_model_filename,
 )
+from lm_optimizer.services.unload_guard import UnloadNotClean
 
 logger = get_logger(__name__)
 
@@ -224,9 +225,10 @@ async def run_deep_model_async(
     ``load_config=None`` resolves the stored best via the run DB and raises
     NoBestConfigError when none exists. Single load/unload cycle per model:
     all 5 tasks run under one load (repetitions=1, no preheat chats), with a
-    fail-closed unload in ``finally``. Task execution reuses
-    BenchmarkService's channel load and single-case measurement; abort and
-    failure counting are unchanged.
+    fail-closed unload in ``finally`` that raises UnloadNotClean (after the
+    report is written) so library callers get a failure signal instead of a
+    logged warning. Task execution reuses BenchmarkService's public channel
+    load and single-case measurement; abort and failure counting are unchanged.
     """
     best_run_id: str | None = None
     if load_config is None:
@@ -246,10 +248,11 @@ async def run_deep_model_async(
     status = "completed"
     load_channel = "REST"
     load_verification: dict = {"verification": "UNKNOWN"}
+    unload_error: str | None = None
 
     try:
         try:
-            ok, _ident, _loaded, channel, applied, load_err = await service._channel_load(
+            ok, _ident, _loaded, channel, applied, load_err = await service.channel_load(
                 model_id, load_config
             )
         except Exception as e:
@@ -291,7 +294,7 @@ async def run_deep_model_async(
                         )
                     )
                     continue
-                m = await service._run_single_case(model_id, case, service.reasoning)
+                m = await service.run_single_case(model_id, case, service.reasoning)
                 collected.append(m)
                 scored = evaluator.evaluate_all(model_id, [m])
                 q = scored.get(case.name)
@@ -312,10 +315,14 @@ async def run_deep_model_async(
                 status = "aborted"
     finally:
         try:
-            if not await client.ensure_unloaded(model_id):
-                logger.warning("Deep run left model loaded", model=model_id)
-        except Exception:
-            pass
+            still_loaded = not await client.ensure_unloaded(model_id)
+        except Exception as e:
+            still_loaded = True
+            unload_error = f"{type(e).__name__}: {e}"
+        if still_loaded:
+            if unload_error is None:
+                unload_error = "model still loaded after unload sweep"
+            logger.warning("Deep run left model loaded", model=model_id, error=unload_error)
 
     agg = ConfigurationResult(
         config=load_config,
@@ -340,6 +347,10 @@ async def run_deep_model_async(
         },
     )
     target = Path(out_dir) if out_dir is not None else _default_deep_dir()
+    note = reason
+    if unload_error is not None:
+        unload_note = f"Unload FAILED: {unload_error}"
+        note = f"{note}; {unload_note}" if note else unload_note
     report_path = _write_deep_report(
         model_id,
         load_config,
@@ -350,14 +361,22 @@ async def run_deep_model_async(
         target,
         stamp or datetime.now().strftime("%Y%m%d-%H%M%S"),
         status,
-        reason,
+        note,
     )
+    if unload_error is not None:
+        raise UnloadNotClean(
+            f"Host not clean after deep:{model_id} "
+            f"(unload sweep failed: {unload_error}). "
+            "If LM Studio has 'Keep Model in Memory' enabled, disable it for "
+            "optimizer runs, or unload models manually in LM Studio and retry."
+        )
     thinking_total = sum(t["thinking_chars"] for t in tasks)
     gen_speeds = [t["gen_tok_s"] for t in tasks if t["status"] == "ok" and t["gen_tok_s"] > 0]
     return {
         "model_id": model_id,
         "status": status,
         "reason": reason,
+        "unload_error": unload_error,
         "tasks": tasks,
         "report_path": str(report_path),
         "context_length": ctx,

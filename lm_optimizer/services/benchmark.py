@@ -179,6 +179,29 @@ class BenchmarkService:
             "",
         )
 
+    async def channel_load(
+        self, model_id: str, cfg: LoadConfiguration
+    ) -> tuple[bool, str | None, object | None, str, dict | None, str]:
+        """Public load via the authoritative channel (same tuple as internal).
+
+        Thin public wrapper for library runners that manage their own load
+        lifetime (e.g. deep suite: load once, measure several cases,
+        unload fail-closed). No behavior change to the benchmark path.
+        """
+        return await self._channel_load(model_id, cfg)
+
+    async def run_single_case(
+        self, model_id: str, case: BenchmarkCase, reasoning: str | None = None
+    ) -> BenchmarkMetrics:
+        """Public single-case measurement (no load/unload; caller owns lifetime).
+
+        Thin public wrapper for library runners measuring cases under an
+        already-held load. No behavior change to the benchmark path.
+        """
+        if reasoning is None:
+            reasoning = self.reasoning
+        return await self._run_single_case(model_id, case, reasoning)
+
     async def smoke_test(
         self,
         model_id: str,

@@ -832,6 +832,9 @@ def deep(
             except NoBestConfigError as e:
                 console.print(f"[red]{e}[/red]")
                 sys.exit(1)
+            except UnloadNotClean as e:
+                console.print(f"[red]Host not clean:[/red] {e}")
+                sys.exit(1)
 
             table = Table(title=f"Deep results: {model} ({out['status']})")
             table.add_column("Task", style="cyan")

@@ -6,6 +6,7 @@ configured results dir so tests never touch the real results/.
 """
 
 import pytest
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 from lm_optimizer.domain.models import (
@@ -169,6 +170,21 @@ def test_deep_run_load_failure_fails_tasks_without_chats():
     assert client.chat_completion.call_count == 0
     assert [t["status"] for t in out["tasks"]] == ["failed"] * 5
     assert "deep" in out["report_path"]
+
+
+def test_deep_run_unload_failure_raises_instead_of_silently_passing():
+    from lm_optimizer.config import config as _cfg
+    from lm_optimizer.services.deep import run_deep_model
+    from lm_optimizer.services.unload_guard import UnloadNotClean
+
+    _seed_best_run("m")
+    client = _mock_client()
+    client.ensure_unloaded = AsyncMock(return_value=False)
+    with pytest.raises(UnloadNotClean, match="[Hh]ost not clean"):
+        run_deep_model(client, "m")
+    # Evidence is still preserved: the per-model report was written first.
+    deep_dir = Path(_cfg.storage.results_dir) / "deep"
+    assert list(deep_dir.glob("m-deep-*.md")), "expected the deep report despite unload failure"
 
 
 def test_deep_run_caps_output_tokens_per_task():
