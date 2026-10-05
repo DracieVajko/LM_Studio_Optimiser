@@ -572,3 +572,118 @@ silent.
 - Capability snapshots carry a backend string; `OptimizationRun` itself
   has no backend field — do not mix runs from different backends in one
   comparison until per-run tagging lands.
+
+---
+
+## 15. Deep Research Benchmark
+
+The **Deep Research** benchmark evaluates models on long-context recall, multi-hop reasoning, JSON discipline, coding precision, and instruction following — tasks that require sustained coherence over thousands of tokens. It runs **after** the standard optimization completes, using the **best configuration** found for each model.
+
+### 15.1 Purpose
+
+- Measure capabilities that the standard 5-test suite does not cover (contexts ≥ 4096, structured reasoning, strict formatting).
+- Provide a **leaderboard** across models with identical prompts and the same best-load configuration each model earned.
+- Produce per-model reports with full Prompt / Thinking / Output traces for manual inspection.
+
+### 15.2 CLI Usage
+
+```bash
+# Run Deep Research on specific models (must have completed optimization runs with best configs)
+lm-opt deep-research --models model-a,model-b --out-dir results/deep
+
+# Run on all models that have a stored best configuration
+lm-opt deep-research --all-optimized --out-dir results/deep
+
+# Override built-in prompts with a custom YAML file
+lm-opt deep-research --models model-a --prompts-file deep_prompts.yaml --out-dir results/deep
+
+# Adjust context length for the deep research run (default: model's max context)
+lm-opt deep-research --models model-a --context 32768
+```
+
+**Requirements:**
+- Each model must have a completed optimization run with a valid best configuration (the CLI refuses otherwise — never silent defaults).
+- Models are loaded **once**, all 5 tasks run sequentially, then unloaded (fail-closed guard between models).
+- If a model fails (load error, OOM, timeout), the batch continues with the next model; the failure is recorded in the batch summary.
+
+### 15.3 Built-in Prompts (5 Fixed Tasks)
+
+| Task | Category | Description | Min Tokens |
+|------|----------|-------------|------------|
+| `long_context_recall` | Recall | Read a 8k-token synthetic document with planted facts; answer specific retrieval questions | 4096 |
+| `multi_hop` | Reasoning | 3-step logical deduction chain requiring intermediate conclusions | 4096 |
+| `json_discipline` | Format | Generate nested JSON matching a strict schema with arrays, objects, and typed fields | 4096 |
+| `coding_precision` | Coding | Implement a non-trivial algorithm with exact signature, edge cases, and docstring | 4096 |
+| `instruction_follow` | Instruction | Follow a complex multi-constraint prompt (format, length, forbidden words, structure) | 4096 |
+
+All prompts use `temperature=0.1`, `seed=42`, and `max_tokens=8192` (configurable via YAML override).
+
+### 15.4 Custom Prompts YAML Override
+
+Create `deep_prompts.yaml` in the working directory or `config/deep_prompts.yaml`:
+
+```yaml
+prompts:
+  - name: "Custom Recall Test"
+    prompt: "Read this document and answer: ..."
+    category: "recall"
+    max_tokens: 8192
+    temperature: 0.1
+  - name: "Custom JSON Task"
+    prompt: "Generate JSON matching this schema: ..."
+    category: "format"
+    max_tokens: 8192
+    temperature: 0.0
+```
+
+**Resolution order:** `./deep_prompts.yaml` → `config/deep_prompts.yaml` → built-in defaults.  
+Override matches by `name`; unknown names are ignored with a warning.
+
+### 15.5 Outputs
+
+**Per-model report** (`results/deep/<model>-deep-<timestamp>.md`):
+- Configuration used (context, GPU ratio, flash attention, KV cache, batch, etc.)
+- Per-task metrics: generation tok/s, prompt tok/s, estimated TTFT, quality checks passed, thinking chars, output chars
+- Full verbatim Prompt / Thinking / Output for each task (markdown-fenced, escaped)
+
+**Batch summary** (`results/deep/deep-batch-<timestamp>.md`):
+- Leaderboard table sorted by: composite score ↓, generation tok/s ↓, elapsed time ↑, model ID
+- Per-model status (completed / failed / skipped) with error reason
+- Links to individual model reports
+
+### 15.6 Web UI — Deep Research Tab
+
+Navigate to `/deep` in the web UI after running at least one batch:
+
+- **Leaderboard**: sortable table with score, gen tok/s, elapsed, model, status
+- **Per-model preview**: click a model to expand Prompt / Thinking / Output tabs for each of the 5 tasks
+- **Pagination**: thinking/output > 50k chars paginated with "show more" (preserves verbatim text)
+- **Export**: combined `.md` download of the entire batch
+
+### 15.7 Metrics
+
+The Deep Research suite computes a **composite score** per model:
+
+```
+score = 0.30 * quality_overall
+      + 0.25 * norm_generation_speed
+      + 0.20 * norm_prompt_speed
+      + 0.15 * norm_context_utilization
+      + 0.10 * (1 - norm_estimated_ttft)
+```
+
+- `quality_overall`: mean of 6 heuristic checks across all 5 tasks (0–1)
+- Speed/TTFT normalized run-relative across models in the batch (min-max)
+- `context_utilization`: actual context used / model max context
+
+### 15.8 Resume Behavior
+
+- Models with an existing `-deep-` report in `results/deep/` are **skipped** (resume).
+- Use `--force` to re-run skipped models.
+- Interrupted batches can be resumed by re-running the same command.
+
+### 15.9 Notes
+
+- Deep Research is **independent** of the optimization profile (Speed/Balanced/Context/Quality). It always uses the model's **best configuration** as determined by the optimization run.
+- Reports are **ASCII-structured** (markdown fences escaped via `_fence_block`); model output is preserved verbatim including Unicode.
+- The CLI prints a summary: `completed N, failed M, skipped K (resume)`.
