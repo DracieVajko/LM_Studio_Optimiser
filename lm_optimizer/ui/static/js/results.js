@@ -187,7 +187,7 @@ const ResultsPage = {
                         ${this.renderChartTab()}
                     </div>
                 </div>
-                ${this.renderConfigTable()}
+                ${this.renderAllConfigs(this.state.runId)}
             </div>
         `;
 
@@ -480,81 +480,137 @@ const ResultsPage = {
         `;
     },
 
-    renderConfigTable() {
-        return `
+    escAllConfigs(v) {
+        // Minimal HTML escape for error/status text in the all-configs table.
+        return String(v ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    },
+
+    renderAllConfigs(runId) {
+        // All-tried-configs table: same columns as the .md report table
+        // (# | Ctx | Flash | KV | Eval | Phys | Parallel | Checkpoints |
+        // Experts | Status | Score | Gen tok/s | Quality | Error).
+        // Data comes from the existing GET /api/runs/{id}/configurations
+        // endpoint (already loaded into state by loadRun). Failed rows carry
+        // status + error only (no metrics exist there); initial render is
+        // capped at 200 rows with a "showing X of Y" note.
+        const all = Array.isArray(this.state.configurations)
+            ? this.state.configurations.slice() : [];
+        const scoreOf = (c) => (c.score != null ? c.score : -Infinity);
+        const passed = all.filter(c => c.status === 'passed')
+            .sort((a, b) => scoreOf(b) - scoreOf(a));
+        const failed = all.filter(c => c.status !== 'passed');
+        const ordered = passed.concat(failed);
+        const CAP = 200;
+        const shown = ordered.slice(0, CAP);
+        const rid = runId || this.state.runId;
+
+        const head = `
             <div class="card">
-                <div class="card-header">
+                <div class="card-header flex items-center justify-between gap-2">
                     <h3 class="font-semibold text-gray-900">All Tested Configurations</h3>
+                    ${ordered.length > CAP
+                        ? `<span class="text-xs text-gray-500">showing ${shown.length} of ${ordered.length}</span>`
+                        : `<span class="text-xs text-gray-500">${ordered.length} configurations</span>`}
                 </div>
                 <div class="card-body p-0">
-                    <div class="table-container">
+                    <div class="table-container">`;
+        if (!ordered.length) {
+            return head + `
+                        <p class="text-sm text-gray-500 p-4">no configurations recorded</p>
+                    </div>
+                </div>
+            </div>`;
+        }
+        const fmtScore = (c) => (c.score != null ? c.score.toFixed(3) : 'n/a');
+        const fmtGen = (c) => (c.avg_generation_tok_s > 0
+            ? c.avg_generation_tok_s.toFixed(1) : 'n/a');
+        const fmtQuality = (c) => (c.quality?.overall != null
+            ? c.quality.overall.toFixed(3) : 'n/a');
+        const rows = shown.map((c, i) => {
+            const cfg = c.config || {};
+            const kv = cfg.offload_kv_cache_to_gpu == null
+                ? 'n/a' : (cfg.offload_kv_cache_to_gpu ? 'GPU' : 'CPU');
+            const flash = cfg.flash_attention == null
+                ? 'n/a' : (cfg.flash_attention ? 'ON' : 'OFF');
+            const na = (v) => (v == null ? 'n/a' : v);
+            const err = this.escAllConfigs(String(c.error || '').slice(0, 120));
+            return `
+                <tr data-cfg-row-anchor="${c.id}" class="${c.status === 'passed' ? '' : 'bg-red-50'}">
+                    <td class="font-mono">${i + 1}</td>
+                    <td class="font-mono">${c.context_length}</td>
+                    <td>${flash}</td>
+                    <td>${kv}</td>
+                    <td>${na(cfg.eval_batch_size)}</td>
+                    <td>${na(cfg.physical_batch_size)}</td>
+                    <td>${na(cfg.parallel)}</td>
+                    <td>${na(cfg.context_checkpoints)}</td>
+                    <td>${na(cfg.num_experts)}</td>
+                    <td><span class="badge ${this.getStatusBadge(c.status)}">${c.status}</span></td>
+                    <td class="font-mono font-medium">${fmtScore(c)}</td>
+                    <td class="font-mono font-medium">${fmtGen(c)}</td>
+                    <td>${fmtQuality(c)}</td>
+                    <td class="font-mono text-xs max-w-60 truncate" title="${err}">${err || '—'}</td>
+                    <td class="whitespace-nowrap">
+                        <button class="btn btn-outline btn-sm cfg-detail-btn" data-cfg="${c.id}">Detail</button>
+                        <a class="underline text-blue-600 text-sm ml-2" target="_blank" rel="noopener" href="/results/${rid}/configs/${c.id}">JSON</a>
+                    </td>
+                </tr>
+                <tr class="cfg-detail-row hidden" data-cfg-row="${c.id}">
+                    <td colspan="15">
+                        <div class="p-3 space-y-2">
+                            ${this.renderConfigFacts(c)}
+                            <div><a class="underline text-blue-600 text-sm" target="_blank" rel="noopener" href="/results/${rid}/configs/${c.id}">Open full JSON</a></div>
+                            <div><span class="font-medium">Per-test outputs:</span>
+                            ${(c.metrics || []).map(m => `
+                                <div class="mt-1 border-t pt-1">
+                                    <span class="font-mono text-xs font-medium">${m.test_name}</span>
+                                    <span class="text-xs text-gray-500">tok/s ${m.generation_tok_s != null ? m.generation_tok_s.toFixed(1) : '—'} · in ${m.prompt_tokens ?? '—'} / out ${m.completion_tokens ?? '—'} tok · ${m.success ? 'ok' : 'fail: ' + (m.error || '')}</span>
+                                    <div class="text-xs font-medium mt-1">Prompt</div>
+                                    <pre class="font-mono text-xs bg-gray-50 p-2 rounded overflow-auto max-h-40">${String(m.prompt || '(prompt not stored for this run)').slice(0, 4000)}</pre>
+                                    <div class="text-xs font-medium mt-1">Thinking</div>
+                                    <pre class="font-mono text-xs bg-gray-50 p-2 rounded overflow-auto max-h-40">${String(m.thinking_text || 'n/a (old run or non-reasoning model)').slice(0, 4000)}</pre>
+                                    <div class="text-xs font-medium mt-1">Output</div>
+                                    <pre class="font-mono text-xs bg-gray-50 p-2 rounded overflow-auto max-h-40">${String(m.output_text || '—').slice(0, 2000)}</pre>
+                                    <button class="btn btn-outline btn-sm cfg-full-output-btn" data-cfg="${c.id}" data-test="${m.test_name}">Full output + quality</button>
+                                    <div class="cfg-full-output" data-full-out="${c.id}:${m.test_name}"></div>
+                                </div>`).join('')}
+                            </div>
+                        </div>
+                    </td>
+                </tr>`;
+        }).join('');
+        return head + `
                         <table class="table">
                             <thead>
                                 <tr>
-                                    <th>Context</th>
-                                    <th>GPU</th>
+                                    <th>#</th>
+                                    <th>Ctx</th>
                                     <th>Flash</th>
                                     <th>KV</th>
-                                    <th>Batch</th>
-                                    <th>Gen tok/s</th>
-                                    <th>Prompt tok/s</th>
-                                    <th>TTFT</th>
-                                    <th>VRAM</th>
-                                    <th>Quality</th>
-                                    <th>Score</th>
+                                    <th>Eval</th>
+                                    <th>Phys</th>
+                                    <th>Parallel</th>
+                                    <th>Checkpoints</th>
+                                    <th>Experts</th>
                                     <th>Status</th>
+                                    <th>Score</th>
+                                    <th>Gen tok/s</th>
+                                    <th>Quality</th>
+                                    <th>Error</th>
                                     <th>Detail</th>
                                 </tr>
                             </thead>
-                            <tbody>
-                                ${this.state.configurations.map(c => {
-                                    const cfg = c.config || {};
-                                    return `
-                                    <tr data-cfg-row-anchor="${c.id}" class="${c.status === 'passed' ? '' : 'bg-red-50'}">
-                                        <td class="font-mono">${c.context_length}</td>
-                                        <td>${cfg.gpu_ratio != null ? (cfg.gpu_ratio * 100).toFixed(0) + '%' : 'Auto'}</td>
-                                        <td>${cfg.flash_attention ? 'ON' : 'OFF'}</td>
-                                        <td>${cfg.offload_kv_cache_to_gpu ? 'GPU' : 'CPU'}</td>
-                                        <td>${cfg.eval_batch_size || 'Auto'}</td>
-                                        <td class="font-mono font-medium">${c.avg_generation_tok_s?.toFixed(1) || '—'}</td>
-                                        <td class="font-mono">${c.avg_prompt_tok_s?.toFixed(0) || '—'}</td>
-                                        <td class="font-mono">${c.avg_ttft_ms?.toFixed(0) || '—'} ms</td>
-                                        <td class="font-mono">${c.peak_vram_gb?.toFixed(1) || '—'} GB</td>
-                                        <td>${c.quality?.overall?.toFixed(3) || '—'}</td>
-                                        <td class="font-mono font-medium">${c.score != null ? c.score.toFixed(3) : '—'}</td>
-                                        <td><span class="badge ${this.getStatusBadge(c.status)}">${c.status}</span></td>
-                                        <td><button class="btn btn-outline btn-sm cfg-detail-btn" data-cfg="${c.id}">Detail</button></td>
-                                    </tr>
-                                    <tr class="cfg-detail-row hidden" data-cfg-row="${c.id}">
-                                        <td colspan="14">
-                                            <div class="p-3 space-y-2">
-                                                ${this.renderConfigFacts(c)}
-                                                <div><a class="underline text-blue-600 text-sm" target="_blank" rel="noopener" href="/results/${this.state.runId}/configs/${c.id}">Open full JSON</a></div>
-                                                <div><span class="font-medium">Per-test outputs:</span>
-                                                ${(c.metrics || []).map(m => `
-                                                    <div class="mt-1 border-t pt-1">
-                                                        <span class="font-mono text-xs font-medium">${m.test_name}</span>
-                                                        <span class="text-xs text-gray-500">tok/s ${m.generation_tok_s != null ? m.generation_tok_s.toFixed(1) : '—'} · in ${m.prompt_tokens ?? '—'} / out ${m.completion_tokens ?? '—'} tok · ${m.success ? 'ok' : 'fail: ' + (m.error || '')}</span>
-                                                        <div class="text-xs font-medium mt-1">Prompt</div>
-                                                        <pre class="font-mono text-xs bg-gray-50 p-2 rounded overflow-auto max-h-40">${String(m.prompt || '(prompt not stored for this run)').slice(0, 4000)}</pre>
-                                                        <div class="text-xs font-medium mt-1">Thinking</div>
-                                                        <pre class="font-mono text-xs bg-gray-50 p-2 rounded overflow-auto max-h-40">${String(m.thinking_text || 'n/a (old run or non-reasoning model)').slice(0, 4000)}</pre>
-                                                        <div class="text-xs font-medium mt-1">Output</div>
-                                                        <pre class="font-mono text-xs bg-gray-50 p-2 rounded overflow-auto max-h-40">${String(m.output_text || '—').slice(0, 2000)}</pre>
-                                                        <button class="btn btn-outline btn-sm cfg-full-output-btn" data-cfg="${c.id}" data-test="${m.test_name}">Full output + quality</button>
-                                                        <div class="cfg-full-output" data-full-out="${c.id}:${m.test_name}"></div>
-                                                    </div>`).join('')}
-                                                </div>
-                                            </div>
-                                        </td>
-                                    </tr>
-                                `;}).join('')}
-                            </tbody>
+                            <tbody>${rows}</tbody>
                         </table>
                     </div>
                 </div>
-            </div>
-        `;
+            </div>`;
+    },
+
+    renderConfigTable() {
+        // Kept for backward compat; the run view now uses renderAllConfigs.
+        return this.renderAllConfigs(this.state.runId);
     },
 
     renderConfigFacts(c) {

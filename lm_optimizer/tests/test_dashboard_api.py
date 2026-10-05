@@ -206,3 +206,64 @@ class TestLauncher:
 
         assert "AdaptiveOptimizer" in inspect.getsource(_routes.run_optimization_task)
         assert "BenchmarkService" in inspect.getsource(_cli._run_optimization)
+
+
+class TestAllConfigsWebTable:
+    """Task 3: web results page lists every tried config (no backend change)."""
+
+    def test_configurations_endpoint_lists_all_statuses(self, monkeypatch):
+        """Existing endpoint already returns passed AND failed rows."""
+        from types import SimpleNamespace
+        from uuid import uuid4
+
+        from fastapi.testclient import TestClient
+
+        from lm_optimizer.api import routes as routes_mod
+        from lm_optimizer.api.main import app
+        from lm_optimizer.domain.models import (
+            BenchmarkMetrics,
+            ConfigurationResult,
+            ConfigurationStatus,
+            LoadConfiguration,
+        )
+
+        run_id = uuid4()
+        ok = ConfigurationResult(
+            run_id=run_id,
+            config=LoadConfiguration(context_length=16384),
+            context_length=16384,
+            status=ConfigurationStatus.PASSED,
+            metrics=[BenchmarkMetrics(test_name="t", category="i",
+                                      success=True, generation_tok_s=30.0)],
+            score=9.1,
+        )
+        bad = ConfigurationResult(
+            run_id=run_id,
+            config=LoadConfiguration(context_length=8192),
+            context_length=8192,
+            status=ConfigurationStatus.LOAD_FAILED,
+            metrics=[],
+            score=None,
+            error="load refused",
+        )
+        monkeypatch.setattr(
+            routes_mod.run_repo, "get",
+            lambda *a, **k: SimpleNamespace(configurations=[ok, bad]))
+
+        with TestClient(app) as client:
+            resp = client.get(f"/api/runs/{run_id}/configurations")
+            assert resp.status_code == 200
+            data = resp.json()
+            assert {c["status"] for c in data["configurations"]} >= {
+                "passed", "load_failed"}
+
+    def test_results_js_has_render_all_configs(self):
+        """results.js renders the md-identical all-configs table (TDD anchor)."""
+        from pathlib import Path
+
+        text = Path(
+            "lm_optimizer/ui/static/js/results.js").read_text(encoding="utf-8")
+        assert "renderAllConfigs" in text
+        assert "no configurations recorded" in text
+        assert "showing " in text and " of " in text  # 200-row cap note
+        assert "/configs/${" in text or "/configs/" in text  # JSON detail link
