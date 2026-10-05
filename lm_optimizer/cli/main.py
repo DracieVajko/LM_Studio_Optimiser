@@ -792,6 +792,83 @@ def benchmark(
     asyncio.run(_benchmark())
 
 
+@app.command()
+def deep(
+    model: str = typer.Option(..., "--model", help="Model ID (must have a stored best config)"),
+    output: Path = typer.Option(Path("results/deep"), "--output", help="Deep report output directory"),
+    context: int | None = typer.Option(
+        None, "--context", help="Override context length (default: best-config context)"
+    ),
+):
+    """Run the fixed deep-research suite on a model's stored best config.
+
+    Refuses with a reason when the model has no stored best config (never
+    a silent default). Fail-closed unload before and after.
+    """
+    from lm_optimizer.services.deep import NoBestConfigError, run_deep_model_async
+
+    setup_logging()
+
+    async def _deep():
+        client = get_client()
+        try:
+            await client.connect()
+            snap = await prepare_host(client, purpose="deep")
+            for line in format_snapshot(snap):
+                console.print(f"  {line}")
+            if not snap.get("verified_empty") and snap.get("leftovers"):
+                console.print("[red]Stale models loaded, aborting. Unload them first.[/red]")
+                sys.exit(1)
+            try:
+                await assert_unloaded(client, purpose=f"deep:{model}:pre")
+            except UnloadNotClean as e:
+                console.print(f"[red]Host not clean, aborting:[/red] {e}")
+                sys.exit(1)
+
+            try:
+                out = await run_deep_model_async(
+                    client, model, load_config=None, out_dir=str(output), context_length=context
+                )
+            except NoBestConfigError as e:
+                console.print(f"[red]{e}[/red]")
+                sys.exit(1)
+
+            table = Table(title=f"Deep results: {model} ({out['status']})")
+            table.add_column("Task", style="cyan")
+            table.add_column("Status", justify="center")
+            table.add_column("Gen tok/s", justify="right")
+            table.add_column("Elapsed s", justify="right")
+            table.add_column("Thinking chars", justify="right")
+            for t in out["tasks"]:
+                table.add_row(
+                    t["name"],
+                    t["status"],
+                    f"{t['gen_tok_s']:.1f}",
+                    f"{t['elapsed_s']:.1f}",
+                    str(t["thinking_chars"]),
+                )
+            console.print(table)
+            if out.get("reason"):
+                console.print(f"[yellow]{out['reason']}[/yellow]")
+            console.print(f"[green]Deep report saved: {out['report_path']}[/green]")
+
+            try:
+                await assert_unloaded(client, purpose=f"deep:{model}:post")
+            except UnloadNotClean as e:
+                console.print(f"[red]Done, but host not clean:[/red] {e}")
+                sys.exit(1)
+        except SystemExit:
+            raise
+        except Exception as e:
+            logger.exception("Deep benchmark failed")
+            console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
+        finally:
+            await client.close()
+
+    asyncio.run(_deep())
+
+
 @app.command(name="manual-memory-duel")
 def manual_memory_duel(
     model: str = typer.Option(
