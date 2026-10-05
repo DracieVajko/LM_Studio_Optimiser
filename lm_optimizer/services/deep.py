@@ -222,8 +222,11 @@ async def run_deep_model_async(
     """Run the fixed deep suite on one model; returns per-task metrics/scores.
 
     ``load_config=None`` resolves the stored best via the run DB and raises
-    NoBestConfigError when none exists. One load/unload cycle per task via
-    BenchmarkService.run_cases (repetitions=1, no preheat chats).
+    NoBestConfigError when none exists. Single load/unload cycle per model:
+    all 5 tasks run under one load (repetitions=1, no preheat chats), with a
+    fail-closed unload in ``finally``. Task execution reuses
+    BenchmarkService's channel load and single-case measurement; abort and
+    failure counting are unchanged.
     """
     best_run_id: str | None = None
     if load_config is None:
@@ -240,60 +243,80 @@ async def run_deep_model_async(
     quality_by_test: dict = {}
     consecutive_errors = 0
     reason: str | None = None
+    status = "completed"
+    load_channel = "REST"
+    load_verification: dict = {"verification": "UNKNOWN"}
 
-    for case in cases:
-        if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
-            reason = (
-                f"aborted after {MAX_CONSECUTIVE_ERRORS} consecutive errors "
-                "(per-model budget cap); remaining tasks skipped"
+    try:
+        try:
+            ok, _ident, _loaded, channel, applied, load_err = await service._channel_load(
+                model_id, load_config
             )
-            tasks.append(_skipped_entry(case, reason))
-            collected.append(
-                BenchmarkMetrics(
+        except Exception as e:
+            ok, channel, applied, load_err = False, "REST", None, (
+                f"{type(e).__name__}: {e}"
+            )
+        load_channel = channel
+        from lm_optimizer.services import control_adapter as _ca
+
+        load_verification = _ca.verify_applied(load_config.to_api_params(), applied)
+        if not ok:
+            reason = load_err or "model load failed"
+            status = "failed"
+            for case in cases:
+                m = BenchmarkMetrics(
                     test_name=case.name,
                     category=case.category,
                     success=False,
                     error=reason,
                     prompt=case.prompt,
                 )
-            )
-            continue
-        result = await service.run_cases(
-            model_id,
-            load_config,
-            ctx,
-            [case],
-            repetitions=1,
-            warmup_repetitions=0,
-        )
-        if result.metrics:
-            m = result.metrics[0]
+                collected.append(m)
+                tasks.append(_task_entry(case, m, None))
         else:
-            m = BenchmarkMetrics(
-                test_name=case.name,
-                category=case.category,
-                success=False,
-                error=result.error or "no measurements recorded",
-                prompt=case.prompt,
-            )
-        collected.append(m)
-        scored = evaluator.evaluate_all(model_id, [m])
-        q = scored.get(case.name)
-        quality = q if (q is not None and q.confident) else None
-        if quality is not None:
-            quality_by_test[case.name] = quality
-        tasks.append(_task_entry(case, m, quality))
-        if m.success:
-            consecutive_errors = 0
-        else:
-            consecutive_errors += 1
-            if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
-                reason = (
-                    f"aborted after {MAX_CONSECUTIVE_ERRORS} consecutive errors "
-                    "(per-model budget cap); remaining tasks skipped"
-                )
+            for case in cases:
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                    reason = (
+                        f"aborted after {MAX_CONSECUTIVE_ERRORS} consecutive errors "
+                        "(per-model budget cap); remaining tasks skipped"
+                    )
+                    tasks.append(_skipped_entry(case, reason))
+                    collected.append(
+                        BenchmarkMetrics(
+                            test_name=case.name,
+                            category=case.category,
+                            success=False,
+                            error=reason,
+                            prompt=case.prompt,
+                        )
+                    )
+                    continue
+                m = await service._run_single_case(model_id, case, service.reasoning)
+                collected.append(m)
+                scored = evaluator.evaluate_all(model_id, [m])
+                q = scored.get(case.name)
+                quality = q if (q is not None and q.confident) else None
+                if quality is not None:
+                    quality_by_test[case.name] = quality
+                tasks.append(_task_entry(case, m, quality))
+                if m.success:
+                    consecutive_errors = 0
+                else:
+                    consecutive_errors += 1
+                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                        reason = (
+                            f"aborted after {MAX_CONSECUTIVE_ERRORS} consecutive errors "
+                            "(per-model budget cap); remaining tasks skipped"
+                        )
+            if any(t["status"] == "skipped" for t in tasks):
+                status = "aborted"
+    finally:
+        try:
+            if not await client.ensure_unloaded(model_id):
+                logger.warning("Deep run left model loaded", model=model_id)
+        except Exception:
+            pass
 
-    status = "aborted" if any(t["status"] == "skipped" for t in tasks) else "completed"
     agg = ConfigurationResult(
         config=load_config,
         context_length=ctx,
@@ -310,6 +333,8 @@ async def run_deep_model_async(
             "stage": "deep",
             "style": "deep",
             "best_run_id": best_run_id,
+            "load_channel": load_channel,
+            "load_verification": load_verification,
             "max_output_tokens_per_task": MAX_OUTPUT_TOKENS_PER_TASK,
             "max_consecutive_errors": MAX_CONSECUTIVE_ERRORS,
         },

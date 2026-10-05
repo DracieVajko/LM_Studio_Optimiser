@@ -81,12 +81,13 @@ def _seed_best_run(model_id="m"):
     return run
 
 
-def _mock_client(thinking="mock reasoning trace", fail=False):
+def _mock_client(thinking="mock reasoning trace", fail=False, load_fail=False):
     c = MagicMock()
     ok = MagicMock()
-    ok.success = True
+    ok.success = not load_fail
     ok.identifier = "mock-id"
     ok.loaded_config = None
+    ok.error = "mock load refused" if load_fail else None
     c.load_model = AsyncMock(return_value=ok)
     c.ensure_unloaded = AsyncMock(return_value=True)
     c.unload_all = AsyncMock(return_value={})
@@ -125,7 +126,11 @@ def test_deep_run_uses_best_config_and_logs_thinking(mock_client_with_best):
     cfgs = [call.args[1] for call in mock_client_with_best.load_model.call_args_list]
     assert cfgs, "expected the model to be loaded with the stored best config"
     assert all(getattr(cfg, "eval_batch_size", None) == 256 for cfg in cfgs)
-    assert mock_client_with_best.load_model.call_count == 5
+    # Single load per model: all 5 tasks run under that one load.
+    assert mock_client_with_best.load_model.call_count == 1
+    assert mock_client_with_best.chat_completion.call_count == 5
+    assert mock_client_with_best.ensure_unloaded.call_count >= 1
+    assert out["status"] == "completed"
 
 
 def test_deep_run_refuses_without_best_config():
@@ -145,8 +150,24 @@ def test_deep_run_aborts_after_three_consecutive_errors():
     out = run_deep_model(client, "m")
     assert out["status"] == "aborted"
     assert "consecutive" in (out["reason"] or "").lower()
-    # Aborted after 3 consecutive errors, not all 5 tasks.
-    assert client.load_model.call_count == 3
+    # Exactly 1 load; 3 tasks attempted, remainder aborted (skipped).
+    assert client.load_model.call_count == 1
+    assert client.chat_completion.call_count == 3
+    assert [t["status"] for t in out["tasks"]] == ["failed"] * 3 + ["skipped"] * 2
+    assert "deep" in out["report_path"]
+
+
+def test_deep_run_load_failure_fails_tasks_without_chats():
+    from lm_optimizer.services.deep import run_deep_model
+
+    _seed_best_run("m")
+    client = _mock_client(load_fail=True)
+    out = run_deep_model(client, "m")
+    assert out["status"] == "failed"
+    assert out["reason"], "expected the load error as reason"
+    assert client.load_model.call_count == 1
+    assert client.chat_completion.call_count == 0
+    assert [t["status"] for t in out["tasks"]] == ["failed"] * 5
     assert "deep" in out["report_path"]
 
 
