@@ -794,24 +794,72 @@ def benchmark(
 
 @app.command()
 def deep(
-    model: str = typer.Option(..., "--model", help="Model ID (must have a stored best config)"),
+    model: str | None = typer.Option(
+        None, "--model", help="Single model ID (must have a stored best config)"
+    ),
+    models: list[str] | None = typer.Option(
+        None, "--models", help="Model IDs (repeatable, comma-separated, or '--models a b')"
+    ),
+    all_optimized: bool = typer.Option(
+        False, "--all-optimized", help="Run all models having a stored best config"
+    ),
+    extra_models: list[str] | None = typer.Argument(
+        None, help="Extra model IDs (lets 'deep --models a b' work literally)"
+    ),
     output: Path = typer.Option(Path("results/deep"), "--output", help="Deep report output directory"),
     context: int | None = typer.Option(
         None, "--context", help="Override context length (default: best-config context)"
     ),
 ):
-    """Run the fixed deep-research suite on a model's stored best config.
+    """Run the fixed deep-research suite on stored best configs.
 
-    Refuses with a reason when the model has no stored best config (never
-    a silent default). Fail-closed unload before and after.
+    Single: ``deep --model <id>``. Batch: ``deep --models a b`` (also
+    repeatable ``--models a --models b``) or ``deep --all-optimized``.
+    Refuses with a reason when a model has no stored best config (never
+    a silent default). Fail-closed unload before and after; batch never
+    aborts early and resumes completed models from disk.
     """
-    from lm_optimizer.services.deep import NoBestConfigError, run_deep_model_async
+    from lm_optimizer.services.deep import (
+        NoBestConfigError,
+        list_optimized_models,
+        run_deep_batch_async,
+        run_deep_model_async,
+    )
 
     setup_logging()
+
+    def _resolve_targets() -> list[str]:
+        if all_optimized:
+            return list_optimized_models()
+        merged: list[str] = []
+        if model:
+            merged.append(model)
+        for token in models or []:
+            merged.extend(
+                [p for p in token.replace(",", " ").split() if p.strip()] or [token]
+            )
+        for token in extra_models or []:
+            merged.extend(
+                [p for p in token.replace(",", " ").split() if p.strip()] or [token]
+            )
+        seen: set[str] = set()
+        out: list[str] = []
+        for mid in merged:
+            if mid not in seen:
+                seen.add(mid)
+                out.append(mid)
+        return out
 
     async def _deep():
         client = get_client()
         try:
+            targets = _resolve_targets()
+            if all_optimized and not targets:
+                console.print("[red]No models with a stored best config (run optimize first).[/red]")
+                sys.exit(1)
+            if not targets:
+                console.print("[red]Specify --model <id>, --models a b, or --all-optimized.[/red]")
+                sys.exit(2)
             await client.connect()
             snap = await prepare_host(client, purpose="deep")
             for line in format_snapshot(snap):
@@ -819,44 +867,72 @@ def deep(
             if not snap.get("verified_empty") and snap.get("leftovers"):
                 console.print("[red]Stale models loaded, aborting. Unload them first.[/red]")
                 sys.exit(1)
-            try:
-                await assert_unloaded(client, purpose=f"deep:{model}:pre")
-            except UnloadNotClean as e:
-                console.print(f"[red]Host not clean, aborting:[/red] {e}")
-                sys.exit(1)
+            if len(targets) == 1 and not all_optimized:
+                single = targets[0]
+                try:
+                    await assert_unloaded(client, purpose=f"deep:{single}:pre")
+                except UnloadNotClean as e:
+                    console.print(f"[red]Host not clean, aborting:[/red] {e}")
+                    sys.exit(1)
 
-            try:
-                out = await run_deep_model_async(
-                    client, model, load_config=None, out_dir=str(output), context_length=context
-                )
-            except NoBestConfigError as e:
-                console.print(f"[red]{e}[/red]")
-                sys.exit(1)
-            except UnloadNotClean as e:
-                console.print(f"[red]Host not clean:[/red] {e}")
-                sys.exit(1)
+                try:
+                    out = await run_deep_model_async(
+                        client, single, load_config=None, out_dir=str(output), context_length=context
+                    )
+                except NoBestConfigError as e:
+                    console.print(f"[red]{e}[/red]")
+                    sys.exit(1)
+                except UnloadNotClean as e:
+                    console.print(f"[red]Host not clean:[/red] {e}")
+                    sys.exit(1)
 
-            table = Table(title=f"Deep results: {model} ({out['status']})")
-            table.add_column("Task", style="cyan")
+                table = Table(title=f"Deep results: {single} ({out['status']})")
+                table.add_column("Task", style="cyan")
+                table.add_column("Status", justify="center")
+                table.add_column("Gen tok/s", justify="right")
+                table.add_column("Elapsed s", justify="right")
+                table.add_column("Thinking chars", justify="right")
+                for t in out["tasks"]:
+                    table.add_row(
+                        t["name"],
+                        t["status"],
+                        f"{t['gen_tok_s']:.1f}",
+                        f"{t['elapsed_s']:.1f}",
+                        str(t["thinking_chars"]),
+                    )
+                console.print(table)
+                if out.get("reason"):
+                    console.print(f"[yellow]{out['reason']}[/yellow]")
+                console.print(f"[green]Deep report saved: {out['report_path']}[/green]")
+
+                try:
+                    await assert_unloaded(client, purpose=f"deep:{single}:post")
+                except UnloadNotClean as e:
+                    console.print(f"[red]Done, but host not clean:[/red] {e}")
+                    sys.exit(1)
+                return
+
+            batch = await run_deep_batch_async(
+                client, targets, out_dir=str(output), context_length=context
+            )
+            table = Table(title="Deep batch results")
+            table.add_column("Model", style="cyan")
             table.add_column("Status", justify="center")
-            table.add_column("Gen tok/s", justify="right")
-            table.add_column("Elapsed s", justify="right")
-            table.add_column("Thinking chars", justify="right")
-            for t in out["tasks"]:
+            table.add_column("Reason")
+            table.add_column("Report")
+            for mid in targets:
+                info = batch["models"].get(mid, {"status": "skipped", "reason": "not run"})
                 table.add_row(
-                    t["name"],
-                    t["status"],
-                    f"{t['gen_tok_s']:.1f}",
-                    f"{t['elapsed_s']:.1f}",
-                    str(t["thinking_chars"]),
+                    mid,
+                    str(info.get("status")),
+                    str((info.get("reason") or "")[:100]),
+                    str(info.get("report_path") or "-"),
                 )
             console.print(table)
-            if out.get("reason"):
-                console.print(f"[yellow]{out['reason']}[/yellow]")
-            console.print(f"[green]Deep report saved: {out['report_path']}[/green]")
+            console.print(f"[green]Deep batch summary saved: {batch['summary_path']}[/green]")
 
             try:
-                await assert_unloaded(client, purpose=f"deep:{model}:post")
+                await assert_unloaded(client, purpose="deep-batch:post")
             except UnloadNotClean as e:
                 console.print(f"[red]Done, but host not clean:[/red] {e}")
                 sys.exit(1)

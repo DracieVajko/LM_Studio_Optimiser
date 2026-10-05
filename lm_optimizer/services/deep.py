@@ -30,7 +30,7 @@ from lm_optimizer.services.reporting import (
     _config_outputs,
     sanitize_model_filename,
 )
-from lm_optimizer.services.unload_guard import UnloadNotClean
+from lm_optimizer.services.unload_guard import UnloadNotClean, assert_unloaded
 
 logger = get_logger(__name__)
 
@@ -410,5 +410,262 @@ def run_deep_model(
             context_length=context_length,
             service=service,
             stamp=stamp,
+        )
+    )
+
+
+def _deep_reports_for(model_id: str, out_dir: Path) -> list[Path]:
+    """All per-model deep reports on disk, newest first (by name)."""
+    stem = sanitize_model_filename(model_id)
+    try:
+        cands = list(Path(out_dir).glob(f"{stem}-deep-*.md"))
+    except OSError:
+        return []
+    return sorted(cands, key=lambda p: p.name, reverse=True)
+
+
+def _is_completed_report(path: Path) -> bool:
+    """A report counts for resume only when it records Status: completed."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    for line in text.splitlines():
+        if line.strip() == "- Status: completed":
+            return True
+    return False
+
+
+def _find_completed_report(model_id: str, out_dir: str | Path) -> Path | None:
+    """Newest completed per-model report, or None (failed reports rerun)."""
+    for p in _deep_reports_for(model_id, Path(out_dir)):
+        if _is_completed_report(p):
+            return p
+    return None
+
+
+def list_optimized_models(repo=None) -> list[str]:
+    """Model ids having a stored best config (never a silent default)."""
+    if repo is None:
+        from lm_optimizer.database import repositories as _repos
+
+        model_ids = [m.id for m in _repos.model_repo.list_all()]
+    else:
+        model_ids = [m.id for m in repo.list_all()]
+    out = []
+    for mid in model_ids:
+        try:
+            resolve_best_config(mid)
+        except NoBestConfigError:
+            continue
+        except Exception:
+            continue
+        else:
+            out.append(mid)
+    return sorted(out)
+
+
+def _write_batch_summary(models: dict, out_dir: Path, stamp: str) -> Path:
+    """Batch summary .md (ASCII-only): per-model status + report links."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"deep-batch-{stamp}.md"
+    n_ok = sum(1 for v in models.values() if v.get("status") == "completed")
+    n_fail = sum(1 for v in models.values() if v.get("status") == "failed")
+    n_skip = sum(1 for v in models.values() if v.get("status") not in ("completed", "failed"))
+    lines = [
+        f"# Deep batch summary: {stamp}",
+        "",
+        f"- Date: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        f"- Models: {len(models)} (completed {n_ok}, failed {n_fail}, skipped {n_skip})",
+        f"- Per-model output cap: {MAX_OUTPUT_TOKENS_PER_TASK} tokens",
+        f"- Consecutive-error abort cap: {MAX_CONSECUTIVE_ERRORS}",
+        "",
+        "## Per-model results",
+        "",
+        "| Model | Status | Reason | Report |",
+        "| --- | --- | --- | --- |",
+    ]
+    for mid in sorted(models):
+        info = models[mid]
+        reason = (info.get("reason") or "")[:160].replace("|", "/").replace("\n", " ")
+        report = info.get("report_path") or ""
+        try:
+            report = str(Path(report).name) if report else "-"
+        except Exception:
+            report = "-"
+        lines.append(f"| {mid} | {info.get('status')} | {reason or '-'} | {report} |")
+    lines += [""]
+    path.write_text("\n".join(lines), encoding="utf-8")
+    logger.info("Deep batch summary saved", path=str(path))
+    return path
+
+
+async def run_deep_batch_async(
+    client,
+    model_ids: list[str],
+    *,
+    out_dir: str | Path | None = None,
+    stamp: str | None = None,
+    context_length: int | None = None,
+) -> dict:
+    """Run the deep suite sequentially over models; never aborts the batch.
+
+    Unload guard between models (assert_unloaded before AND after each
+    model); per-model budget caps live in run_deep_model_async (reused
+    as-is, single load per model). Skip-done resume reuses completed
+    per-model reports on disk. Failures (incl. UnloadNotClean and missing
+    best config) are recorded per model with a reason. Never continues
+    dirty: when the server cannot be verified empty, remaining models are
+    recorded as skipped with a reason instead of measuring blind.
+    """
+    target = Path(out_dir) if out_dir is not None else _default_deep_dir()
+    target.mkdir(parents=True, exist_ok=True)
+    batch_stamp = stamp or datetime.now().strftime("%Y%m%d-%H%M%S")
+    wanted = list(model_ids or [])
+    models: dict[str, dict] = {}
+
+    def _skip_rest(from_idx: int, reason: str) -> None:
+        for rest in wanted[from_idx:]:
+            if rest not in models:
+                models[rest] = {
+                    "status": "skipped",
+                    "reason": reason,
+                    "report_path": None,
+                    "resumed": False,
+                }
+
+    idx = 0
+    while idx < len(wanted):
+        mid = wanted[idx]
+        done = _find_completed_report(mid, target)
+        if done is not None:
+            models[mid] = {
+                "status": "completed",
+                "reason": f"already completed; reused {done.name}",
+                "report_path": str(done),
+                "resumed": True,
+            }
+            idx += 1
+            continue
+        try:
+            await assert_unloaded(client, purpose=f"deep-batch:{mid}:pre")
+        except UnloadNotClean as e:
+            models[mid] = {
+                "status": "failed",
+                "reason": f"pre-model unload guard: {e}",
+                "report_path": None,
+                "resumed": False,
+            }
+            _skip_rest(
+                idx + 1,
+                f"skipped: host not clean before {mid}; refusing to measure blind",
+            )
+            break
+        try:
+            out = await run_deep_model_async(
+                client,
+                mid,
+                load_config=None,
+                out_dir=target,
+                context_length=context_length,
+                stamp=batch_stamp,
+            )
+        except NoBestConfigError as e:
+            models[mid] = {
+                "status": "skipped",
+                "reason": str(e),
+                "report_path": None,
+                "resumed": False,
+            }
+            try:
+                await assert_unloaded(client, purpose=f"deep-batch:{mid}:post-skip")
+            except UnloadNotClean:
+                _skip_rest(
+                    idx + 1,
+                    f"skipped: host not clean after {mid}; refusing to measure blind",
+                )
+                break
+            idx += 1
+            continue
+        except UnloadNotClean as e:
+            latest = _deep_reports_for(mid, target)
+            rep = str(latest[0]) if latest else None
+            models[mid] = {
+                "status": "failed",
+                "reason": f"unload guard: {e}",
+                "report_path": rep,
+                "resumed": False,
+            }
+            try:
+                await assert_unloaded(
+                    client, purpose=f"deep-batch:{mid}:post-unload-failure"
+                )
+            except UnloadNotClean:
+                _skip_rest(
+                    idx + 1,
+                    f"skipped: host not clean after {mid}; refusing to measure blind",
+                )
+                break
+            idx += 1
+            continue
+        except Exception as e:
+            models[mid] = {
+                "status": "failed",
+                "reason": f"{type(e).__name__}: {e}",
+                "report_path": None,
+                "resumed": False,
+            }
+            try:
+                await assert_unloaded(client, purpose=f"deep-batch:{mid}:post-failure")
+            except UnloadNotClean:
+                _skip_rest(
+                    idx + 1,
+                    f"skipped: host not clean after {mid}; refusing to measure blind",
+                )
+                break
+            idx += 1
+            continue
+        models[mid] = {
+            "status": out.get("status", "completed"),
+            "reason": out.get("reason"),
+            "report_path": out.get("report_path"),
+            "resumed": False,
+            "summary": out.get("summary"),
+        }
+        try:
+            await assert_unloaded(client, purpose=f"deep-batch:{mid}:post")
+        except UnloadNotClean:
+            _skip_rest(
+                idx + 1,
+                f"skipped: host not clean after {mid}; refusing to measure blind",
+            )
+            break
+        idx += 1
+
+    summary_path = _write_batch_summary(models, target, batch_stamp)
+    return {
+        "models": models,
+        "summary_path": str(summary_path),
+        "batch_stamp": batch_stamp,
+        "out_dir": str(target),
+    }
+
+
+def run_deep_batch(
+    client,
+    model_ids: list[str],
+    *,
+    out_dir: str | Path | None = None,
+    stamp: str | None = None,
+    context_length: int | None = None,
+) -> dict:
+    """Sync wrapper around run_deep_batch_async (tests + simple callers)."""
+    return asyncio.run(
+        run_deep_batch_async(
+            client,
+            model_ids,
+            out_dir=out_dir,
+            stamp=stamp,
+            context_length=context_length,
         )
     )

@@ -207,3 +207,147 @@ def test_deep_cli_registered_with_model_option():
     assert "deep" in info.commands, "CLI must expose a 'deep' command"
     params = [p.name for p in info.commands["deep"].params]
     assert "model" in params, "deep must accept --model"
+
+
+# --- Task 3: multi-model batch with resume (TDD: must FAIL before impl) ---
+
+
+@pytest.fixture
+def mock_client_one_fail():
+    from unittest.mock import AsyncMock, MagicMock
+
+    _seed_best_run("m1")
+    _seed_best_run("m2")
+    c = _mock_client()
+    ok = MagicMock()
+    ok.success = True
+    ok.identifier = "mock-id"
+    ok.loaded_config = None
+    ok.error = None
+    bad = MagicMock()
+    bad.success = False
+    bad.identifier = None
+    bad.loaded_config = None
+    bad.error = "mock load refused for m1"
+
+    async def _load(model_id, cfg=None, **kwargs):
+        if model_id == "m1":
+            return bad
+        return ok
+
+    c.load_model = AsyncMock(side_effect=_load)
+    return c
+
+
+def test_batch_continues_after_model_failure(mock_client_one_fail):
+    from lm_optimizer.services.deep import run_deep_batch
+
+    out = run_deep_batch(mock_client_one_fail, ["m1", "m2"])
+    assert out["models"]["m1"]["status"] == "failed"
+    assert out["models"]["m2"]["status"] == "completed"
+
+
+def test_batch_skips_model_without_best_config():
+    from lm_optimizer.services.deep import run_deep_batch
+
+    _seed_best_run("has-best")
+    client = _mock_client()
+    out = run_deep_batch(client, ["has-best", "never-optimized-model"])
+    assert out["models"]["has-best"]["status"] == "completed"
+    assert out["models"]["never-optimized-model"]["status"] == "skipped"
+    assert "no stored best" in (out["models"]["never-optimized-model"]["reason"] or "").lower()
+
+
+def test_batch_resume_reuses_completed_report():
+    from lm_optimizer.services.deep import run_deep_batch
+
+    _seed_best_run("r1")
+    client = _mock_client()
+    first = run_deep_batch(client, ["r1"])
+    assert first["models"]["r1"]["status"] == "completed"
+    n_loads = client.load_model.call_count
+    assert n_loads == 1
+
+    # Second run with a client that would explode if asked to measure.
+    client2 = _mock_client(fail=True)
+    client2.load_model = AsyncMock(side_effect=AssertionError("must not reload resumed model"))
+    client2.chat_completion = AsyncMock(side_effect=AssertionError("must not re-measure"))
+    second = run_deep_batch(client2, ["r1"])
+    assert second["models"]["r1"]["report_path"] == first["models"]["r1"]["report_path"]
+    assert second["models"]["r1"].get("resumed") is True
+
+
+def test_batch_unload_failure_records_and_continues():
+    from unittest.mock import AsyncMock
+
+    from lm_optimizer.services.deep import run_deep_batch
+
+    _seed_best_run("u1")
+    _seed_best_run("u2")
+    client = _mock_client()
+    orig_unloaded = client.ensure_unloaded
+
+    async def _unloaded(model_id=None, **kwargs):
+        if model_id == "u1":
+            return False  # force UnloadNotClean from the single-model runner
+        return True
+
+    client.ensure_unloaded = AsyncMock(side_effect=_unloaded)
+    out = run_deep_batch(client, ["u1", "u2"])
+    assert out["models"]["u1"]["status"] == "failed"
+    assert "unload" in (out["models"]["u1"]["reason"] or "").lower()
+    assert out["models"]["u2"]["status"] == "completed"
+
+
+def test_batch_dirty_host_skips_remaining():
+    from unittest.mock import AsyncMock
+
+    from lm_optimizer.services.deep import run_deep_batch
+
+    _seed_best_run("d1")
+    _seed_best_run("d2")
+    client = _mock_client()
+    client.ensure_unloaded = AsyncMock(return_value=False)
+    client.get_loaded_instances = AsyncMock(
+        return_value=[{"model": "d1", "instance_id": "stub-1"}]
+    )
+    out = run_deep_batch(client, ["d1", "d2"])
+    assert out["models"]["d1"]["status"] == "failed"
+    assert out["models"]["d2"]["status"] == "skipped"
+    assert "not clean" in (out["models"]["d2"]["reason"] or "").lower()
+
+
+def test_batch_writes_summary_md():
+    from pathlib import Path
+
+    from lm_optimizer.services.deep import run_deep_batch
+
+    _seed_best_run("s1")
+    client = _mock_client()
+    out = run_deep_batch(client, ["s1"])
+    assert "summary_path" in out
+    p = Path(out["summary_path"])
+    assert p.exists(), "batch must write a summary .md"
+    text = p.read_text(encoding="utf-8")
+    assert "s1" in text
+    text.encode("ascii")  # ASCII-only reports
+
+
+def test_deep_cli_has_models_and_all_optimized_options():
+    import typer
+
+    from lm_optimizer.cli.main import app
+
+    info = typer.main.get_command(app)
+    params = [p.name for p in info.commands["deep"].params]
+    assert "models" in params, "deep must accept --models"
+    assert "all_optimized" in params, "deep must accept --all-optimized"
+
+
+def test_list_optimized_models_resolves_only_with_best():
+    from lm_optimizer.services.deep import list_optimized_models
+
+    _seed_best_run("opt-a")
+    got = list_optimized_models()
+    assert "opt-a" in got
+    assert "never-optimized-model" not in got
