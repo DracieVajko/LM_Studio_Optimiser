@@ -544,6 +544,91 @@ def _context_trio(tested: list) -> dict:
     }
 
 
+def _cell(text: object) -> str:
+    """Markdown-table-safe cell: pipe-escape, flatten newlines, drop controls."""
+    t = "" if text is None else str(text)
+    t = t.replace("|", "\\|").replace("\r", " ").replace("\n", " ")
+    return "".join(ch if ord(ch) >= 32 else " " for ch in t)
+
+
+def _all_configs_rows(configs: list, best_id) -> list[str]:
+    """Every tried config as markdown rows: score-descending, failed bottom.
+
+    Consumes ConfigurationResult fields (status, score, metrics, error).
+    Failed rows carry status + trimmed error only (no metrics exist there,
+    so metric cells render n/a rather than invented values). `best_id` is
+    accepted for winner-annotation compatibility; ordering stays score-based
+    so winner selection and scoring are untouched.
+    """
+
+    def _status(c) -> str:
+        try:
+            return c.status.value
+        except Exception:
+            return str(getattr(c, "status", "unknown"))
+
+    def _rank(c) -> float:
+        try:
+            return float(c.score) if c.score is not None else float("-inf")
+        except (TypeError, ValueError):
+            return float("-inf")
+
+    passed = [c for c in configs if _status(c) == "passed"]
+    failed = [c for c in configs if _status(c) != "passed"]
+    passed.sort(key=_rank, reverse=True)
+    ordered = passed + failed
+
+    def _gen_str(c) -> str:
+        try:
+            speeds = [
+                m.generation_tok_s
+                for m in (c.metrics or [])
+                if m.success and m.generation_tok_s
+            ]
+            if not speeds:
+                return "n/a"
+            return f"{c.get_avg_generation_tok_s():.1f}"
+        except Exception:
+            return "n/a"
+
+    def _quality_str(c) -> str:
+        try:
+            q = c.quality_score.overall if c.quality_score else None
+            return f"{float(q):.3f}" if q is not None else "n/a"
+        except (TypeError, ValueError):
+            return "n/a"
+
+    def _score_cell(c) -> str:
+        try:
+            return f"{float(c.score):.3f}" if c.score is not None else "n/a"
+        except (TypeError, ValueError):
+            return "n/a"
+
+    def _kv(c) -> str:
+        v = c.config.offload_kv_cache_to_gpu
+        return "n/a" if v is None else ("GPU" if v else "CPU")
+
+    rows = [
+        "| # | Ctx | Flash | KV | Eval | Phys | Parallel | Checkpoints | "
+        "Experts | Status | Score | Gen tok/s | Quality | Error |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | "
+        "--- | --- | --- | --- |",
+    ]
+    for i, c in enumerate(ordered, 1):
+        rows.append(
+            f"| {i} | {_cell(_fmt(c.context_length, 'n/a'))} | "
+            f"{_cell(_fmt(c.config.flash_attention, 'n/a'))} | {_cell(_kv(c))} | "
+            f"{_cell(_fmt(c.config.eval_batch_size, 'n/a'))} | "
+            f"{_cell(_fmt(c.config.physical_batch_size, 'n/a'))} | "
+            f"{_cell(_fmt(c.config.parallel, 'n/a'))} | "
+            f"{_cell(_fmt(c.config.context_checkpoints, 'n/a'))} | "
+            f"{_cell(_fmt(c.config.num_experts, 'n/a'))} | {_cell(_status(c))} | "
+            f"{_cell(_score_cell(c))} | {_cell(_gen_str(c))} | "
+            f"{_cell(_quality_str(c))} | {_cell(str(c.error or '')[:120])} |"
+        )
+    return rows
+
+
 def save_best_report(
     run: OptimizationRun,
     out_dir: str | Path = "results",
@@ -648,6 +733,12 @@ def save_best_report(
             "Apply via REST: POST /api/v1/models/load with the flat parameters above "
             "(gpu_ratio excluded). GUI-only items (KV quant, offload ratio, threads) "
             "must be set on the host.",
+            "",
+            "## All tried configurations (score-descending, failed bottom)",
+            "",
+        ]
+        + _all_configs_rows(configs, best.id)
+        + [
             "",
             "## Control channels (per parameter, registry-driven)",
             "",
