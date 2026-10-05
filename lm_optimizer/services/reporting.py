@@ -237,6 +237,8 @@ def save_failed_report(
             f"{getattr(c.status, 'value', c.status)} | "
             f"{str(c.error or '')[:120]} |"
         )
+    lines += [""]
+    lines += _full_outputs_section(_appendix_order(configs))
     lines += ["", "## Closest config per-test breakdown", ""]
     if closest is not None:
         try:
@@ -629,6 +631,107 @@ def _all_configs_rows(configs: list, best_id) -> list[str]:
     return rows
 
 
+def _fence_block(text: object) -> list[str]:
+    """Fenced verbatim block: inner fences escaped, pipes left untouched.
+
+    Pipe-escaping is for table cells only; inside fenced blocks model text
+    stays verbatim and only inner ``` fences are neutralized so the block
+    never breaks.
+    """
+    t = "" if text is None else str(text)
+    t = t.replace("\r\n", "\n").replace("\r", "\n")
+    t = t.replace("```", "` ` `")
+    return ["```", t, "```"]
+
+
+def _config_outputs(config) -> list[str]:
+    """Per-test Prompt / Thinking / Output sections for one config.
+
+    Consumes BenchmarkMetrics (test_name, prompt, thinking_text,
+    output_text). Empty thinking renders `n/a (non-reasoning or
+    unrecorded)`; configs with no metrics render one status line.
+    """
+    try:
+        status = config.status.value
+    except Exception:
+        status = str(getattr(config, "status", "unknown"))
+    try:
+        metrics = list(config.metrics or [])
+    except Exception:
+        metrics = []
+    if not metrics:
+        return [f"no measurements recorded ({status})"]
+    lines: list[str] = []
+    for m in metrics:
+        lines.append(f"### {getattr(m, 'test_name', '?')}")
+        lines.append("")
+        lines.append("Prompt:")
+        lines += _fence_block(getattr(m, "prompt", "") or "")
+        lines.append("")
+        lines.append("Thinking:")
+        thinking = getattr(m, "thinking_text", "") or ""
+        if not thinking.strip():
+            thinking = "n/a (non-reasoning or unrecorded)"
+        lines += _fence_block(thinking)
+        lines.append("")
+        lines.append("Output:")
+        lines += _fence_block(getattr(m, "output_text", "") or "")
+        lines.append("")
+    return lines
+
+
+def _appendix_order(configs: list) -> list:
+    """Table-consistent order: passed by score desc, failed bottom."""
+    def _key(c):
+        try:
+            failed = c.status.value != "passed"
+        except Exception:
+            failed = str(getattr(c, "status", "")) != "passed"
+        try:
+            s = float(c.score) if c.score is not None else None
+        except (TypeError, ValueError):
+            s = None
+        return (failed, -(s if s is not None else float("-inf")))
+
+    return sorted(configs, key=_key)
+
+
+def _full_outputs_section(configs: list) -> list[str]:
+    """Appendix: full verbatim outputs of every config, with total size."""
+    total = 0
+    for c in configs:
+        try:
+            members = c.metrics or []
+        except Exception:
+            continue
+        for m in members:
+            for part in (
+                getattr(m, "prompt", ""),
+                getattr(m, "thinking_text", ""),
+                getattr(m, "output_text", ""),
+            ):
+                try:
+                    total += len(part or "")
+                except Exception:
+                    continue
+    lines = [
+        "## Full outputs (all configs, verbatim)",
+        "",
+        f"- Full outputs size: {total} chars "
+        "(verbatim prompts, thinking traces and outputs).",
+        "",
+    ]
+    for c in configs:
+        try:
+            status = c.status.value
+        except Exception:
+            status = str(getattr(c, "status", "unknown"))
+        lines += [f"### Config {c.id} (ctx {c.context_length}, {status})", ""]
+        lines += _config_outputs(c)
+        lines += [""]
+    return lines
+
+
 def save_best_report(
     run: OptimizationRun,
     out_dir: str | Path = "results",
@@ -738,6 +841,8 @@ def save_best_report(
             "",
         ]
         + _all_configs_rows(configs, best.id)
+        + [""]
+        + _full_outputs_section(_appendix_order(configs))
         + [
             "",
             "## Control channels (per parameter, registry-driven)",
