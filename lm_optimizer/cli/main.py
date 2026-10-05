@@ -1223,6 +1223,61 @@ def runs(
     console.print(table)
 
 
+@app.command(name="re-report")
+def re_report(
+    model: str | None = typer.Option(None, "--model", help="Only re-report runs for this model ID"),
+    all_runs: bool = typer.Option(False, "--all", help="Re-report all stored runs"),
+    output: Path = typer.Option("results", "--output", help="Report output directory"),
+):
+    """Regenerate .md reports from stored DB runs (backfill, never modifies the DB).
+
+    Winner runs regenerate via save_best_report, winnerless runs via
+    save_failed_report. Corrupt/missing rows are skipped with a count,
+    never aborting the batch.
+    """
+    setup_logging()
+
+    if model:
+        lean = run_repo.get_by_model(model, 10000)
+    else:
+        lean = run_repo.list_all(10000)
+    _ = all_runs  # explicit flag; bare invocation also covers all stored runs.
+
+    regenerated = 0
+    skipped: dict[str, int] = {}
+
+    def _skip(reason: str) -> None:
+        skipped[reason] = skipped.get(reason, 0) + 1
+
+    for row in lean:
+        try:
+            run = run_repo.get(str(row.id))
+        except Exception as e:
+            logger.debug("re-report: unreadable run row", error=str(e))
+            _skip(f"unreadable run row ({type(e).__name__})")
+            continue
+        if run is None:
+            _skip("run row missing")
+            continue
+        try:
+            if run.get_best_config() is not None:
+                path = save_best_report(run, out_dir=str(output))
+            else:
+                path = save_failed_report(run, out_dir=str(output))
+        except Exception as e:
+            logger.debug("re-report: saver failed", error=str(e))
+            _skip(f"saver error ({type(e).__name__})")
+            continue
+        if path is None:
+            _skip("nothing to report (no configurations)")
+            continue
+        regenerated += 1
+
+    n_skipped = sum(skipped.values())
+    detail = "; ".join(f"{k}: {v}" for k, v in sorted(skipped.items())) or "none"
+    console.print(f"regenerated {regenerated}, skipped {n_skipped} ({detail})")
+
+
 TEST_MODEL_IDS = {"m", "resume-model-x", "isolation-probe", "iso-ckpt"}
 
 
