@@ -1,0 +1,83 @@
+# Deep Research Custom Prompts Override
+# Place this file as ./deep_prompts.yaml (repo root) or ./config/deep_prompts.yaml
+# to override the built-in deep-research prompts.
+#
+# Each prompt entry must have:
+#   - name: Must match one of the built-in case names to override it, or use a new name to add
+#   - prompt: The full prompt text
+#   - category: One of: recall, reasoning, format, coding, instruction, custom
+#   - max_tokens: Maximum output tokens for this task
+#
+# Built-in case names: long_context_recall, multi_hop, json_discipline, coding_precision, instruction_follow
+#
+# Override behavior: Entries with matching 'name' replace the built-in prompt.
+# Entries with new names are appended to the suite.
+
+prompts:
+  - name: "Custom Recall Test"
+    prompt: |
+      Read the document below carefully. Then answer each question
+      using only facts stated in the document.
+
+      DOCUMENT:
+      [YOUR DOCUMENT HERE]
+
+      QUESTIONS:
+      1. What is the first fact?
+      2. What is the second fact?
+      3. What is the third fact?
+
+      Answer as a numbered list with one fact per line.
+    category: "recall"
+    max_tokens: 8192
+
+  - name: "multi_hop"
+    prompt: |
+      Solve this multi-step reasoning problem step by step.
+
+      A factory produces widgets. Machine A produces 100 widgets/hour.
+      Machine B produces 1.5x what Machine A produces.
+      Machine C produces the average of Machine A and Machine B.
+      Machine D produces 20% less than Machine C.
+
+      What is the total hourly production of all four machines?
+      Show each machine's output and the total.
+    category: "reasoning"
+    max_tokens: 4096
+
+  - name: "json_discipline"
+    prompt: |
+      Output a JSON object with exactly these keys:
+      "project", "version", "stages" (array of exactly 4 strings),
+      "dependencies" (array of objects with "name" and "version"),
+      and "metadata" (object with "owner", "created", "tags" array).
+      Use realistic values for a software library project.
+      No extra text, no markdown fences, just the JSON object.
+    category: "format"
+    max_tokens: 2048
+
+  - name: "coding_precision"
+    prompt: |
+      Write a Python function `find_longest_substring(s: str, k: int) -> str`
+      that returns the longest substring of s containing at most k distinct characters.
+      Requirements:
+      1. Run in O(n) time complexity
+      2. Use O(k) extra space
+      3. Return empty string if k == 0 or s is empty
+      4. No imports beyond typing
+
+      Provide only the function definition with docstring.
+    category: "coding"
+    max_tokens: 4096
+
+  - name: "instruction_follow"
+    prompt: |
+      Follow these instructions exactly:
+      1. Write exactly 5 lines.
+      2. Each line must start with "Step N:" where N is 1-5.
+      3. Step 2 must contain the word "anchor".
+      4. Step 4 must contain a number greater than 100.
+      5. Step 5 must end with an exclamation mark.
+      6. Do not add any extra lines, headers, or explanations.
+    category: "instruction"
+    max_tokens: 1024

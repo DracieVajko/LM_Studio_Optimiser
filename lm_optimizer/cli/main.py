@@ -810,6 +810,9 @@ def deep(
     context: int | None = typer.Option(
         None, "--context", help="Override context length (default: best-config context)"
     ),
+    prompts_file: Path | None = typer.Option(
+        None, "--prompts-file", help="YAML file with custom prompts (overrides CWD/config defaults)"
+    ),
 ):
     """Run the fixed deep-research suite on stored best configs.
 
@@ -818,15 +821,24 @@ def deep(
     Refuses with a reason when a model has no stored best config (never
     a silent default). Fail-closed unload before and after; batch never
     aborts early and resumes completed models from disk.
+
+    Custom prompts: provide ``--prompts-file path/to/deep_prompts.yaml`` to
+    override the built-in suite. File is merged by prompt ``name``.
     """
     from lm_optimizer.services.deep import (
         NoBestConfigError,
         list_optimized_models,
+        load_deep_prompts,
         run_deep_batch_async,
         run_deep_model_async,
     )
 
     setup_logging()
+
+    # Load custom prompts if provided
+    custom_prompts = None
+    if prompts_file:
+        custom_prompts = load_deep_prompts(str(prompts_file))
 
     def _resolve_targets() -> list[str]:
         if all_optimized:
@@ -877,7 +889,7 @@ def deep(
 
                 try:
                     out = await run_deep_model_async(
-                        client, single, load_config=None, out_dir=str(output), context_length=context
+                        client, single, load_config=None, out_dir=str(output), context_length=context, prompts=custom_prompts
                     )
                 except NoBestConfigError as e:
                     console.print(f"[red]{e}[/red]")
@@ -913,7 +925,7 @@ def deep(
                 return
 
             batch = await run_deep_batch_async(
-                client, targets, out_dir=str(output), context_length=context
+                client, targets, out_dir=str(output), context_length=context, prompts=custom_prompts
             )
             table = Table(title="Deep batch results")
             table.add_column("Model", style="cyan")

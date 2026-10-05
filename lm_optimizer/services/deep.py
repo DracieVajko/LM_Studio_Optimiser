@@ -13,6 +13,9 @@ Reports reuse the full-visibility helpers (``_all_configs_rows``,
 import asyncio
 from datetime import datetime
 from pathlib import Path
+from typing import Any
+
+import yaml
 
 from lm_optimizer.benchmark.deep_suite import DEEP_CASES, deep_metrics
 from lm_optimizer.config import config as _app_config
@@ -36,6 +39,223 @@ logger = get_logger(__name__)
 
 MAX_OUTPUT_TOKENS_PER_TASK = 8192
 MAX_CONSECUTIVE_ERRORS = 3
+
+
+# Built-in default prompts (mirrored from deep_suite._DEEP_PROMPTS for override merging)
+DEEP_PROMPT_DEFAULTS: list[dict[str, Any]] = [
+    {
+        "name": "long_context_recall",
+        "prompt": (
+            "Read the document below carefully. Then answer each question "
+            "using only facts stated in the document.\n\n"
+            "DOCUMENT:\n"
+            "FIELD SURVEY OF GULL ISLAND (synthetic document).\n\n"
+            "Section 1: Arrival.\n"
+            "The survey team reached Gull Island after a three-day crossing. "
+            "The harbor lighthouse keeper is named MARLOWE. "
+            "He keeps the lamp lit from dusk until dawn and logs every vessel.\n\n"
+            "Section 2: Supplies.\n"
+            "Provisions arrive by sea. The supply ship arrives on the 14th of HARVEST month. "
+            "Crates are stored in the stone depot above the dock.\n\n"
+            "Section 3: Research station.\n"
+            "The vault access code is 73921. "
+            "Only station staff may enter the vault where samples are kept.\n\n"
+            "Section 4: Flora.\n"
+            "The botanist catalogued 47 fern species on Gull Island. "
+            "Most grow on the shaded northern slopes near the stream.\n\n"
+            "Section 5: History.\n"
+            "The treaty was signed in the year 1848 at Port Ansel. "
+            "A plaque at the harbor commemorates the event.\n\n"
+            "Section 6: Notes.\n"
+            "Winds are strongest in winter. Gulls nest on the eastern cliffs. "
+            "Fresh water comes from the hillside spring.\n\n"
+            "QUESTIONS:\n"
+            "1. Who is the harbor lighthouse keeper?\n"
+            "2. When does the supply ship arrive?\n"
+            "3. What is the vault access code?\n"
+            "4. How many fern species did the botanist catalogue on Gull Island?\n"
+            "5. When and where was the treaty signed?\n\n"
+            "Answer as a numbered list with one fact per line."
+        ),
+        "category": "recall",
+        "max_tokens": 2048,
+        "temperature": 0.0,
+        "top_p": None,
+        "top_k": None,
+    },
+    {
+        "name": "multi_hop",
+        "prompt": (
+            "A relay race has four runners. Ana runs first and hands off to Ben. "
+            "Ben is twice as slow as Ana per lap. Cora runs third and her lap time "
+            "is the average of Ana's and Ben's lap times. Dana runs last and her lap "
+            "time is 10 seconds faster than Cora's. Ana's lap time is 60 seconds. "
+            "What is the total team time? Show each runner's lap time step by step, "
+            "then give the total in seconds."
+        ),
+        "category": "reasoning",
+        "max_tokens": 2048,
+        "temperature": 0.3,
+        "top_p": None,
+        "top_k": None,
+    },
+    {
+        "name": "json_discipline",
+        "prompt": (
+            "Output a JSON object with exactly these keys: "
+            '"project", "version", "stages" (array of exactly 3 strings), '
+            'and "meta" (object with keys "author" and "year"). '
+            "Use realistic values for a bridge-building project. "
+            "No extra text, no markdown fences, just the JSON object."
+        ),
+        "category": "format",
+        "max_tokens": 1024,
+        "temperature": 0.0,
+        "top_p": None,
+        "top_k": None,
+    },
+    {
+        "name": "coding_precision",
+        "prompt": (
+            "Write a Python function `is_sorted_unique(nums: list[int]) -> bool` that returns "
+            "True only if the list is strictly increasing (each element greater than the "
+            "previous) with no duplicates. Requirements:\n"
+            "1. Run in O(n) time complexity\n"
+            "2. Use O(1) extra space\n"
+            "3. Handle empty and single-element lists (return True)\n"
+            "4. No imports\n\n"
+            "Provide only the function definition with docstring."
+        ),
+        "category": "coding",
+        "max_tokens": 2048,
+        "temperature": 0.1,
+        "top_p": None,
+        "top_k": None,
+    },
+    {
+        "name": "instruction_follow",
+        "prompt": (
+            "Follow these instructions exactly:\n"
+            "1. Write exactly 4 lines.\n"
+            "2. Each line must start with the word 'Line' followed by its number (Line 1, Line 2, ...).\n"
+            "3. Line 2 must contain the word 'compass'.\n"
+            "4. Line 4 must end with a period.\n"
+            "5. Do not add any extra lines, headers, or explanations."
+        ),
+        "category": "instruction",
+        "max_tokens": 2048,
+        "temperature": 0.3,
+        "top_p": None,
+        "top_k": None,
+    },
+]
+
+
+def _load_yaml_prompts(path: Path) -> list[dict[str, Any]] | None:
+    """Load prompts from a YAML file. Returns None if file missing or invalid."""
+    if not path.exists():
+        return None
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning("Failed to parse deep prompts YAML", path=str(path), error=str(e))
+        return None
+    if not isinstance(data, dict) or "prompts" not in data:
+        logger.warning("Deep prompts YAML missing 'prompts' key", path=str(path))
+        return None
+    prompts = data["prompts"]
+    if not isinstance(prompts, list):
+        logger.warning("Deep prompts YAML 'prompts' must be a list", path=str(path))
+        return None
+    # Validate each entry has required fields
+    valid = []
+    for i, p in enumerate(prompts):
+        if not isinstance(p, dict):
+            logger.warning("Deep prompt entry %d is not a dict, skipping", i)
+            continue
+        if "name" not in p or "prompt" not in p:
+            logger.warning("Deep prompt entry %d missing 'name' or 'prompt', skipping", i)
+            continue
+        valid.append(p)
+    return valid
+
+
+def load_deep_prompts(custom_path: str | Path | None = None) -> list[dict[str, Any]]:
+    """Load deep-research prompts with override precedence.
+
+    Search order (highest priority first):
+      1. ``custom_path`` if provided (explicit CLI --prompts-file)
+      2. ``./deep_prompts.yaml`` (CWD)
+      3. ``config/deep_prompts.yaml`` (config dir)
+      4. Bundled defaults (DEEP_PROMPT_DEFAULTS)
+
+    Override merges by ``name``: YAML entries replace built-ins with the same name;
+    new names are appended. Logs which source was used.
+    """
+    # 1. Explicit custom path
+    if custom_path:
+        custom = Path(custom_path)
+        loaded = _load_yaml_prompts(custom)
+        if loaded is not None:
+            logger.info("Loaded deep prompts from custom path", path=str(custom))
+            return _merge_prompts(loaded)
+        logger.warning("Custom prompts file not found or invalid, falling back", path=str(custom))
+
+    # 2. CWD
+    cwd_path = Path.cwd() / "deep_prompts.yaml"
+    loaded = _load_yaml_prompts(cwd_path)
+    if loaded is not None:
+        logger.info("Loaded deep prompts from CWD", path=str(cwd_path))
+        return _merge_prompts(loaded)
+
+    # 3. Config dir
+    config_dir = Path(_app_config.storage.config_dir)
+    config_path = config_dir / "deep_prompts.yaml"
+    loaded = _load_yaml_prompts(config_path)
+    if loaded is not None:
+        logger.info("Loaded deep prompts from config dir", path=str(config_path))
+        return _merge_prompts(loaded)
+
+    # 4. Bundled defaults
+    logger.info("Using bundled deep prompt defaults")
+    return [dict(p) for p in DEEP_PROMPT_DEFAULTS]
+
+
+def _merge_prompts(override: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Merge override prompts with defaults by name."""
+    defaults_by_name = {p["name"]: p for p in DEEP_PROMPT_DEFAULTS}
+    for p in override:
+        defaults_by_name[p["name"]] = p
+    # Preserve default order, then append any new names from override
+    seen = set()
+    merged = []
+    for p in DEEP_PROMPT_DEFAULTS:
+        if p["name"] in defaults_by_name:
+            merged.append(defaults_by_name[p["name"]])
+            seen.add(p["name"])
+    for p in override:
+        if p["name"] not in seen:
+            merged.append(p)
+    return merged
+
+
+def _prompts_to_cases(prompts: list[dict[str, Any]]) -> list[BenchmarkCase]:
+    """Convert prompt dicts to BenchmarkCase objects."""
+    cases = []
+    for p in prompts:
+        cases.append(
+            BenchmarkCase(
+                name=p["name"],
+                category=p.get("category", "custom"),
+                prompt=p["prompt"],
+                max_tokens=p.get("max_tokens", 2048),
+                temperature=p.get("temperature", 0.0),
+                top_p=p.get("top_p"),
+                top_k=p.get("top_k"),
+                stop_sequences=p.get("stop_sequences"),
+            )
+        )
+    return cases
 
 
 class NoBestConfigError(ValueError):
@@ -219,16 +439,22 @@ async def run_deep_model_async(
     context_length: int | None = None,
     service: BenchmarkService | None = None,
     stamp: str | None = None,
+    prompts: list[dict[str, Any]] | None = None,
 ) -> dict:
-    """Run the fixed deep suite on one model; returns per-task metrics/scores.
+    """Run the deep suite on one model; returns per-task metrics/scores.
 
     ``load_config=None`` resolves the stored best via the run DB and raises
     NoBestConfigError when none exists. Single load/unload cycle per model:
-    all 5 tasks run under one load (repetitions=1, no preheat chats), with a
+    all tasks run under one load (repetitions=1, no preheat chats), with a
     fail-closed unload in ``finally`` that raises UnloadNotClean (after the
     report is written) so library callers get a failure signal instead of a
     logged warning. Task execution reuses BenchmarkService's public channel
     load and single-case measurement; abort and failure counting are unchanged.
+
+    ``prompts``: Optional list of prompt dicts (name, prompt, category, max_tokens,
+    temperature, top_p, top_k). When provided, these replace the built-in suite.
+    When None, loads from YAML (CWD -> config dir -> bundled defaults) via
+    ``load_deep_prompts()``.
     """
     best_run_id: str | None = None
     if load_config is None:
@@ -239,7 +465,11 @@ async def run_deep_model_async(
     service = service or BenchmarkService(client)
     evaluator = QualityEvaluator()
 
-    cases = cap_deep_cases()
+    # Load prompts: explicit param > YAML > defaults
+    if prompts is None:
+        prompts = load_deep_prompts()
+    cases = _prompts_to_cases(prompts)
+    cases = cap_deep_cases(cases)
     collected: list[BenchmarkMetrics] = []
     tasks: list[dict] = []
     quality_by_test: dict = {}
@@ -399,6 +629,7 @@ def run_deep_model(
     context_length: int | None = None,
     service: BenchmarkService | None = None,
     stamp: str | None = None,
+    prompts: list[dict[str, Any]] | None = None,
 ) -> dict:
     """Sync wrapper around run_deep_model_async (tests + simple callers)."""
     return asyncio.run(
@@ -410,6 +641,7 @@ def run_deep_model(
             context_length=context_length,
             service=service,
             stamp=stamp,
+            prompts=prompts,
         )
     )
 
@@ -507,6 +739,7 @@ async def run_deep_batch_async(
     out_dir: str | Path | None = None,
     stamp: str | None = None,
     context_length: int | None = None,
+    prompts: list[dict[str, Any]] | None = None,
 ) -> dict:
     """Run the deep suite sequentially over models; never aborts the batch.
 
@@ -517,6 +750,10 @@ async def run_deep_batch_async(
     best config) are recorded per model with a reason. Never continues
     dirty: when the server cannot be verified empty, remaining models are
     recorded as skipped with a reason instead of measuring blind.
+
+    ``prompts``: Optional list of prompt dicts passed to each model's run.
+    When None, loads from YAML (CWD -> config dir -> bundled defaults) via
+    ``load_deep_prompts()``.
     """
     target = Path(out_dir) if out_dir is not None else _default_deep_dir()
     target.mkdir(parents=True, exist_ok=True)
@@ -569,6 +806,7 @@ async def run_deep_batch_async(
                 out_dir=target,
                 context_length=context_length,
                 stamp=batch_stamp,
+                prompts=prompts,
             )
         except NoBestConfigError as e:
             models[mid] = {
@@ -658,6 +896,7 @@ def run_deep_batch(
     out_dir: str | Path | None = None,
     stamp: str | None = None,
     context_length: int | None = None,
+    prompts: list[dict[str, Any]] | None = None,
 ) -> dict:
     """Sync wrapper around run_deep_batch_async (tests + simple callers)."""
     return asyncio.run(
@@ -667,5 +906,6 @@ def run_deep_batch(
             out_dir=out_dir,
             stamp=stamp,
             context_length=context_length,
+            prompts=prompts,
         )
     )

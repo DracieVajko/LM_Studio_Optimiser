@@ -351,3 +351,239 @@ def test_list_optimized_models_resolves_only_with_best():
     got = list_optimized_models()
     assert "opt-a" in got
     assert "never-optimized-model" not in got
+
+
+# --- Task 9: Deep Research default prompts YAML + example (TDD) ---
+
+
+def test_load_deep_prompts_yaml_from_cwd(tmp_path, monkeypatch):
+    """YAML file in CWD takes priority over config/ and defaults."""
+    from lm_optimizer.services.deep import load_deep_prompts
+
+    yaml_content = """prompts:
+  - name: "Custom Recall Test"
+    prompt: "Custom recall prompt content"
+    category: "recall"
+    max_tokens: 4096
+  - name: "multi_hop"
+    prompt: "Override multi-hop prompt"
+    category: "reasoning"
+    max_tokens: 2048
+"""
+    (tmp_path / "deep_prompts.yaml").write_text(yaml_content, encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    prompts = load_deep_prompts()
+    # Should have 2 prompts: custom recall + overridden multi_hop (others from defaults)
+    names = [p["name"] for p in prompts]
+    assert "Custom Recall Test" in names
+    assert "multi_hop" in names
+    # Override should take effect
+    multi_hop = next(p for p in prompts if p["name"] == "multi_hop")
+    assert multi_hop["prompt"] == "Override multi-hop prompt"
+
+
+def test_load_deep_prompts_yaml_from_config_dir(tmp_path, monkeypatch):
+    """YAML file in config/ is used when CWD has none."""
+    from lm_optimizer.services.deep import load_deep_prompts
+    from lm_optimizer.config import config as app_config
+
+    # Create config dir with YAML
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    yaml_content = """prompts:
+  - name: "Config Dir Test"
+    prompt: "Prompt from config dir"
+    category: "custom"
+    max_tokens: 1024
+"""
+    (config_dir / "deep_prompts.yaml").write_text(yaml_content, encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    # Patch the config's storage.config_dir to point to our temp config dir
+    monkeypatch.setattr(app_config.storage, "config_dir", str(config_dir))
+
+    prompts = load_deep_prompts()
+    names = [p["name"] for p in prompts]
+    assert "Config Dir Test" in names
+
+
+def test_load_deep_prompts_falls_back_to_defaults(monkeypatch, tmp_path):
+    """When no YAML files exist, bundled defaults are returned."""
+    from lm_optimizer.services.deep import load_deep_prompts, DEEP_PROMPT_DEFAULTS
+
+    monkeypatch.chdir(tmp_path)
+    # Ensure no YAML files exist
+    assert not (tmp_path / "deep_prompts.yaml").exists()
+
+    prompts = load_deep_prompts()
+    # Should return all 5 built-in defaults
+    names = [p["name"] for p in prompts]
+    assert names == ["long_context_recall", "multi_hop", "json_discipline", "coding_precision", "instruction_follow"]
+    # Content should match defaults
+    for p in prompts:
+        default = next(d for d in DEEP_PROMPT_DEFAULTS if d["name"] == p["name"])
+        assert p["prompt"] == default["prompt"]
+        assert p["category"] == default["category"]
+        assert p["max_tokens"] == default["max_tokens"]
+
+
+def test_load_deep_prompts_override_by_name():
+    """Override replaces by name; other defaults preserved."""
+    from lm_optimizer.services.deep import load_deep_prompts, DEEP_PROMPT_DEFAULTS
+
+    # Create a YAML that only overrides one prompt
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        yaml_content = """prompts:
+  - name: "json_discipline"
+    prompt: "Custom JSON prompt"
+    category: "format"
+    max_tokens: 512
+"""
+        (td_path / "deep_prompts.yaml").write_text(yaml_content, encoding="utf-8")
+        import os
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(td_path)
+            prompts = load_deep_prompts()
+        finally:
+            os.chdir(old_cwd)
+
+    # Should have all 5 prompts
+    names = [p["name"] for p in prompts]
+    assert len(names) == 5
+    # json_discipline should be overridden
+    json_prompt = next(p for p in prompts if p["name"] == "json_discipline")
+    assert json_prompt["prompt"] == "Custom JSON prompt"
+    assert json_prompt["max_tokens"] == 512
+    # Others should be defaults
+    for p in prompts:
+        if p["name"] != "json_discipline":
+            default = next(d for d in DEEP_PROMPT_DEFAULTS if d["name"] == p["name"])
+            assert p["prompt"] == default["prompt"]
+            assert p["category"] == default["category"]
+            assert p["max_tokens"] == default["max_tokens"]
+
+
+def test_run_deep_model_async_accepts_custom_prompts():
+    """run_deep_model_async accepts a custom prompts list and uses it instead of defaults."""
+    from lm_optimizer.services.deep import run_deep_model_async
+    from unittest.mock import AsyncMock, MagicMock
+
+    # This test will fail until we modify run_deep_model_async to accept custom prompts
+    # For now, we just check the signature accepts the parameter
+    import inspect
+    sig = inspect.signature(run_deep_model_async)
+    assert "prompts" in sig.parameters, "run_deep_model_async must accept 'prompts' parameter"
+
+
+def test_run_deep_model_uses_custom_prompts(mock_client_with_best):
+    """Custom prompts passed to run_deep_model_async are used for task execution."""
+    import asyncio
+    from lm_optimizer.services.deep import run_deep_model_async
+
+    client = mock_client_with_best
+
+    # Custom prompts - only 2 tasks instead of 5
+    custom_prompts = [
+        {
+            "name": "custom_task_1",
+            "prompt": "Custom prompt 1",
+            "category": "custom",
+            "max_tokens": 1024,
+            "temperature": 0.0,
+        },
+        {
+            "name": "custom_task_2",
+            "prompt": "Custom prompt 2",
+            "category": "custom",
+            "max_tokens": 1024,
+            "temperature": 0.0,
+        },
+    ]
+
+    async def _test():
+        out = await run_deep_model_async(
+            client, "m", load_config=None, out_dir="results/deep", prompts=custom_prompts
+        )
+        # Should only have 2 tasks
+        assert len(out["tasks"]) == 2
+        assert out["tasks"][0]["name"] == "custom_task_1"
+        assert out["tasks"][1]["name"] == "custom_task_2"
+        # Verify chat_completion was called with custom prompts (2 calls)
+        calls = client.chat_completion.call_args_list
+        assert len(calls) == 2
+        # The prompt should be in the call kwargs (check both input_text and messages)
+        for i, call in enumerate(calls):
+            kwargs = call.kwargs
+            prompt_found = False
+            for key in ("input_text", "messages", "prompt"):
+                if key in kwargs:
+                    val = kwargs[key]
+                    if isinstance(val, str) and custom_prompts[i]["prompt"] in val:
+                        prompt_found = True
+                        break
+                    if isinstance(val, list):
+                        for msg in val:
+                            if isinstance(msg, dict) and "content" in msg:
+                                if custom_prompts[i]["prompt"] in msg["content"]:
+                                    prompt_found = True
+                                    break
+            assert prompt_found, f"Custom prompt {i} not found in call kwargs: {kwargs}"
+
+    asyncio.run(_test())
+
+
+def test_run_deep_batch_uses_custom_prompts(tmp_path):
+    """Custom prompts passed to run_deep_batch_async are used for all models."""
+    import asyncio
+    from lm_optimizer.services.deep import run_deep_batch_async
+    from lm_optimizer.tests.test_deep_run import _seed_best_run, _mock_client
+
+    _seed_best_run("m1")
+    _seed_best_run("m2")
+
+    custom_prompts = [
+        {
+            "name": "batch_task_1",
+            "prompt": "Batch custom prompt",
+            "category": "custom",
+            "max_tokens": 1024,
+            "temperature": 0.0,
+        },
+    ]
+
+    client = _mock_client()
+    out_dir = tmp_path / "deep_test_batch"
+
+    async def _test():
+        out = await run_deep_batch_async(
+            client, ["m1", "m2"], out_dir=str(out_dir), prompts=custom_prompts
+        )
+        # Both models should have run with 1 custom task
+        assert out["models"]["m1"]["status"] == "completed"
+        assert out["models"]["m2"]["status"] == "completed"
+        # Check the task name
+        # Note: We can't easily access tasks from batch output, but we can verify
+        # the chat_completion was called correctly
+        calls = client.chat_completion.call_args_list
+        assert len(calls) == 2  # 1 per model
+        for call in calls:
+            kwargs = call.kwargs
+            prompt_found = False
+            for key in ("input_text", "messages", "prompt"):
+                if key in kwargs:
+                    val = kwargs[key]
+                    if isinstance(val, str) and "Batch custom prompt" in val:
+                        prompt_found = True
+                        break
+                    if isinstance(val, list):
+                        for msg in val:
+                            if isinstance(msg, dict) and "content" in msg:
+                                if "Batch custom prompt" in msg["content"]:
+                                    prompt_found = True
+                                    break
+            assert prompt_found, f"Batch custom prompt not found in call kwargs: {kwargs}"
+
+    asyncio.run(_test())
