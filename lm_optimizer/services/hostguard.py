@@ -5,6 +5,8 @@ stale loaded model, and the run records how much VRAM/RAM/swap is free.
 All explanations are predefined (no AI needed at runtime).
 """
 
+import asyncio
+import inspect
 import json
 import platform
 import subprocess
@@ -170,6 +172,98 @@ def _query_pagefile(_query: str) -> str:
     except Exception:
         pass
     return ""
+
+
+class HostBusyTimeout(Exception):
+    """Raised when a foreign model never leaves the endpoint.
+
+    Carries .blocker: model ids still loaded when the wait budget ran out
+    (empty when the endpoint state itself was unverifiable).
+    """
+
+    def __init__(self, message: str = "", blocker=None):
+        super().__init__(message)
+        self.blocker = list(blocker) if blocker else []
+
+
+async def ensure_exclusive_access(client, purpose: str = "",
+                                  wait_interval_s: float = 60.0,
+                                  max_waits: int = 30) -> dict[str, Any]:
+    """Wait until the endpoint holds no loaded model; evict foreigners first.
+
+    Lists loaded instances; empty means immediate return. Otherwise each
+    blocker model is evicted via client.ensure_unloaded (unload_all
+    fallback) and the endpoint is re-checked right away -- a successful
+    unload never sleeps through wait_interval_s. Only a still-loaded
+    endpoint sleeps, at most max_waits times.
+
+    Returns {free: True, waited_s, attempts}. Raises HostBusyTimeout with
+    .blocker model ids after exhausting waits, or when the endpoint state
+    cannot be verified at all (fail-closed: never measure blind).
+    """
+    started = time.monotonic()
+    list_fn = getattr(client, "get_loaded_instances", None)
+    if list_fn is None or not inspect.iscoroutinefunction(list_fn):
+        logger.debug("Exclusive-access guard skipped (no async client interface)",
+                     purpose=purpose)
+        return {"free": True, "waited_s": 0.0, "attempts": 0}
+
+    async def _loaded() -> list | None:
+        try:
+            instances = await client.get_loaded_instances()
+        except Exception as e:
+            raise HostBusyTimeout(
+                f"Host busy check failed before {purpose or 'load'}: "
+                f"endpoint state unverifiable ({str(e)[:160]}).",
+                blocker=[],
+            ) from e
+        if not isinstance(instances, list):
+            logger.debug("Exclusive-access guard skipped (non-list state)",
+                         purpose=purpose)
+            return None
+        return [i for i in instances if isinstance(i, dict) and i.get("instance_id")]
+
+    async def _evict(blockers: list) -> None:
+        unload_fn = getattr(client, "ensure_unloaded", None)
+        if unload_fn is not None and inspect.iscoroutinefunction(unload_fn):
+            for inst in blockers:
+                try:
+                    await client.ensure_unloaded(inst.get("model"))
+                except Exception as e:
+                    logger.warning("Evict attempt failed", purpose=purpose,
+                                   model=inst.get("model"), error=str(e)[:160])
+        else:
+            try:
+                await client.unload_all()
+            except Exception as e:
+                logger.warning("Evict unload_all failed", purpose=purpose,
+                               error=str(e)[:160])
+
+    attempts = 0
+    waits_used = 0
+    while True:
+        blockers = await _loaded()
+        attempts += 1
+        if not blockers:
+            return {"free": True, "waited_s": time.monotonic() - started,
+                    "attempts": attempts}
+        await _evict(blockers)
+        # Re-check right after the unload; never sleep through a success.
+        blockers = await _loaded()
+        attempts += 1
+        if not blockers:
+            return {"free": True, "waited_s": time.monotonic() - started,
+                    "attempts": attempts}
+        if waits_used >= max_waits:
+            ids = [i.get("model") for i in blockers]
+            raise HostBusyTimeout(
+                f"Host busy before {purpose or 'load'}: still loaded after "
+                f"{waits_used} waits: {', '.join(str(m) for m in ids)}. "
+                "Unload the model in LM Studio and retry.",
+                blocker=ids,
+            )
+        await asyncio.sleep(wait_interval_s)
+        waits_used += 1
 
 
 async def prepare_host(client, purpose: str = "") -> dict[str, Any]:
