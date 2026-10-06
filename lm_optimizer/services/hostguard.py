@@ -183,7 +183,12 @@ class HostBusyTimeout(Exception):
 
     def __init__(self, message: str = "", blocker=None):
         super().__init__(message)
-        self.blocker = list(blocker) if blocker else []
+        if blocker is None:
+            self.blocker = []
+        elif isinstance(blocker, str):
+            self.blocker = [blocker]
+        else:
+            self.blocker = list(blocker)
 
 
 async def ensure_exclusive_access(client, purpose: str = "",
@@ -200,13 +205,24 @@ async def ensure_exclusive_access(client, purpose: str = "",
     Returns {free: True, waited_s, attempts}. Raises HostBusyTimeout with
     .blocker model ids after exhausting waits, or when the endpoint state
     cannot be verified at all (fail-closed: never measure blind).
+
+    Test doubles with no loadable endpoint opt out explicitly via
+    client._skip_exclusive_check = True (checked with `is True` so plain
+    MagicMock auto-attributes never opt out by accident).
     """
     started = time.monotonic()
+    skip = getattr(client, "_skip_exclusive_check", False) is True
     list_fn = getattr(client, "get_loaded_instances", None)
     if list_fn is None or not inspect.iscoroutinefunction(list_fn):
-        logger.debug("Exclusive-access guard skipped (no async client interface)",
-                     purpose=purpose)
-        return {"free": True, "waited_s": 0.0, "attempts": 0}
+        if skip:
+            logger.debug("Exclusive-access guard skipped (explicit opt-out)",
+                         purpose=purpose)
+            return {"free": True, "waited_s": 0.0, "attempts": 0}
+        raise HostBusyTimeout(
+            f"Host busy check failed before {purpose or 'load'}: "
+            "unverifiable: no instance listing.",
+            blocker="unverifiable: no instance listing",
+        )
 
     async def _loaded() -> list | None:
         try:
@@ -218,9 +234,15 @@ async def ensure_exclusive_access(client, purpose: str = "",
                 blocker=[],
             ) from e
         if not isinstance(instances, list):
-            logger.debug("Exclusive-access guard skipped (non-list state)",
-                         purpose=purpose)
-            return None
+            if skip:
+                logger.debug("Exclusive-access guard skipped (non-list state)",
+                             purpose=purpose)
+                return None
+            raise HostBusyTimeout(
+                f"Host busy check failed before {purpose or 'load'}: "
+                "unverifiable: non-list instance state.",
+                blocker="unverifiable: non-list instance state",
+            )
         return [i for i in instances if isinstance(i, dict) and i.get("instance_id")]
 
     async def _evict(blockers: list) -> None:

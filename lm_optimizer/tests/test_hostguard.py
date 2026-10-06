@@ -73,3 +73,25 @@ async def test_exclusive_access_blocker_on_timeout(mock_client_foreign_forever):
     with pytest.raises(HostBusyTimeout) as exc:
         await ensure_exclusive_access(mock_client_foreign_forever, "test", wait_interval_s=0, max_waits=1)
     assert "foreign-model" in exc.value.blocker
+
+
+async def test_exclusive_access_opt_out_double_returns_free():
+    client = MagicMock()
+    client._skip_exclusive_check = True
+    out = await ensure_exclusive_access(client, "test", wait_interval_s=0, max_waits=1)
+    assert out["free"] is True and out["attempts"] == 0
+
+
+async def test_exclusive_access_missing_listing_raises():
+    client = MagicMock()  # get_loaded_instances auto-attr is non-async
+    with pytest.raises(HostBusyTimeout) as exc:
+        await ensure_exclusive_access(client, "test", wait_interval_s=0, max_waits=1)
+    assert "unverifiable" in exc.value.blocker[0]
+
+
+async def test_exclusive_access_non_list_state_raises():
+    client = MagicMock()
+    client.get_loaded_instances = AsyncMock(return_value={"not": "a-list"})
+    with pytest.raises(HostBusyTimeout) as exc:
+        await ensure_exclusive_access(client, "test", wait_interval_s=0, max_waits=1)
+    assert "unverifiable" in exc.value.blocker[0]
