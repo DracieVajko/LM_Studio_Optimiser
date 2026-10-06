@@ -35,7 +35,14 @@ from lm_optimizer.services.context_sweep import sweep as _ctx_sweep
 from lm_optimizer.services.hardware import hardware_detector
 from lm_optimizer.services.fit import ladder as ctx_ladder
 from lm_optimizer.services.generation_defaults import lookup as generation_lookup
-from lm_optimizer.services.hostguard import format_snapshot, prepare_host
+from lm_optimizer.services.hostguard import (
+    HostBusyTimeout,
+    HostUnreachableError,
+    format_snapshot,
+    is_connection_error,
+    prepare_host,
+)
+from lm_optimizer.services.joblock import JobBusyError, acquire_lock, release_lock
 from lm_optimizer.services.matrix import build_matrix, recommendation_line, run_one
 from lm_optimizer.services.model_recommendations import (
     diagnose_load_error,
@@ -134,6 +141,102 @@ def _handle_connection_error(url: str, error: Exception) -> None:
     console.print("  - Network access is allowed (firewall/VPN)")
     console.print(f"\n[dim]Details: {type(error).__name__}[/dim]")
     # Do not log full URL with credentials or stack trace containing secrets
+
+
+def _acquire_run_lock(purpose: str) -> None:
+    """Claim the cross-process optimizer job lock for this run.
+
+    A second concurrent job is refused with holder info (exit 1); the
+    existing lock file is never disturbed. Callers release in `finally`.
+    """
+    try:
+        acquire_lock(purpose)
+    except JobBusyError as e:
+        holder = e.holder or {}
+        console.print("[red]Another optimizer job is already running:[/red]")
+        console.print(f"  pid {holder.get('pid')} purpose {holder.get('purpose')!r}")
+        console.print("Run one job at a time; retry when it finishes.")
+        sys.exit(1)
+
+
+def _client_base_url(client) -> str:
+    """Backend URL for messages (never raises)."""
+    return getattr(client, "base_url", None) or config.lm_studio.base_url
+
+
+def _busy_blockers(exc: HostBusyTimeout) -> str:
+    """Blocker model ids for messages (never empty)."""
+    return ", ".join(str(b) for b in (exc.blocker or [])) or "unknown model"
+
+
+def _print_host_busy_abort(exc: HostBusyTimeout) -> None:
+    """Clear abort message for a persistently busy host."""
+    console.print(f"[red]Host busy: {_busy_blockers(exc)} still loaded; aborting.[/red]")
+    console.print(f"  {exc}")
+    console.print("Unload the model in LM Studio (disable Keep Model in Memory) and retry.")
+
+
+def _print_host_busy_paused(model: str, exc: HostBusyTimeout) -> None:
+    """Pause-framed busy message for optimize, with a resume hint.
+
+    Nothing started (no run id, no checkpoint), so "pause" here means the
+    pre-start wait budget ran out: free the host and re-run; in-progress
+    runs resume via the normal checkpoint flow.
+    """
+    console.print(
+        f"[yellow]Host busy: {_busy_blockers(exc)} still loaded "
+        "- pausing before start.[/yellow]"
+    )
+    console.print(f"  {exc}")
+    console.print("Nothing was started, so no checkpoint was needed.")
+    console.print("Unload the model in LM Studio (disable Keep Model in Memory),")
+    console.print(f"then re-run: lm-optimizer optimize {model}")
+    console.print("In-progress runs resume with: lm-optimizer resume <run-id>")
+    console.print("  (list them with: lm-optimizer checkpoints)")
+
+
+async def _connect_guarded(
+    client, purpose: str, wait_interval_s: float = 60.0, max_waits: int = 30
+):
+    """Connect + exclusive-access guard with typed failures.
+
+    Raises HostUnreachableError when the backend cannot be reached (caller
+    shows the friendly connection message) or HostBusyTimeout when a foreign
+    model never leaves (caller pauses or aborts). Other errors propagate.
+    """
+    try:
+        await client.connect()
+    except Exception as e:
+        if is_connection_error(e):
+            raise HostUnreachableError(
+                f"Cannot reach backend at {_client_base_url(client)}", cause=e
+            ) from e
+        raise
+    return await prepare_host(
+        client,
+        purpose=purpose,
+        wait_interval_s=wait_interval_s,
+        max_waits=max_waits,
+    )
+
+
+async def _connect_guarded_or_abort(
+    client, purpose: str, wait_interval_s: float = 60.0, max_waits: int = 30
+):
+    """_connect_guarded that aborts (exit 1) with a clear message.
+
+    Shared by every command except optimize (which pauses with a resume
+    hint instead). Unreachable shows the friendly connection message, busy
+    shows the abort message; never the twain.
+    """
+    try:
+        return await _connect_guarded(client, purpose, wait_interval_s, max_waits)
+    except HostBusyTimeout as e:
+        _print_host_busy_abort(e)
+        sys.exit(1)
+    except HostUnreachableError as e:
+        _handle_connection_error(_client_base_url(client), e.cause or e)
+        sys.exit(1)
 
 
 def _require_style(style: str) -> str:
@@ -750,8 +853,7 @@ def benchmark(
     async def _benchmark():
         client = get_client()
         try:
-            await client.connect()
-            snap = await prepare_host(client, purpose="benchmark")
+            snap = await _connect_guarded_or_abort(client, "benchmark")
             for line in format_snapshot(snap):
                 console.print(f"  {line}")
             if not snap.get("verified_empty") and snap.get("leftovers"):
@@ -836,8 +938,7 @@ def manual_memory_duel(
     async def _duel_run():
         client = get_client()
         try:
-            await client.connect()
-            snap = await prepare_host(client, purpose="manual-memory-duel")
+            snap = await _connect_guarded_or_abort(client, "manual-memory-duel")
             for line in format_snapshot(snap):
                 console.print(f"  {line}")
             if not snap.get("verified_empty") and snap.get("leftovers"):
@@ -988,6 +1089,16 @@ def optimize(
         "--enable-speculative",
         help="Experimental tail opt-in: speculative probes after the FINAL winner",
     ),
+    wait_interval: float = typer.Option(
+        60.0,
+        "--wait-interval",
+        help="Seconds between foreign-model eviction re-checks before start",
+    ),
+    max_waits: int = typer.Option(
+        30,
+        "--max-waits",
+        help="Max re-checks for a foreign model before pausing with a resume hint",
+    ),
 ):
     """Optimize a model configuration."""
     setup_logging()
@@ -1007,8 +1118,19 @@ def optimize(
     async def _optimize():
         client = get_client()
         try:
-            await client.connect()
-            snap = await prepare_host(client, purpose="optimize")
+            try:
+                snap = await _connect_guarded(
+                    client,
+                    "optimize",
+                    wait_interval_s=wait_interval,
+                    max_waits=max_waits,
+                )
+            except HostBusyTimeout as e:
+                _print_host_busy_paused(model, e)
+                sys.exit(1)
+            except HostUnreachableError as e:
+                _handle_connection_error(_client_base_url(client), e.cause or e)
+                sys.exit(1)
             for line in format_snapshot(snap):
                 console.print(f"  {line}")
             if not snap.get("verified_empty") and snap.get("leftovers"):
@@ -1112,11 +1234,14 @@ def optimize(
         finally:
             await client.close()
 
+    _acquire_run_lock(f"optimize:{model}")
     try:
         asyncio.run(_optimize())
     except KeyboardInterrupt:
         console.print("\n[yellow]Interrupted — checkpoint saved.[/yellow]")
         sys.exit(130)
+    finally:
+        release_lock()
 
 
 @app.command()
@@ -1511,6 +1636,16 @@ def auto(
         "--enable-speculative",
         help="Experimental tail opt-in: speculative probes after the FINAL winner",
     ),
+    wait_interval: float = typer.Option(
+        60.0,
+        "--wait-interval",
+        help="Seconds between foreign-model eviction re-checks before start",
+    ),
+    max_waits: int = typer.Option(
+        30,
+        "--max-waits",
+        help="Max re-checks for a foreign model before aborting with a message",
+    ),
 ):
     """Unattended pipeline: smoke -> precision -> ladder(ctx max) -> matrix -> optimize."""
     setup_logging()
@@ -1526,9 +1661,13 @@ def auto(
         summary = []
         pipeline_t0 = time.perf_counter()
         try:
-            await client.connect()
+            snap = await _connect_guarded_or_abort(
+                client,
+                "auto",
+                wait_interval_s=wait_interval,
+                max_waits=max_waits,
+            )
             remote_note = _warn_if_remote(client.base_url)
-            snap = await prepare_host(client, purpose="auto")
             for line in format_snapshot(snap):
                 console.print(f"  {line}")
             hardware = hardware_detector.detect()
@@ -1878,7 +2017,11 @@ def auto(
                 pass
             await client.close()
 
-    asyncio.run(_auto())
+    _acquire_run_lock("auto")
+    try:
+        asyncio.run(_auto())
+    finally:
+        release_lock()
 
 
 @app.command()
@@ -1894,6 +2037,16 @@ def fit(
     kv: str = typer.Option("both", "--kv", help="KV paths to probe (gpu/cpu/both)"),
     output: Path = typer.Option("results", "--output", help="Report output directory"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Show plan without running"),
+    wait_interval: float = typer.Option(
+        60.0,
+        "--wait-interval",
+        help="Seconds between foreign-model eviction re-checks before start",
+    ),
+    max_waits: int = typer.Option(
+        30,
+        "--max-waits",
+        help="Max re-checks for a foreign model before aborting with a message",
+    ),
 ):
     """Max-context ladder: escalate ctx until load refusal, per KV path (fit, no tuning)."""
     setup_logging()
@@ -1905,8 +2058,9 @@ def fit(
     async def _fit():
         client = get_client()
         try:
-            await client.connect()
-            snap = await prepare_host(client, purpose="fit")
+            snap = await _connect_guarded_or_abort(
+                client, "fit", wait_interval_s=wait_interval, max_waits=max_waits
+            )
             for line in format_snapshot(snap):
                 console.print(f"  {line}")
             hardware = hardware_detector.detect()
@@ -1989,7 +2143,11 @@ def fit(
                 pass
             await client.close()
 
-    asyncio.run(_fit())
+    _acquire_run_lock("fit")
+    try:
+        asyncio.run(_fit())
+    finally:
+        release_lock()
 
 
 @app.command()
@@ -2005,6 +2163,16 @@ def ctx(
     batch: int = typer.Option(256, "--batch", "-b", help="Eval batch size"),
     repetitions: int = typer.Option(1, "--repetitions", "-r", help="Smoke repetitions per point"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Show plan without running"),
+    wait_interval: float = typer.Option(
+        60.0,
+        "--wait-interval",
+        help="Seconds between foreign-model eviction re-checks before start",
+    ),
+    max_waits: int = typer.Option(
+        30,
+        "--max-waits",
+        help="Max re-checks for a foreign model before aborting with a message",
+    ),
 ):
     """Test context capacity for ONE model with a fixed runtime configuration."""
     setup_logging()
@@ -2025,8 +2193,9 @@ def ctx(
     async def _ctx():
         client = get_client()
         try:
-            await client.connect()
-            snap = await prepare_host(client, purpose="ctx")
+            snap = await _connect_guarded_or_abort(
+                client, "ctx", wait_interval_s=wait_interval, max_waits=max_waits
+            )
             for line in format_snapshot(snap):
                 console.print(f"  {line}")
             model_info = await client.get_model(model)
@@ -2123,11 +2292,14 @@ def ctx(
                 sys.exit(1)
             await client.close()
 
+    _acquire_run_lock(f"ctx:{model}")
     try:
         asyncio.run(_ctx())
     except KeyboardInterrupt:
         console.print("\n[yellow]Interrupted.[/yellow]")
         sys.exit(130)
+    finally:
+        release_lock()
 
 
 @app.command()
@@ -2193,11 +2365,14 @@ def resume(
         finally:
             await client.close()
 
+    _acquire_run_lock(f"resume:{run_id}")
     try:
         asyncio.run(_resume())
     except KeyboardInterrupt:
         console.print("\n[yellow]Interrupted.[/yellow]")
         sys.exit(130)
+    finally:
+        release_lock()
 
 
 @app.command()
@@ -2830,8 +3005,7 @@ def compare(
     async def _compare():
         client = get_client()
         try:
-            await client.connect()
-            snap = await prepare_host(client, purpose="compare")
+            snap = await _connect_guarded_or_abort(client, "compare")
             for line in format_snapshot(snap):
                 console.print(f"  {line}")
             if not snap.get("verified_empty") and snap.get("leftovers"):
@@ -2894,8 +3068,7 @@ def sample_sweep(
     async def _sweep():
         client = get_client()
         try:
-            await client.connect()
-            snap = await prepare_host(client, purpose="sample-sweep")
+            snap = await _connect_guarded_or_abort(client, "sample-sweep")
             for line in format_snapshot(snap):
                 console.print(f"  {line}")
             if not snap.get("verified_empty") and snap.get("leftovers"):

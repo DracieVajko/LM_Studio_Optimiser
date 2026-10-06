@@ -44,6 +44,7 @@ from lm_optimizer.domain.models import (
 )
 from lm_optimizer.services.benchmark import BenchmarkService
 from lm_optimizer.services.hardware import hardware_detector
+from lm_optimizer.services.joblock import JobBusyError, acquire_lock, release_lock
 from lm_optimizer.services.lm_studio import LMStudioClient, create_client
 from lm_optimizer.services.optimizer import AdaptiveOptimizer
 from lm_optimizer.services.quality import QualityConfig, QualityEvaluator
@@ -429,70 +430,98 @@ async def start_optimization(request: OptimizationRequest, background_tasks: Bac
     ):
         raise HTTPException(status_code=409, detail="Optimization already running")
 
-    # Validate model exists
-    client = await get_lm_client()
-    model = await client.get_model(request.model_id)
-    if not model:
-        await client.close()
-        raise HTTPException(status_code=404, detail="Model not found")
-
-    # Fail-closed start: never optimize onto a dirty host (two models
-    # sharing the GPU silently invalidates speed measurements).
+    # Cross-process job lock (shared with the CLI): one optimizer job per
+    # machine. PID-liveness means a stale lock never blocks forever; two
+    # workers racing resolve to exactly one winner (atomic create).
     try:
-        from lm_optimizer.services.unload_guard import UnloadNotClean, assert_unloaded
-
-        await assert_unloaded(client, purpose=f"optimize:{request.model_id}")
-    except UnloadNotClean as e:
-        try:
-            await client.close()
-        except Exception:
-            pass
-        raise HTTPException(status_code=409, detail=str(e)[:300])
-
-    # Get hardware
-    hardware = hardware_detector.detect()
-
-    # Create services
-    benchmark_service = BenchmarkService(client)
-    quality_evaluator = QualityEvaluator(QualityConfig(minimum_score=request.quality_threshold))
-    search_generator = SearchSpaceGenerator(client)
-    optimizer = AdaptiveOptimizer(client, benchmark_service, quality_evaluator, search_generator)
-
-    # Merge top-level workload into advanced settings (canonical source).
-    from lm_optimizer.services.workload import normalize_workload
-
-    adv = request.advanced_settings.dict() if request.advanced_settings else {}
-    adv.setdefault("workload_type", normalize_workload(request.workload_type))
-    adv["workload_type"] = normalize_workload(adv.get("workload_type"))
-    weights = ProfileWeights(**request.custom_weights.dict()) if request.custom_weights else None
-    profile = OptimizationProfile(request.profile.value)
-
-    # Prepare run + state synchronously so the response carries a real run id
-    # (state used to appear only inside the background task -> HTTP 500).
-    try:
-        run, baseline_config, adv = await optimizer.prepare_run(
-            model, hardware, profile, weights, request.quality_threshold, adv,
+        acquire_lock(f"optimize:{request.model_id}")
+    except JobBusyError as e:
+        holder = e.holder or {}
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Optimizer job already running "
+                f"(pid {holder.get('pid')}, purpose {holder.get('purpose')!r})."
+            ),
         )
-    except Exception as e:
-        try:
+    try:
+        # Validate model exists
+        client = await get_lm_client()
+        model = await client.get_model(request.model_id)
+        if not model:
             await client.close()
+            raise HTTPException(status_code=404, detail="Model not found")
+
+        # Fail-closed start: never optimize onto a dirty host (two models
+        # sharing the GPU silently invalidates speed measurements).
+        try:
+            from lm_optimizer.services.unload_guard import UnloadNotClean, assert_unloaded
+
+            await assert_unloaded(client, purpose=f"optimize:{request.model_id}")
+        except UnloadNotClean as e:
+            try:
+                await client.close()
+            except Exception:
+                pass
+            raise HTTPException(status_code=409, detail=str(e)[:300])
+
+        # Get hardware
+        hardware = hardware_detector.detect()
+
+        # Create services
+        benchmark_service = BenchmarkService(client)
+        quality_evaluator = QualityEvaluator(QualityConfig(minimum_score=request.quality_threshold))
+        search_generator = SearchSpaceGenerator(client)
+        optimizer = AdaptiveOptimizer(
+            client, benchmark_service, quality_evaluator, search_generator
+        )
+
+        # Merge top-level workload into advanced settings (canonical source).
+        from lm_optimizer.services.workload import normalize_workload
+
+        adv = request.advanced_settings.dict() if request.advanced_settings else {}
+        adv.setdefault("workload_type", normalize_workload(request.workload_type))
+        adv["workload_type"] = normalize_workload(adv.get("workload_type"))
+        weights = (
+            ProfileWeights(**request.custom_weights.dict())
+            if request.custom_weights
+            else None
+        )
+        profile = OptimizationProfile(request.profile.value)
+
+        # Prepare run + state synchronously so the response carries a real run id
+        # (state used to appear only inside the background task -> HTTP 500).
+        try:
+            run, baseline_config, adv = await optimizer.prepare_run(
+                model, hardware, profile, weights, request.quality_threshold, adv,
+            )
+        except Exception as e:
+            try:
+                await client.close()
+            except Exception:
+                pass
+            raise HTTPException(status_code=500, detail=f"Could not start run: {str(e)[:200]}")
+
+        _current_optimizer = optimizer
+        _current_run_id = run.id
+
+        # Run in background from the prepared state (never re-prepares).
+        background_tasks.add_task(
+            run_optimization_task,
+            optimizer,
+            model,
+            profile,
+            run,
+            baseline_config,
+            adv,
+        )
+    except Exception:
+        # Start failed after the lock was claimed: never leak it.
+        try:
+            release_lock()
         except Exception:
             pass
-        raise HTTPException(status_code=500, detail=f"Could not start run: {str(e)[:200]}")
-
-    _current_optimizer = optimizer
-    _current_run_id = run.id
-
-    # Run in background from the prepared state (never re-prepares).
-    background_tasks.add_task(
-        run_optimization_task,
-        optimizer,
-        model,
-        profile,
-        run,
-        baseline_config,
-        adv,
-    )
+        raise
 
     return _convert_run(run, config_count=0, stale=False)
 
@@ -538,6 +567,10 @@ async def run_optimization_task(
         global _current_optimizer, _current_run_id
         _current_optimizer = None
         _current_run_id = None
+        try:
+            release_lock()
+        except Exception:
+            pass
 
 
 @router.post("/optimize/{run_id}/pause")
@@ -598,26 +631,46 @@ async def resume_run_from_checkpoint(run_id: UUID, background_tasks: BackgroundT
     global _current_optimizer
     if _current_optimizer and _current_optimizer.state:
         raise HTTPException(status_code=409, detail="Another optimization is running")
+    try:
+        acquire_lock(f"resume:{run_id}")
+    except JobBusyError as e:
+        holder = e.holder or {}
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Optimizer job already running "
+                f"(pid {holder.get('pid')}, purpose {holder.get('purpose')!r})."
+            ),
+        )
     from lm_optimizer.storage.run_checkpoint import load_checkpoint
 
     try:
-        ckpt = load_checkpoint(run_id)
-    except ValueError as e:
-        raise HTTPException(status_code=422, detail=f"Corrupted checkpoint: {e}")
-    if not ckpt:
-        raise HTTPException(status_code=404, detail="No checkpoint for run")
-    run = run_repo.get(str(run_id))
-    if not run:
-        raise HTTPException(status_code=404, detail="Run not found")
+        try:
+            ckpt = load_checkpoint(run_id)
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=f"Corrupted checkpoint: {e}")
+        if not ckpt:
+            raise HTTPException(status_code=404, detail="No checkpoint for run")
+        run = run_repo.get(str(run_id))
+        if not run:
+            raise HTTPException(status_code=404, detail="Run not found")
 
-    client = await get_lm_client()
-    hardware = hardware_detector.detect()
-    benchmark_service = BenchmarkService(client)
-    quality_evaluator = QualityEvaluator(QualityConfig(minimum_score=run.quality_threshold))
-    search_generator = SearchSpaceGenerator(client)
-    optimizer = AdaptiveOptimizer(client, benchmark_service, quality_evaluator, search_generator)
-    _current_optimizer = optimizer
-    background_tasks.add_task(resume_run_task, optimizer, run_id)
+        client = await get_lm_client()
+        hardware = hardware_detector.detect()
+        benchmark_service = BenchmarkService(client)
+        quality_evaluator = QualityEvaluator(QualityConfig(minimum_score=run.quality_threshold))
+        search_generator = SearchSpaceGenerator(client)
+        optimizer = AdaptiveOptimizer(
+            client, benchmark_service, quality_evaluator, search_generator
+        )
+        _current_optimizer = optimizer
+        background_tasks.add_task(resume_run_task, optimizer, run_id)
+    except Exception:
+        try:
+            release_lock()
+        except Exception:
+            pass
+        raise
     completed = len(ckpt.get("completed_candidate_ids", []))
     return {"success": True, "run_id": str(run_id), "completed": completed}
 
@@ -633,6 +686,10 @@ async def resume_run_task(optimizer: AdaptiveOptimizer, run_id: UUID):
         logger.error("Resume task failed", error=str(e))
     finally:
         _current_optimizer = None
+        try:
+            release_lock()
+        except Exception:
+            pass
 
 
 @router.get("/checkpoints")

@@ -191,6 +191,39 @@ class HostBusyTimeout(Exception):
             self.blocker = list(blocker)
 
 
+class HostUnreachableError(Exception):
+    """Raised when the endpoint cannot be reached at all (LM Studio down).
+
+    Carries .cause: the underlying transport error. Callers must show the
+    friendly connection message for this, never the busy/timeout message.
+    """
+
+    def __init__(self, message: str = "", cause=None):
+        super().__init__(message)
+        self.cause = cause
+
+
+try:  # httpx is a hard dependency; fallback keeps guard importable regardless
+    import httpx as _httpx
+
+    _TRANSPORT_ERRORS: tuple = (_httpx.TransportError,)
+except Exception:
+    _TRANSPORT_ERRORS = ()
+
+_CONNECTION_ERRORS = _TRANSPORT_ERRORS + (ConnectionError, TimeoutError)
+
+
+def is_connection_error(exc: BaseException) -> bool:
+    """True when exc means unreachable backend (not a busy host).
+
+    Covers httpx transport failures (connect/read timeouts, refused
+    connections, remote protocol errors) and builtin socket errors. HTTP
+    error statuses are NOT connection errors: the server answered, so an
+    unverifiable state stays fail-closed busy, never a friendly retry hint.
+    """
+    return isinstance(exc, _CONNECTION_ERRORS)
+
+
 async def ensure_exclusive_access(client, purpose: str = "",
                                   wait_interval_s: float = 60.0,
                                   max_waits: int = 30) -> dict[str, Any]:
@@ -228,6 +261,12 @@ async def ensure_exclusive_access(client, purpose: str = "",
         try:
             instances = await client.get_loaded_instances()
         except Exception as e:
+            if is_connection_error(e):
+                raise HostUnreachableError(
+                    f"Host unreachable before {purpose or 'load'}: "
+                    f"{type(e).__name__}: {str(e)[:160]}.",
+                    cause=e,
+                ) from e
             raise HostBusyTimeout(
                 f"Host busy check failed before {purpose or 'load'}: "
                 f"endpoint state unverifiable ({str(e)[:160]}).",
@@ -288,13 +327,24 @@ async def ensure_exclusive_access(client, purpose: str = "",
         waits_used += 1
 
 
-async def prepare_host(client, purpose: str = "") -> dict[str, Any]:
-    """Preventive safety: unload everything, snapshot free resources, verify empty.
+async def prepare_host(
+    client, purpose: str = "",
+    wait_interval_s: float = 60.0, max_waits: int = 30,
+) -> dict[str, Any]:
+    """Preventive safety: exclusive access, unload, snapshot, verify empty.
 
-    Returns {gpus, mem, unloaded, verified_empty}. Never raises for monitor
-    failures (records them); raises only if stale models cannot be evicted.
+    The exclusive-access guard runs first (wait-loop evicting foreign
+    models): a persistently busy host raises HostBusyTimeout, an unreachable
+    endpoint raises HostUnreachableError (friendly message upstream, never
+    the busy text). On an empty host the snapshot/verify semantics are
+    unchanged. Never raises for monitor failures (records them).
     """
     tag = f" [{purpose}]" if purpose else ""
+    guard = await ensure_exclusive_access(
+        client, purpose or "prepare_host",
+        wait_interval_s=wait_interval_s, max_waits=max_waits,
+    )
+    logger.debug("Exclusive access granted" + tag, guard=guard)
     try:
         await client.unload_all()
     except Exception as e:

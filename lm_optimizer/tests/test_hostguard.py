@@ -5,7 +5,13 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from lm_optimizer.services.hostguard import HostBusyTimeout, ensure_exclusive_access
+from lm_optimizer.services.hostguard import (
+    HostBusyTimeout,
+    HostUnreachableError,
+    ensure_exclusive_access,
+    is_connection_error,
+    prepare_host,
+)
 
 
 def _inst(model="foreign-model", iid="inst-1"):
@@ -95,3 +101,44 @@ async def test_exclusive_access_non_list_state_raises():
     with pytest.raises(HostBusyTimeout) as exc:
         await ensure_exclusive_access(client, "test", wait_interval_s=0, max_waits=1)
     assert "unverifiable" in exc.value.blocker[0]
+
+
+async def test_prepare_host_enforces_exclusivity(mock_client_foreign_forever):
+    with pytest.raises(HostBusyTimeout):
+        await prepare_host(mock_client_foreign_forever, "test", wait_interval_s=0, max_waits=1)
+
+
+async def test_prepare_host_unreachable_is_not_busy():
+    """A dead endpoint must surface as unreachable, never as busy/timeout."""
+    import httpx
+
+    client = MagicMock()
+    client.get_loaded_instances = AsyncMock(
+        side_effect=httpx.ConnectError("refused")
+    )
+    client.unload_all = AsyncMock(return_value={})
+    with pytest.raises(HostUnreachableError):
+        await prepare_host(client, "test", wait_interval_s=0, max_waits=1)
+
+
+async def test_prepare_host_empty_path_unchanged():
+    """No contention: same snapshot semantics as before the guard."""
+    client = MagicMock()
+    client.get_loaded_instances = AsyncMock(return_value=[])
+    client.ensure_unloaded = AsyncMock(return_value=True)
+    client.unload_all = AsyncMock(return_value={})
+    snap = await prepare_host(client, "test", wait_interval_s=0, max_waits=1)
+    assert snap["verified_empty"] is True
+    assert "leftovers" not in snap
+    client.ensure_unloaded.assert_not_called()
+
+
+def test_is_connection_error_classification():
+    import httpx
+
+    assert is_connection_error(httpx.ConnectError("x"))
+    assert is_connection_error(httpx.ReadTimeout("x"))
+    assert is_connection_error(ConnectionError("x"))
+    assert is_connection_error(TimeoutError("x"))
+    assert not is_connection_error(ValueError("x"))
+    assert not is_connection_error(HostBusyTimeout("x"))
