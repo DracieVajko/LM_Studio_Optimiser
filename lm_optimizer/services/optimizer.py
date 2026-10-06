@@ -284,6 +284,7 @@ class AdaptiveOptimizer:
             search_space={},
             is_experimental=False,
             experimental_reason=None,
+            advanced_settings=advanced_settings or {},
             benchmark_params={
                 "benchmark_repetitions": config.optimization.benchmark_runs,
                 "validation_repetitions": 5,
@@ -654,7 +655,8 @@ class AdaptiveOptimizer:
             self.state.current_config_id = None
             self._log_event("Next candidate", f"ctx={cfg.context_length} gpu={cfg.gpu_ratio}")
             result = await self._test_config(
-                cfg, cfg.context_length or self.state.run.model.context_limit or 4096
+                cfg, cfg.context_length or self.state.run.model.context_limit or 4096,
+                min_speed=self.state.run.advanced_settings.get("min_speed", 0.0)
             )
 
             if result and result.status == ConfigurationStatus.PASSED:
@@ -874,7 +876,7 @@ class AdaptiveOptimizer:
                     break
                 while self.state.should_pause:
                     await asyncio.sleep(1)
-                result = await self._test_config(cfg, cfg.context_length or 4096)
+                result = await self._test_config(cfg, cfg.context_length or 4096, min_speed=self.state.run.advanced_settings.get("min_speed", 0.0))
                 tested_keys.add(key)
                 if result and result.status == ConfigurationStatus.PASSED:
                     self.state.tested_configs.append(result)
@@ -917,7 +919,7 @@ class AdaptiveOptimizer:
                             num_experts=bc.num_experts,
                         )
 
-                        result = await self._test_config(config, ctx)
+                        result = await self._test_config(config, ctx, min_speed=self.state.run.advanced_settings.get("min_speed", 0.0))
                         tested_keys.add(key)
                         if result and result.status == ConfigurationStatus.PASSED:
                             self.state.tested_configs.append(result)
@@ -1056,7 +1058,7 @@ class AdaptiveOptimizer:
             while self.state.should_pause:
                 await asyncio.sleep(1)
 
-            result = await self._test_config(config, best.context_length)
+            result = await self._test_config(config, best.context_length, min_speed=self.state.run.advanced_settings.get("min_speed", 0.0))
             if result and result.status == ConfigurationStatus.PASSED:
                 self.state.tested_configs.append(result)
                 self._update_best(result)
@@ -1129,7 +1131,7 @@ class AdaptiveOptimizer:
         for i in range(self.state.run.validation_repetitions):
             if self.state.should_cancel:
                 break
-            result = await self._test_config(config, best.context_length)
+            result = await self._test_config(config, best.context_length, min_speed=self.state.run.advanced_settings.get("min_speed", 0.0))
             if result and result.status == ConfigurationStatus.PASSED:
                 validation_results.append(result)
 
@@ -1247,6 +1249,7 @@ class AdaptiveOptimizer:
         load_config: LoadConfiguration,
         context_length: int,
         score_context: bool | None = None,
+        min_speed: float = 0.0,
     ) -> ConfigurationResult | None:
         """Test a single configuration through the strict phase machine.
 
@@ -1325,6 +1328,35 @@ class AdaptiveOptimizer:
                 )
             self._log_event("BENCHMARK_STARTED", f"ctx={context_length}")
             self._log_event("BENCHMARK_COMPLETED", f"ctx={context_length}")
+
+            # Check minimum speed threshold (if set)
+            if min_speed > 0.0:
+                gen_tok_s = result.get_avg_generation_tok_s()
+                if gen_tok_s < min_speed:
+                    result.status = ConfigurationStatus.FAILED
+                    result.error = f"Generation speed {gen_tok_s:.1f} tok/s below minimum threshold {min_speed:.1f} tok/s"
+                    result.score = None
+                    result.quality_score = None
+                    result.score_breakdown = None
+                    result.generation = {
+                        **(result.generation or {}),
+                        "stage": self.state.run.stage.value,
+                    }
+                    try:
+                        config_repo.save(result)
+                    except Exception as e:
+                        logger.error("Failure record save failed", error=str(e))
+                    self._log_event(
+                        "SPEED_BELOW_THRESHOLD",
+                        f"ctx={context_length} gen={gen_tok_s:.1f} tok/s < min={min_speed:.1f} tok/s",
+                    )
+                    logger.warning(
+                        "SPEED_BELOW_THRESHOLD",
+                        config_id=str(result.id),
+                        speed=gen_tok_s,
+                        min_speed=min_speed,
+                    )
+                    return result
 
             # Server demands flash attention (non-F16 KV quant): prune flash=False (R28)
             self._note_flash_requirement(result)
@@ -2345,7 +2377,7 @@ class AdaptiveOptimizer:
         self, rolled: LoadConfiguration, ctx: int
     ) -> ConfigurationResult | None:
         """Full-suite admission of a subset-passing rollback (PASSED + scored)."""
-        admitted = await self._test_config(rolled, ctx, score_context=False)
+        admitted = await self._test_config(rolled, ctx, score_context=False, min_speed=self.state.run.advanced_settings.get("min_speed", 0.0))
         if admitted is not None and admitted.status == ConfigurationStatus.PASSED:
             self._tag_phase(admitted, OptimizationPhase.RECOVERY.value)
             if admitted.id not in [c.id for c in self.state.tested_configs]:
@@ -2449,7 +2481,7 @@ class AdaptiveOptimizer:
             vcfg = LoadConfiguration(
                 **{k: v for k, v in data.items() if hasattr(LoadConfiguration, k)}
             )
-            result = await self._test_config(vcfg, best.context_length, score_context=False)
+            result = await self._test_config(vcfg, best.context_length, score_context=False, min_speed=self.state.run.advanced_settings.get("min_speed", 0.0))
             if result is not None and result.status == ConfigurationStatus.PASSED:
                 self._tag_phase(result, OptimizationPhase.FINAL_VALIDATION.value)
                 validated.append(result)

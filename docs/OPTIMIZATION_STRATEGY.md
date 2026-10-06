@@ -1,7 +1,7 @@
 # Optimization Strategy (CURRENT, implemented)
 
 > Authority for the CURRENT pipeline. Historical proposal:
-> `docs/OPTIMIZATION_STRATEGY_AUDIT.md` (superseded where it differs).
+> `docs/archive/OPTIMIZATION_STRATEGY_AUDIT.md` (superseded where it differs).
 > Benchmark procedure detail: `docs/BENCHMARK_TESTS_DETAIL.md`.
 > LM Studio capability source: registry (`parameter_registry.py`) +
 > `docs/LM_STUDIO_PARAMETER_MATRIX.md`.

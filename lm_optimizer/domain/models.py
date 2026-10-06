@@ -475,6 +475,7 @@ class OptimizationRun:
     raw_fastest_config_id: UUID | None = None
     phase_b_enabled: bool = False
     phase_b_result: dict | None = None
+    advanced_settings: dict = field(default_factory=dict)
 
     def get_best_config(self) -> ConfigurationResult | None:
         if self.best_config_id:

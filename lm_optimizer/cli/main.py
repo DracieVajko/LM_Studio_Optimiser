@@ -281,6 +281,7 @@ async def _run_optimization(
     style: str,
     advanced: dict,
     max_tokens_scale: float = 1.0,
+    min_speed: float = 0.0,
 ):
     """Shared optimize flow for the optimize/auto commands. Returns the run."""
     from lm_optimizer.services import lms_cli as _lms
@@ -319,6 +320,7 @@ async def _run_optimization(
         advanced_settings=advanced,
         style=style,
         progress_cb=advanced.pop("progress_cb", None),
+        min_speed=min_speed,
     )
 
 
@@ -1069,6 +1071,11 @@ def optimize(
         "--max-tokens-scale",
         help="Scale case max-tokens 0.25-1.0 for slow models (may fail quality gates)",
     ),
+    min_speed: float = typer.Option(
+        0.0,
+        "--min-speed",
+        help="Minimum generation tok/s to accept a config; slower configs are skipped and marked as too slow",
+    ),
     optimize_context: bool = typer.Option(
         False,
         "--optimize-context",
@@ -1165,6 +1172,7 @@ def optimize(
             advanced.update(
                 _resolve_experimental_flags(enable_rope, enable_cpu_moe, enable_speculative)
             )
+            advanced["min_speed"] = min_speed
 
             console.print(f"[bold]Starting optimization for {model}[/bold]")
             console.print(f"  Profile: {profile}")
@@ -1621,6 +1629,11 @@ def auto(
         "--max-tokens-scale",
         help="Scale case max-tokens 0.25-1.0 for slow models (may fail quality gates)",
     ),
+    min_speed: float = typer.Option(
+        0.0,
+        "--min-speed",
+        help="Minimum generation tok/s to accept a config; slower configs are skipped and marked as too slow",
+    ),
     enable_rope: bool = typer.Option(
         False,
         "--enable-rope",
@@ -1854,6 +1867,7 @@ def auto(
                             "workload_type": normalize_workload(workload),
                             "selection_threshold": 0.05,
                             "gpu_via_cli": gpu_via_cli,
+                            "min_speed": min_speed,
                             **experimental_flags,
                         }
                         run = await _run_optimization(

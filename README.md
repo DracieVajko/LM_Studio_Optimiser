@@ -5,10 +5,10 @@ Finds empirically validated inference configurations for your hardware, model an
 not theoretical optima. Includes a model-vs-model sandbox (text / HTML / 3D-scene duels),
 transparent results with per-test outputs, and a dark-mode web UI.
 
-**Status: v1.1.0 working.** Speed-first search (cheap probes → quality validation on
+**Status: v1.5.0b1.** Speed-first search (cheap probes → quality validation on
 finalists → bounded causal recovery → adaptive validation), sandbox duels with history,
 Prompt/Thinking/Output transparency, OS-following dark mode, resilient Web UI.
-408 automated tests green, E2E-validated on a live server + live LM Studio.
+513 automated tests green, E2E-validated on a live server + live LM Studio.
 
 | Platform | Status |
 |-|-|
@@ -200,6 +200,21 @@ compared on every load (mismatches recorded, never silent).
 Details: `docs/PARAMETERS.md`, generated `docs/LM_STUDIO_PARAMETER_MATRIX.md`
 (`scripts/generate_parameter_matrix.py`), `lm_optimizer/services/parameter_registry.py`.
 
+## Backends (Ollama beta)
+
+Global switch (default unchanged, LM Studio path byte-identical):
+
+```bash
+python -m lm_optimizer --backend lm-studio status     # default
+python -m lm_optimizer --backend ollama models        # Ollama sweep client (beta)
+python -m lm_optimizer ollama-export --model <tag> --param num_ctx=4096 -o best.modelfile.md
+python -m lm_optimizer ollama-apply --file best.modelfile.md --as <tag>:opt --yes
+```
+
+Ollama is beta: mocked-test evidence only, no live-server verification yet;
+llama.cpp is an explicit phase-2 stub. Live checklist: `docs/OLLAMA_LIVE_CHECK.md`.
+Design: `docs/specs/2026-10-02-multi-backend-design.md`.
+
 ## Hardware notes
 
 * Designed hardware-agnostic (no hardcoded GPU): NVIDIA/CPU paths, ASCII output,
@@ -212,7 +227,7 @@ CPU-only paths are coded and unit-tested, not physically exercised.
 
 ```bash
 pip install -e ".[dev]"
-python -m pytest -q                       # 408 tests
+python -m pytest -q                       # 513 tests
 python scripts/generate_parameter_matrix.py
 ```
 
@@ -221,6 +236,7 @@ python scripts/generate_parameter_matrix.py
 ```
 lm_optimizer/
   api/          FastAPI app, routes (single /api prefix), schemas, websocket
+  backends/     BackendClient seam + ollama/ client, registry, modelfile (llama-cpp: phase-2 stub)
   benchmark/    suite (5 fixed tests) + runner (native chat)
   cli/          commands (status..param-matrix, incl. compare/pause/ctx/resume)
   database/     SQLite + migrations (runs, duels, capability snapshots)

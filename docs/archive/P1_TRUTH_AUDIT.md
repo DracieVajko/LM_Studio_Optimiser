@@ -65,7 +65,7 @@ JS variable names); prior reports claiming them were not backed by the repo.
 
 - `pytest -q`: 125 passed, 0 failed, 0 skipped. `pytest --collect-only -q`: 125.
 - Pydantic warnings: 0 (was 3; fixed locally, verified with `-W error::DeprecationWarning`).
-- `ruff check lm_optimizer`: see `docs/P1_5_STABILIZATION_AUDIT.md` for the exact
+- `ruff check lm_optimizer`: see `docs/archive/P1_5_STABILIZATION_AUDIT.md` for the exact
   reconciliation (baseline 531 -> current 866; legacy vs new split per file/rule).
   No ruff baseline file exists in the repo. Mechanical safe fixes applied
   (unused imports, mypy type args); remaining new violations match the
