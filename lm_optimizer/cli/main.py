@@ -32,6 +32,11 @@ from lm_optimizer.services.benchmark import VALID_STYLES, BenchmarkService
 from lm_optimizer.services.context_sweep import format_report as _ctx_format
 from lm_optimizer.services.context_sweep import geometric_contexts as _ctx_ladder
 from lm_optimizer.services.context_sweep import sweep as _ctx_sweep
+from lm_optimizer.services.context_probe import (
+    NoBestConfigError,
+    probe_context,
+    resolve_best_for_sweep,
+)
 from lm_optimizer.services.hardware import hardware_detector
 from lm_optimizer.services.fit import ladder as ctx_ladder
 from lm_optimizer.services.generation_defaults import lookup as generation_lookup
@@ -2125,6 +2130,199 @@ def ctx(
 
     try:
         asyncio.run(_ctx())
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Interrupted.[/yellow]")
+        sys.exit(130)
+
+
+def _sweep_bounds(
+    best_ctx: int, max_ctx: int, model_limit: int | None = None
+) -> tuple[int, int]:
+    """Escalation interval for context-sweep: best-config ctx to --max-context.
+
+    hi is clamped to the model context limit; lo never exceeds hi so a best
+    ctx already at/above the ceiling collapses to a single probe at hi.
+    """
+    hi = int(max_ctx)
+    if model_limit:
+        hi = min(hi, int(model_limit))
+    lo = int(best_ctx or 512)
+    if lo <= 0:
+        lo = 512
+    lo = min(lo, hi)
+    return lo, hi
+
+
+_PROBE_HEADER = (
+    f"{'ctx':<7} {'gen/s':>7} {'prompt/s':>9} {'ttft_ms':>8} "
+    f"{'recall':>6} {'st':<4} error"
+)
+
+
+def _format_probe_row(p: dict) -> str:
+    """One live per-try line (ASCII only for Windows console)."""
+    status = "PASS" if p.get("ok") else "FAIL"
+    recall = "skip" if p.get("skipped_needle") else f"{p.get('recall', 0.0):.2f}"
+    err = (p.get("error") or "")[:60]
+    return (
+        f"{p['ctx']:<7} {p.get('tok_s', 0.0):>7.1f} "
+        f"{p.get('prompt_tok_s', 0.0):>9.0f} {p.get('ttft_ms', 0.0):>8.0f} "
+        f"{recall:>6} {status:<4} {err}"
+    )
+
+
+def _save_context_sweep_report(model_id: str, result: dict, out_dir: Path) -> Path | None:
+    """Minimal per-try markdown report (Task 3 provides the full version)."""
+    from lm_optimizer.services.reporting import sanitize_model_filename
+
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    safe = sanitize_model_filename(model_id)
+    path = out / f"{safe}-context-{stamp}.md"
+    tried = list(result.get("geometric", [])) + list(result.get("refinement", []))
+    lines = [
+        f"# Context sweep: {model_id} ({stamp})",
+        "",
+        f"- Maximum stable context: {result.get('maximum_stable_context')}",
+        f"- Failed boundary: {result.get('failed_boundary')}",
+        "",
+        "| ctx | gen tok/s | prompt tok/s | TTFT ms | recall | status | error |",
+        "| --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    for p in tried:
+        recall = "skipped" if p.get("skipped_needle") else f"{p.get('recall', 0.0):.2f}"
+        status = "PASS" if p.get("ok") else "FAIL"
+        lines.append(
+            f"| {p['ctx']} | {p.get('tok_s', 0.0):.1f} | "
+            f"{p.get('prompt_tok_s', 0.0):.0f} | {p.get('ttft_ms', 0.0):.0f} | "
+            f"{recall} | {status} | {(p.get('error') or '')[:80]} |"
+        )
+    try:
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except OSError as e:
+        console.print(f"[red]Cannot write report {path}: {e}[/red]")
+        return None
+    return path
+
+
+@app.command(name="context-sweep")
+def context_sweep(
+    model: str = typer.Option(..., "--model", help="Model ID (must have a stored best config)"),
+    max_context: int = typer.Option(..., "--max-context", help="Maximum context to escalate to"),
+    min_speed: float = typer.Option(
+        1.0, "--min-speed", help="Absolute tok/s floor (stop below it)"
+    ),
+    min_recall: float = typer.Option(
+        0.8, "--min-recall", help="Needle recall floor (stop below it)"
+    ),
+    skip_fill_test: bool = typer.Option(
+        False, "--skip-fill-test", help="Skip the 90%-fill needle recall gate (speed floor only)"
+    ),
+    output: Path = typer.Option(Path("results"), "--output", help="Report output directory"),
+):
+    """Escalate context on the stored best config to its absolute maximum.
+
+    Geometric ladder from the best-config ctx to --max-context, then bisect
+    refinement via sweep(). Each probe loads the best config at ctx N and
+    applies the speed floor + needle recall gates. Refuses when the model
+    has no stored best config.
+    """
+    setup_logging()
+    if max_context < 1:
+        console.print("[red]Invalid --max-context (must be >= 1)[/red]")
+        sys.exit(2)
+    if not 0.0 <= min_recall <= 1.0:
+        console.print("[red]Invalid --min-recall (must be 0-1)[/red]")
+        sys.exit(2)
+
+    async def _sweep():
+        client = get_client()
+        try:
+            await client.connect()
+            snap = await prepare_host(client, purpose="context-sweep")
+            for line in format_snapshot(snap):
+                console.print(f"  {line}")
+            if not snap.get("verified_empty") and snap.get("leftovers"):
+                console.print("[red]Stale models loaded, aborting. Unload them first.[/red]")
+                sys.exit(1)
+            try:
+                await assert_unloaded(client, purpose=f"context-sweep:{model}:pre")
+            except UnloadNotClean as e:
+                console.print(f"[red]Host not clean, aborting:[/red] {e}")
+                sys.exit(1)
+            model_info = await client.get_model(model)
+            if not model_info:
+                console.print(f"[red]Model not found: {model}[/red]")
+                sys.exit(1)
+            try:
+                best = resolve_best_for_sweep(model)
+            except NoBestConfigError as e:
+                console.print(f"[red]{e}[/red]")
+                sys.exit(1)
+            lo, hi = _sweep_bounds(
+                best["context_length"], max_context, model_info.context_limit
+            )
+            console.print(
+                f"[bold]Context sweep: {model}[/bold] "
+                f"(best ctx {best['context_length']} -> max {hi})"
+            )
+            floors = f"  floors: speed >= {min_speed:.1f} tok/s, recall >= {min_recall:.2f}"
+            if skip_fill_test:
+                floors += " (fill test skipped)"
+            console.print(floors)
+            console.print(_PROBE_HEADER)
+
+            async def _probe(ctx_len: int) -> dict:
+                res = await probe_context(
+                    client,
+                    model,
+                    best["load_config"],
+                    ctx_len,
+                    min_speed,
+                    min_recall,
+                    skip_needle=skip_fill_test,
+                )
+                console.print(_format_probe_row({"ctx": ctx_len, **res}))
+                return res
+
+            report = await _ctx_sweep(_probe, lo, hi, step=1000)
+            console.print("")
+            console.print(_ctx_format(report, model))
+            saved = _save_context_sweep_report(model, report, output)
+            if saved is not None:
+                console.print(f"[green]Report saved: {saved}[/green]")
+            if report["maximum_stable_context"] is None:
+                console.print(
+                    "[red]No stable context: the first probe already breached a floor.[/red]"
+                )
+                sys.exit(1)
+        except SystemExit:
+            raise
+        except KeyboardInterrupt:
+            console.print(
+                "\n[yellow]Interrupted — partial sweep results above are preserved.[/yellow]"
+            )
+            sys.exit(130)
+        except Exception as e:
+            logger.exception("context-sweep failed")
+            console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
+        finally:
+            try:
+                await assert_unloaded(client, purpose=f"context-sweep:{model}")
+            except UnloadNotClean as e:
+                logger.error("Host not clean after context-sweep", model=model)
+                console.print(f"[red]Done, but host not clean:[/red] {e}")
+                try:
+                    await client.close()
+                except Exception:
+                    pass
+                sys.exit(1)
+            await client.close()
+
+    try:
+        asyncio.run(_sweep())
     except KeyboardInterrupt:
         console.print("\n[yellow]Interrupted.[/yellow]")
         sys.exit(130)

@@ -7,13 +7,24 @@ unload in finally.
 """
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
-from lm_optimizer.domain.models import LoadConfiguration
+import pytest
+
+from lm_optimizer.domain.models import (
+    BenchmarkMetrics,
+    ConfigurationResult,
+    ConfigurationStatus,
+    LoadConfiguration,
+    OptimizationRun,
+)
 from lm_optimizer.services.context_probe import (
     NEEDLE_FACTS,
+    NoBestConfigError,
     build_filler,
     probe_context,
+    resolve_best_for_sweep,
     run_needle,
 )
 
@@ -133,3 +144,114 @@ def test_run_needle_recall_hits_over_asked():
     assert out["recall"] == 1.0
     assert out["fill_chars"] > 0
     assert out["prompt_tokens"] == 7000
+
+
+# ---- Task 2: context-sweep command (resolve + registration) ----
+
+
+class _EmptyRepo:
+    def get_by_model(self, model_id, limit):
+        return []
+
+
+def _measured_run(model_id="m", ctx=4096, gen=42.0):
+    best_cfg = ConfigurationResult(
+        config=LoadConfiguration(context_length=ctx),
+        context_length=ctx,
+        status=ConfigurationStatus.PASSED,
+        metrics=[
+            BenchmarkMetrics(
+                test_name="t",
+                category="c",
+                success=True,
+                generation_tok_s=gen,
+                prompt_tok_s=800.0,
+                estimated_ttft_ms=120.0,
+            )
+        ],
+        generation={"style": "balanced"},
+    )
+    run = OptimizationRun()
+    run.configurations = [best_cfg]
+    run.best_config_id = best_cfg.id
+    return run
+
+
+class _SeededRepo:
+    def __init__(self, run):
+        self._run = run
+
+    def get_by_model(self, model_id, limit):
+        return [SimpleNamespace(id=str(self._run.id))]
+
+    def get(self, run_id):
+        return self._run
+
+
+async def test_sweep_refuses_without_best_config():
+    with pytest.raises(NoBestConfigError, match="ghost-model"):
+        resolve_best_for_sweep("ghost-model", repo=_EmptyRepo())
+
+
+async def test_sweep_resolves_best_from_db():
+    out = resolve_best_for_sweep("m", repo=_SeededRepo(_measured_run()))
+    assert out["context_length"] == 4096
+    assert out["load_config"].context_length == 4096
+    assert out["gen_tok_s"] == 42.0
+
+
+async def test_probe_skips_needle_when_requested():
+    c = _client_scripted(_resp("hash tables map keys fast.", tok_s=50.0))
+    out = await probe_context(
+        c, "m", cfg(), 8192, min_speed=1.0, min_recall=0.8, skip_needle=True
+    )
+    assert out["ok"] is True
+    assert out.get("skipped_needle") is True
+    assert c.chat_completion.await_count == 1  # speed chat only, no fill chat
+
+
+def test_context_sweep_command_options():
+    import typer
+
+    from lm_optimizer.cli.main import app
+
+    info = typer.main.get_command(app)
+    cmd = info.commands["context-sweep"]
+    params = {p.name: p for p in cmd.params}
+    for name in (
+        "model",
+        "max_context",
+        "min_speed",
+        "min_recall",
+        "skip_fill_test",
+        "output",
+    ):
+        assert name in params, name
+    assert params["min_speed"].default == 1.0
+    assert params["min_recall"].default == 0.8
+
+
+def test_sweep_bounds_clamp_to_model_limit():
+    from lm_optimizer.cli.main import _sweep_bounds
+
+    assert _sweep_bounds(4096, 65536, 131072) == (4096, 65536)
+    assert _sweep_bounds(8192, 65536, 16384) == (8192, 16384)
+    assert _sweep_bounds(32768, 8192, None) == (8192, 8192)
+
+
+def test_probe_row_marks_skipped_recall():
+    from lm_optimizer.cli.main import _format_probe_row
+
+    row = _format_probe_row(
+        {
+            "ctx": 8192,
+            "ok": True,
+            "tok_s": 40.0,
+            "prompt_tok_s": 900.0,
+            "ttft_ms": 120.0,
+            "recall": 1.0,
+            "skipped_needle": True,
+            "error": "",
+        }
+    )
+    assert "8192" in row and "PASS" in row and "skip" in row

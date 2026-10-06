@@ -40,6 +40,53 @@ NEEDLE_INSTRUCTION = (
     "Now list the five key sentences verbatim, one per line:"
 )
 
+
+class NoBestConfigError(ValueError):
+    """Refusal: no stored best config for this model (run optimize first)."""
+
+
+def resolve_best_for_sweep(model_id: str, repo=None) -> dict:
+    """Stored best config for `model_id` from the run DB.
+
+    Mirrors the `manual_memory_duel._best_from_db` pattern: newest runs
+    first (`get_by_model`), full run via `get`, measured best via
+    `get_best_config`, zero-speed rows skipped. Raises NoBestConfigError
+    naming the model when nothing measurable exists; never a silent default.
+    """
+    if repo is None:
+        from lm_optimizer.database.repositories import run_repo as repo
+    try:
+        lean = repo.get_by_model(model_id, 50)
+    except Exception as e:
+        raise NoBestConfigError(
+            f"no stored best config for '{model_id}': run DB lookup failed "
+            f"({e}); run optimize first"
+        ) from e
+    for row in lean:
+        try:
+            full = repo.get(str(row.id)) or row
+            best = full.get_best_config()
+        except Exception:
+            continue
+        if best is None:
+            continue
+        gen = best.get_avg_generation_tok_s()
+        if gen <= 0:
+            continue
+        return {
+            "model_id": model_id,
+            "gen_tok_s": gen,
+            "ttft_ms": best.get_avg_estimated_ttft_ms(),
+            "context_length": best.context_length,
+            "load_config": best.config,
+            "style": (best.generation or {}).get("style", "balanced"),
+            "source": "run-db",
+            "run_id": str(full.id),
+        }
+    raise NoBestConfigError(
+        f"no stored best config for '{model_id}': run optimize first"
+    )
+
 _FILLER_SENTENCES = (
     "The quarterly inventory lists grain shipments by weight and origin.",
     "Clerks recorded rainfall totals in the margin of each ledger page.",
@@ -152,12 +199,17 @@ async def probe_context(
     ctx: int,
     min_speed: float,
     min_recall: float,
+    skip_needle: bool = False,
 ) -> dict:
     """Load best config at ctx, run speed + needle gates, always unload.
 
-    Returns {ctx, ok, tok_s, prompt_tok_s, ttft_ms, recall, error}.
-    ok requires load ok AND tok_s >= min_speed AND recall >= min_recall.
+    Returns {ctx, ok, tok_s, prompt_tok_s, ttft_ms, recall, skipped_needle,
+    error}. ok requires load ok AND tok_s >= min_speed AND recall >=
+    min_recall. With skip_needle=True the 90%-fill needle chat is not sent
+    (recall reported 1.0 with skipped_needle True; speed gate still applies).
     """
+
+    skipped = bool(skip_needle)
 
     def _fail(
         tok_s: float, prompt_tok_s: float, ttft_ms: float, recall: float, error: str
@@ -169,6 +221,7 @@ async def probe_context(
             "prompt_tok_s": prompt_tok_s,
             "ttft_ms": ttft_ms,
             "recall": recall,
+            "skipped_needle": skipped,
             "error": error,
         }
 
@@ -208,6 +261,17 @@ async def probe_context(
                 0.0,
                 f"speed {tok_s:.1f} tok/s below floor {min_speed:.1f} tok/s",
             )
+        if skipped:
+            return {
+                "ctx": ctx,
+                "ok": True,
+                "tok_s": tok_s,
+                "prompt_tok_s": prompt_tok_s,
+                "ttft_ms": ttft_ms,
+                "recall": 1.0,
+                "skipped_needle": True,
+                "error": "",
+            }
         try:
             needle = await run_needle(client, model_id, probe_cfg, ctx)
         except Exception as e:
@@ -236,6 +300,7 @@ async def probe_context(
             "prompt_tok_s": prompt_tok_s,
             "ttft_ms": ttft_ms,
             "recall": recall,
+            "skipped_needle": skipped,
             "error": "",
         }
     finally:
