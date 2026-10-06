@@ -218,17 +218,22 @@ async def probe_context(
 ) -> dict:
     """Load best config at ctx, run speed + needle gates, always unload.
 
-    Returns {ctx, ok, tok_s, prompt_tok_s, ttft_ms, recall, skipped_needle,
-    error, output_text, thinking_text, prompt, prompt_tokens, fill_chars,
-    speed_output, speed_thinking_text}. ok requires load ok AND
+    Returns {ctx, ok, tok_s, prompt_tok_s, ttft_ms, recall, needle_ran,
+    skipped_needle, error, output_text, thinking_text, prompt, prompt_tokens,
+    fill_chars, speed_output, speed_thinking_text}. ok requires load ok AND
     tok_s >= min_speed AND recall >= min_recall. output_text/thinking_text
     are the verbatim needle response (and reasoning trace, if any);
     prompt is the needle prompt sent; prompt_tokens is the measured
     server-reported value; speed_* are the verbatim speed-chat response.
     Keys default to ""/0 on paths where that chat never ran, so the
     report can always render real texts instead of placeholders.
-    With skip_needle=True the 90%-fill needle chat is not sent
-    (recall reported 1.0 with skipped_needle True; speed gate still applies).
+    recall is None with needle_ran False on every path where the needle
+    chat never ran (load/config/generation failure, speed-floor breach,
+    needle error, or skip_needle=True); it is a measured float with
+    needle_ran True only when the needle chat completed. With
+    skip_needle=True the 90%-fill needle chat is not sent
+    (recall None with skipped_needle True and needle_ran False;
+    speed gate still applies).
     """
 
     skipped = bool(skip_needle)
@@ -237,9 +242,10 @@ async def probe_context(
         tok_s: float,
         prompt_tok_s: float,
         ttft_ms: float,
-        recall: float,
+        recall: float | None,
         error: str,
         extra: dict | None = None,
+        needle_ran: bool = False,
     ) -> dict:
         out = {
             "ctx": ctx,
@@ -248,6 +254,7 @@ async def probe_context(
             "prompt_tok_s": prompt_tok_s,
             "ttft_ms": ttft_ms,
             "recall": recall,
+            "needle_ran": needle_ran,
             "skipped_needle": skipped,
             "error": error,
             "output_text": "",
@@ -266,14 +273,14 @@ async def probe_context(
         try:
             probe_cfg = dataclasses.replace(load_config, context_length=ctx)
         except Exception as e:
-            return _fail(0.0, 0.0, 0.0, 0.0, f"config failed: {e}")
+            return _fail(0.0, 0.0, 0.0, None, f"config failed: {e}")
         try:
             res = await client.load_model(model_id, probe_cfg)
         except Exception as e:
-            return _fail(0.0, 0.0, 0.0, 0.0, f"load failed: {type(e).__name__}: {e}")
+            return _fail(0.0, 0.0, 0.0, None, f"load failed: {type(e).__name__}: {e}")
         if not getattr(res, "success", False):
             return _fail(
-                0.0, 0.0, 0.0, 0.0, f"load failed: {getattr(res, 'error', 'unknown')}"
+                0.0, 0.0, 0.0, None, f"load failed: {getattr(res, 'error', 'unknown')}"
             )
         start = time.perf_counter()
         try:
@@ -285,7 +292,7 @@ async def probe_context(
             )
         except Exception as e:
             return _fail(
-                0.0, 0.0, 0.0, 0.0, f"generation failed: {type(e).__name__}: {e}"
+                0.0, 0.0, 0.0, None, f"generation failed: {type(e).__name__}: {e}"
             )
         wall_ms = (time.perf_counter() - start) * 1000
         usage, speed_text, stats = _extract(resp)
@@ -300,7 +307,7 @@ async def probe_context(
                 tok_s,
                 prompt_tok_s,
                 ttft_ms,
-                0.0,
+                None,
                 f"speed {tok_s:.1f} tok/s below floor {min_speed:.1f} tok/s",
                 extra=speed_extra,
             )
@@ -311,7 +318,8 @@ async def probe_context(
                 "tok_s": tok_s,
                 "prompt_tok_s": prompt_tok_s,
                 "ttft_ms": ttft_ms,
-                "recall": 1.0,
+                "recall": None,
+                "needle_ran": False,
                 "skipped_needle": True,
                 "error": "",
                 "output_text": "",
@@ -328,7 +336,7 @@ async def probe_context(
                 tok_s,
                 prompt_tok_s,
                 ttft_ms,
-                0.0,
+                None,
                 f"needle failed: {type(e).__name__}: {e}",
                 extra=speed_extra,
             )
@@ -351,6 +359,7 @@ async def probe_context(
                 recall,
                 f"recall {recall:.2f} ({hits}/{asked}) below floor {min_recall:.2f}",
                 extra=needle_extra,
+                needle_ran=True,
             )
         return {
             "ctx": ctx,
@@ -359,6 +368,7 @@ async def probe_context(
             "prompt_tok_s": prompt_tok_s,
             "ttft_ms": ttft_ms,
             "recall": recall,
+            "needle_ran": True,
             "skipped_needle": skipped,
             "error": "",
             **needle_extra,

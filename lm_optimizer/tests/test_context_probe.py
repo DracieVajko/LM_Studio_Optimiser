@@ -502,3 +502,48 @@ def test_optimize_has_skip_context_flag_default_off():
     params = {p.name: p for p in cmd.params}
     assert "skip_context" in params
     assert params["skip_context"].default is False
+
+
+# ---- Fix round 2 (I1): unmeasured recall is None + needle_ran False ----
+
+
+def test_probe_speed_breach_has_no_measured_recall():
+    slow = _client_scripted(_resp("short answer here.", tok_s=0.3))
+    out = asyncio.run(
+        probe_context(slow, "m", cfg(), 8192, min_speed=1.0, min_recall=0.8)
+    )
+    assert out["ok"] is False and "speed" in out["error"]
+    assert out["recall"] is None
+    assert out["needle_ran"] is False
+
+
+async def test_probe_skipped_needle_has_no_measured_recall():
+    c = _client_scripted(_resp("hash tables map keys fast.", tok_s=50.0))
+    out = await probe_context(
+        c, "m", cfg(), 8192, min_speed=1.0, min_recall=0.8, skip_needle=True
+    )
+    assert out["ok"] is True
+    assert out["recall"] is None
+    assert out["needle_ran"] is False
+    assert out.get("skipped_needle") is True
+
+
+def test_context_report_renders_na_when_needle_not_run(tmp_path):
+    from lm_optimizer.services.reporting import save_context_report
+
+    breached = probe_fail(8192, recall=None, needle_ran=False)
+    text = save_context_report(
+        "m", [probe_ok(4096), breached], trio(), tmp_path
+    ).read_text(encoding="utf-8")
+    assert "n/a (needle not run)" in text
+
+
+def test_context_report_keeps_measured_zero_recall(tmp_path):
+    from lm_optimizer.services.reporting import save_context_report
+
+    measured_zero = probe_fail(8192, recall=0.0, needle_ran=True)
+    text = save_context_report(
+        "m", [measured_zero], trio(), tmp_path
+    ).read_text(encoding="utf-8")
+    assert "0.00" in text
+    assert "n/a (needle not run)" not in text

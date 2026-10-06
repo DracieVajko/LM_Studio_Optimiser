@@ -389,9 +389,12 @@ def save_context_report(
     """Save a context-sweep .md with per-try table + full verbatim outputs.
 
     probes: per-try probe dicts {ctx, ok, tok_s, prompt_tok_s, ttft_ms,
-    recall, error, skipped_needle, prompt_tokens, fill_chars, output_text,
-    thinking_text, prompt, speed_output, speed_thinking_text}
+    recall, needle_ran, error, skipped_needle, prompt_tokens, fill_chars,
+    output_text, thinking_text, prompt, speed_output, speed_thinking_text}
     (legacy speed_output/needle_output/output keys still honored).
+    recall is None with needle_ran False on rows where the needle chat
+    never ran; such rows render `n/a (needle not run)` while a genuinely
+    measured zero recall still renders `0.00`.
     Missing keys render as honest placeholders. Texts render verbatim in
     fenced blocks (inner fences escaped, pipes untouched inside fences).
     trio: {stable, optimal, recommended} (also accepts
@@ -434,7 +437,13 @@ def save_context_report(
         "| --- | --- | --- | --- | --- | --- | --- |",
     ]
     for p in tried:
-        recall = "skipped" if p.get("skipped_needle") else f"{float(p.get('recall', 0.0) or 0.0):.2f}"
+        recall_val = p.get("recall")
+        if p.get("skipped_needle"):
+            recall = "skipped"
+        elif recall_val is None or p.get("needle_ran") is False:
+            recall = "n/a (needle not run)"
+        else:
+            recall = f"{float(recall_val):.2f}"
         status = "PASS" if p.get("ok") else "FAIL"
         lines.append(
             f"| {p.get('ctx')} | {float(p.get('tok_s', 0.0) or 0.0):.1f} | "

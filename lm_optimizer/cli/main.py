@@ -192,6 +192,12 @@ async def _run_optimization(
     """Shared optimize flow for the optimize/auto commands. Returns the run."""
     from lm_optimizer.services import lms_cli as _lms
 
+    if advanced.get("skip_context") and advanced.get("custom_contexts"):
+        dropped = list(advanced.get("custom_contexts") or [])
+        console.print(
+            f"[yellow]--skip-context is set: ignoring custom_contexts={dropped}[/yellow]"
+        )
+        logger.warning("skip_context is set: ignoring custom_contexts=%s", dropped)
     gpu_via_cli = bool(advanced.get("gpu_via_cli", False)) and _lms.lms_available()
     if advanced.get("gpu_via_cli") and not _lms.lms_available():
         console.print(
@@ -2175,7 +2181,12 @@ _PROBE_HEADER = (
 def _format_probe_row(p: dict) -> str:
     """One live per-try line (ASCII only for Windows console)."""
     status = "PASS" if p.get("ok") else "FAIL"
-    recall = "skip" if p.get("skipped_needle") else f"{p.get('recall', 0.0):.2f}"
+    if p.get("skipped_needle"):
+        recall = "skip"
+    elif p.get("recall") is None or p.get("needle_ran") is False:
+        recall = "n/a"
+    else:
+        recall = f"{p.get('recall', 0.0):.2f}"
     err = (p.get("error") or "")[:60]
     return (
         f"{p['ctx']:<7} {p.get('tok_s', 0.0):>7.1f} "

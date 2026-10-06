@@ -636,3 +636,6 @@ Trio verdicts: maximum stable context (last pass), performance-optimal
   dimensions (GPU, flash, KV, batch, stage-4) sweep normally, so the run
   finds the fastest runtime cheaply; escalate context afterwards with
   `context-sweep`.
+- `--skip-context` ON ignores any `custom_contexts` (a warning naming the
+  dropped values is logged and printed); drop the flag or the custom list
+  to avoid the warning.

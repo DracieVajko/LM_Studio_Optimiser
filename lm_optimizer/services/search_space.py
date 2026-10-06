@@ -146,6 +146,12 @@ class SearchSpaceGenerator:
         if advanced.get("skip_context", False):
             anchor = 4096
             chosen = max(min_ctx, min(anchor, max_ctx))
+            custom = advanced.get("custom_contexts", [])
+            if custom:
+                logger.warning(
+                    "skip_context is set: ignoring custom_contexts=%s",
+                    list(custom),
+                )
             return [chosen]
 
         # Standard candidates - benchmark-specific (powers of 2 and common context sizes)
