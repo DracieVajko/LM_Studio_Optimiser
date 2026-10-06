@@ -302,6 +302,7 @@ def _optimize_advanced(
     workload: str,
     gpu_via_cli: bool,
     optimize_context: bool,
+    skip_context: bool = False,
 ) -> dict:
     """Advanced settings for the optimize command (Phase A/B keys included)."""
     return {
@@ -318,6 +319,7 @@ def _optimize_advanced(
         "selection_threshold": 0.05,
         "gpu_via_cli": gpu_via_cli,
         "optimize_context": optimize_context,
+        "skip_context": skip_context,
     }
 
 
@@ -983,6 +985,11 @@ def optimize(
         "--optimize-context",
         help="Phase B opt-in: max-context sweep on the frozen runtime winner",
     ),
+    skip_context: bool = typer.Option(
+        False,
+        "--skip-context",
+        help="Skip context-dimension sweep (single small context; escalate later via context-sweep)",
+    ),
     enable_rope: bool = typer.Option(
         False,
         "--enable-rope",
@@ -1042,6 +1049,7 @@ def optimize(
                 workload,
                 gpu_via_cli,
                 optimize_context,
+                skip_context,
             )
 
             if dry_run:

@@ -572,3 +572,67 @@ silent.
 - Capability snapshots carry a backend string; `OptimizationRun` itself
   has no backend field — do not mix runs from different backends in one
   comparison until per-run tagging lands.
+
+---
+
+## 15. Context sweep (post-optimize escalation)
+
+`context-sweep` escalates context on the **stored best config** to its
+absolute maximum. Use it after `optimize` when the main sweep kept
+context small: first find the fastest stable runtime, then push context
+as far as speed and recall allow.
+
+### 15.1 Usage
+
+```
+lm-optimizer context-sweep --model <id> --max-context N \
+  [--min-speed 1.0] [--min-recall 0.8] [--skip-fill-test] [--output results]
+```
+
+- Refuses with a named reason when the model has no stored best config
+  (never a silent default).
+- Each probe loads the best config at ctx N (one load per probe, unload
+  in `finally`), then runs one short benchmark plus one 90%-fill needle
+  recall. Fail-closed unload + verified-empty apply between probes.
+- Live per-try table (`ctx | gen tok/s | prompt tok/s | TTFT | recall |
+  status | error`) plus a saved `<model>-context-<stamp>.md` report with
+  the same table, trio verdicts, fill-ratio notes, and full verbatim
+  outputs.
+
+### 15.2 Defaults
+
+- `--min-speed 1.0`: absolute generation tok/s floor. A probe below it
+  stops the escalation with a `speed ... below floor ...` reason. A
+  breach on the FIRST probe stops immediately (no zero-length
+  escalation); the report records no stable context.
+- `--min-recall 0.8`: needle recall floor over asked facts only
+  (case-insensitive substring hits / asked; truncation of the 90%
+  filler narrows the denominator, with the measured fill-ratio stated).
+  A probe below it stops with a `recall ... below floor ...` reason.
+- `--skip-fill-test` (default OFF): speed floor only; the recall column
+  shows `skip`.
+
+### 15.3 Two-phase flow
+
+1. **Geometric ladder**: powers-of-two (and mid) steps from the
+   best-config ctx up to `--max-context` (clamped to the model context
+   limit), via `context_sweep.sweep()`.
+2. **Bisect refinement**: 50% bisection between the last pass and the
+   first failure, same probe contract (`{ctx, ok, tok_s, error}`),
+   until the step granularity (1000) resolves the boundary.
+
+Trio verdicts: maximum stable context (last pass), performance-optimal
+(the fastest passing probe), balanced recommended.
+
+### 15.4 `--skip-context` on `optimize` (default OFF)
+
+- Default OFF is byte-identical to the legacy path: the full context
+  candidate list (`[2048, 4096, ...]` filtered to
+  `[--min-context, --max-context]`, always including the model max) is
+  generated unchanged.
+- `--skip-context` ON collapses the ctx dimension to the fixed small
+  set `[4096]` (clamped into `[min_context, max_context]` so tiny-limit
+  models stay valid, e.g. a 2048-limit model yields `[2048]`). Other
+  dimensions (GPU, flash, KV, batch, stage-4) sweep normally, so the run
+  finds the fastest runtime cheaply; escalate context afterwards with
+  `context-sweep`.

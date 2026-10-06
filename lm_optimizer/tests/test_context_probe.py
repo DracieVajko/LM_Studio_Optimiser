@@ -435,3 +435,70 @@ def test_probe_to_report_has_no_placeholders(tmp_path):
     assert "_No stored needle output._" not in text
     assert "_No stored speed output._" not in text
     assert "measured prompt_tokens=7000" in text
+
+
+# ---- Task 4: --skip-context flag (context candidate collapse) ----
+
+
+def generate_space(skip_context=False, min_context=2048, max_context=32768,
+                   context_limit=32768):
+    """Test helper threading the same path the CLI flags use.
+
+    Builds a SearchSpaceGenerator with a stub client and returns the
+    context candidate list for the given advanced settings.
+    """
+    from unittest.mock import MagicMock
+
+    from lm_optimizer.domain.models import GPUInfo, HardwareInfo, ModelIdentity
+    from lm_optimizer.domain.models import OptimizationProfile
+    from lm_optimizer.services.lm_studio import LMStudioCapabilities
+    from lm_optimizer.services.search_space import SearchSpaceGenerator
+
+    cap = LMStudioCapabilities()
+    cap.supports_context_length = True
+    cap.supports_gpu_ratio = True
+    cap.supports_flash_attention = True
+    cap.supports_kv_cache_placement = True
+    cap.supports_eval_batch_size = True
+    client = MagicMock()
+    client.capabilities = cap
+    gen = SearchSpaceGenerator(client)
+    model = ModelIdentity(id="m", name="m", context_limit=context_limit)
+    hw = HardwareInfo(
+        os="Linux",
+        cpu_name="TestCPU",
+        cpu_cores_physical=8,
+        cpu_cores_logical=16,
+        total_ram_gb=32,
+        gpu_count=1,
+        gpus=[GPUInfo(index=0, name="TestGPU", vram_gb=6, vendor="NVIDIA")],
+    )
+    space = gen.generate(
+        model,
+        hw,
+        OptimizationProfile.BALANCED,
+        {"min_context": min_context, "max_context": max_context,
+         "skip_context": skip_context},
+    )
+    return list(space.context_lengths)
+
+
+def test_skip_context_flag_collapses_candidates():
+    space = generate_space(skip_context=True)
+    assert space == sorted(set(space)) and len(space) <= 2
+
+
+def test_skip_context_off_is_byte_identical_default():
+    assert generate_space() == generate_space(skip_context=False)
+
+
+def test_optimize_has_skip_context_flag_default_off():
+    import typer
+
+    from lm_optimizer.cli.main import app
+
+    info = typer.main.get_command(app)
+    cmd = info.commands["optimize"]
+    params = {p.name: p for p in cmd.params}
+    assert "skip_context" in params
+    assert params["skip_context"].default is False

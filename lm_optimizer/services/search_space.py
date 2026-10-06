@@ -140,6 +140,14 @@ class SearchSpaceGenerator:
         max_ctx_setting = advanced.get("max_context", max_ctx)
         max_ctx = min(max_ctx, max_ctx_setting)
 
+        # --skip-context: collapse the ctx dimension to one fixed small
+        # anchor (clamped into [min_ctx, max_ctx] so tiny-limit models stay
+        # valid). Escalate later via `context-sweep` on the stored best.
+        if advanced.get("skip_context", False):
+            anchor = 4096
+            chosen = max(min_ctx, min(anchor, max_ctx))
+            return [chosen]
+
         # Standard candidates - benchmark-specific (powers of 2 and common context sizes)
         # These are test points, not scoring constants. Documented in docs/OPTIMIZATION_METHOD.md
         candidates = [2048, 4096, 8192, 12288, 16384, 24576, 32768, 65536, 131072]
