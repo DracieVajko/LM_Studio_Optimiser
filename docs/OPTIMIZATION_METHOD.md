@@ -469,7 +469,112 @@ For implementation details, see `lm_optimizer/scoring/normalization.py`, `lm_opt
 
 ---
 
-## 14. Ollama Backend (Phase 1)
+## 15. Single-Model Invariant & Job Lock
+
+The optimizer enforces two invariants on every run:
+
+1. **Single-model invariant**: The LM Studio endpoint never holds two loaded models simultaneously. If a foreign model is present when a run starts, the optimizer attempts to unload it and waits for the endpoint to become empty before proceeding.
+2. **Single-job invariant**: Only one optimizer job runs at a time on a given machine. A cross-process lock file coordinates CLI and web invocations; a second concurrent job is refused with a clear message.
+
+Both invariants are **fail-closed**: any doubt about endpoint state aborts the load rather than measuring blindly.
+
+### 15.1 Wait Loop (Foreign Model Eviction)
+
+When `prepare_host` is called (every CLI command and every web run-start), it invokes `ensure_exclusive_access` which:
+
+1. Lists currently loaded instances via `client.get_loaded_instances()`.
+2. If none: returns immediately — no delay, no lock contention.
+3. Otherwise: calls `client.ensure_unloaded(model)` for each blocker (falls back to `unload_all`).
+4. **Re-checks immediately after each unload attempt** — a successful eviction never sleeps through the wait interval.
+4. If still loaded: sleeps `wait_interval_s` seconds and repeats, up to `max_waits` times.
+
+**Defaults**: `wait_interval_s = 60.0` seconds, `max_waits = 30` (total budget ≈ 30 minutes).
+
+**CLI flags** (on `optimize`, `auto`, `fit`, `ctx`):
+```
+--wait-interval FLOAT   Seconds between re-checks (default: 60.0)
+--max-waits INT         Max re-checks before giving up (default: 30)
+```
+
+**Outcomes**:
+- Endpoint clears within budget → run proceeds normally.
+- Budget exhausted → `HostBusyTimeout` raised with `.blocker` = list of model IDs still loaded.
+  - `optimize` command: prints a **pause** message with a resume hint (nothing started yet, so no checkpoint needed). User unloads the model in LM Studio and re-runs the same command; in-progress runs resume via `lm-optimizer resume <run-id>`.
+  - All other commands (`auto`, `fit`, `ctx`, `benchmark`, etc.): abort with a clear message and exit 1.
+- Endpoint state unverifiable (no instance listing, transport error) → treated as busy (fail-closed), same as above.
+
+The wait loop is implemented in `lm_optimizer/services/hostguard.py:ensure_exclusive_access`.
+
+### 15.2 Cross-Process Job Lock
+
+A file lock at `results/.optimizer.lock` (resolved from the configured results directory, gitignored, created at runtime) guarantees that only one optimizer job runs at a time across all CLI commands and the web server.
+
+**Lock content** (JSON):
+```json
+{ "pid": 12345, "started": 1728000000.0, "purpose": "optimize:my-model" }
+```
+
+**Acquisition** (`acquire_lock` in `lm_optimizer/services/joblock.py`):
+- Atomic create via `os.open(..., O_CREAT|O_EXCL|O_WRONLY)` — two jobs starting in the same millisecond resolve to exactly one winner.
+- If lock exists and holder PID is alive (via `psutil.pid_exists`) → `JobBusyError` raised with `.holder` dict.
+- If holder PID is dead (kill -9, crash without `finally`) → **stale takeover**: lock file removed, new lock acquired, warning logged.
+- A lost create race after a stale unlink re-reads the winner and refuses instead of double-running.
+
+**Release** (`release_lock`): idempotent; removes the lock file only when the PID matches the caller; missing file is a no-op; foreign lock is never removed.
+
+**CLI wiring**: `_acquire_run_lock(purpose)` called at command entry, `release_lock()` in `finally` block. Purposes: `optimize:<model>`, `auto`, `fit`, `ctx:<model>`, `resume:<run-id>`, `benchmark`, `manual-memory-duel`.
+
+**Web wiring** (`lm_optimizer/api/routes.py`):
+- `POST /optimize` and `POST /optimize/{run_id}/resume-run` acquire the lock before starting the background task.
+- On `JobBusyError`: returns **HTTP 409 Conflict** with detail:
+  ```
+  "Optimizer job already running (pid 12345, purpose 'optimize:other-model')."
+  ```
+- Lock released in the background task's `finally` block (success, cancellation, or exception).
+
+### 15.3 Pause + Resume Flow (Optimize Only)
+
+The `optimize` command is the only one that **pauses** (rather than aborts) when the wait budget exhausts:
+
+```
+[YELLOW]Host busy: <model-id> still loaded - pausing before start.[/YELLOW]
+  Host busy before optimize: still loaded after 30 waits: <model-id>. Unload the model in LM Studio and retry.
+Nothing was started, so no checkpoint was needed.
+Unload the model in LM Studio (disable Keep Model in Memory),
+then re-run: lm-optimizer optimize <model>
+In-progress runs resume with: lm-optimizer resume <run-id>
+  (list them with: lm-optimizer checkpoints)
+```
+
+Rationale: `optimize` is the primary interactive command. The pause message guides the user to free the host and re-run the exact same command (which picks up a fresh wait budget). Runs that were already in progress (have a checkpoint) resume via the standard `resume` command.
+
+### 15.4 Web Server 409 Semantics
+
+| Endpoint | Condition | Response |
+|----------|-----------|----------|
+| `POST /optimize` | Another job holds the lock (live PID) | 409 Conflict + holder PID + purpose |
+| `POST /optimize/{run_id}/resume-run` | Another job holds the lock | 409 Conflict + holder PID + purpose |
+| `POST /optimize` | Host not clean (foreign model, `assert_unloaded` fails) | 409 Conflict + error detail (truncated to 300 chars) |
+| `POST /optimize` | Optimization already running in this process (`_current_optimizer` active) | 409 Conflict "Optimization already running" |
+
+The web server runs **single-worker** by design. Multi-worker deployments (e.g. Gunicorn with workers>1) share the same lock file; only one worker can hold the lock at a time, others receive 409 — this is the documented requirement, not a bug.
+
+### 15.5 Configuration Constants
+
+| Constant | Value | Location |
+|----------|-------|----------|
+| Default wait interval | 60.0 seconds | `hostguard.py`, CLI defaults |
+| Default max waits | 30 | `hostguard.py`, CLI defaults |
+| Lock file name | `.optimizer.lock` | `joblock.py:LOCK_NAME` |
+| Lock directory | `config.storage.results_dir` (default `results/`) | `joblock.py:LOCK_PATH` |
+| Stale PID check | `psutil.pid_exists(pid)` | `joblock.py:_holder_alive` |
+| Lock content fields | `pid`, `started` (epoch), `purpose` | `joblock.py:acquire_lock` |
+
+All reports and messages use **ASCII-only** text (no emoji, no Unicode box-drawing) to remain readable in any terminal encoding.
+
+---
+
+## 16. Ollama Backend (Phase 1)
 
 Second inference backend behind the `BackendClient` seam
 (`lm_optimizer/backends/base.py`; spec
