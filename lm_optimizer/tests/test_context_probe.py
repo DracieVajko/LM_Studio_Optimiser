@@ -41,7 +41,7 @@ def _load_ok():
 
 
 def _resp(text: str, tok_s: float, prompt_tokens: int = 20,
-          completion_tokens: int = 10) -> dict:
+          completion_tokens: int = 10, thinking: str = "") -> dict:
     return {
         "choices": [{"message": {"content": text}}],
         "usage": {
@@ -53,6 +53,7 @@ def _resp(text: str, tok_s: float, prompt_tokens: int = 20,
             "tokens_per_second": tok_s,
             "time_to_first_token_seconds": 0.05,
         },
+        "thinking_text": thinking,
     }
 
 
@@ -349,3 +350,88 @@ def test_context_sweep_uses_save_context_report():
 
     assert callable(getattr(reporting, "save_context_report", None))
     assert not hasattr(cli_main, "_save_context_sweep_report")
+
+
+# ---- Fix round 1: live probe dicts must carry verbatim texts ----
+
+
+def test_run_needle_returns_text_thinking_and_prompt():
+    c = _client_scripted(
+        _resp("alpha one.", tok_s=40.0, prompt_tokens=7000, thinking="needle thought")
+    )
+    out = asyncio.run(run_needle(c, "m", cfg(), 8192, fill_ratio=0.9))
+    assert out["output_text"] == "alpha one."
+    assert out["thinking_text"] == "needle thought"
+    assert out["prompt_tokens"] == 7000
+    assert NEEDLE_FACTS[0] in out["prompt"]
+    assert out["prompt"].startswith("Read the document")
+
+
+def test_probe_returns_outputs_thinking_prompt_and_tokens():
+    needle_text = "\n".join(NEEDLE_FACTS)
+    c = _client_scripted(
+        _resp("hash tables map keys fast.", tok_s=50.0, thinking="speed thought"),
+        _resp(needle_text, tok_s=40.0, prompt_tokens=7000, thinking="needle thought"),
+    )
+    out = asyncio.run(
+        probe_context(c, "m", cfg(), 8192, min_speed=1.0, min_recall=0.8)
+    )
+    assert out["ok"] is True
+    assert out["output_text"] == needle_text
+    assert out["thinking_text"] == "needle thought"
+    assert out["prompt_tokens"] == 7000
+    assert NEEDLE_FACTS[0] in out["prompt"]
+    assert out["speed_output"] == "hash tables map keys fast."
+    assert out["speed_thinking_text"] == "speed thought"
+
+
+def test_probe_recall_fail_keeps_outputs_and_prompt():
+    c = _client_scripted(
+        _resp("hash tables map keys fast.", tok_s=50.0),
+        _resp("I do not know any facts.", tok_s=40.0, prompt_tokens=7000),
+    )
+    out = asyncio.run(
+        probe_context(c, "m", cfg(), 8192, min_speed=1.0, min_recall=0.8)
+    )
+    assert out["ok"] is False and "recall" in out["error"]
+    assert out["output_text"] == "I do not know any facts."
+    assert out["prompt_tokens"] == 7000
+    assert NEEDLE_FACTS[0] in out["prompt"]
+    assert out["speed_output"] == "hash tables map keys fast."
+
+
+def test_context_report_renders_outputs_thinking_and_prompt(tmp_path):
+    from lm_optimizer.services.reporting import save_context_report
+
+    probe = probe_ok(
+        4096,
+        output_text="verbatim out | pipe\n```\ninner\n```\ndone",
+        thinking_text="think | trace",
+        prompt="sent prompt | text",
+        prompt_tokens=7000,
+    )
+    text = save_context_report("m", [probe], trio(), tmp_path).read_text(encoding="utf-8")
+    assert "verbatim out | pipe" in text  # pipes untouched inside fences
+    assert "think | trace" in text
+    assert "sent prompt | text" in text
+    assert "\n```\ninner\n```\n" not in text  # inner fences escaped
+
+
+def test_probe_to_report_has_no_placeholders(tmp_path):
+    from lm_optimizer.services.reporting import save_context_report
+
+    needle_text = "\n".join(NEEDLE_FACTS)
+    c = _client_scripted(
+        _resp("hash tables map keys fast.", tok_s=50.0),
+        _resp(needle_text, tok_s=40.0, prompt_tokens=7000),
+    )
+    probe = asyncio.run(
+        probe_context(c, "m", cfg(), 8192, min_speed=1.0, min_recall=0.8)
+    )
+    text = save_context_report(
+        "m", [probe], {"stable": 8192, "optimal": 8192, "recommended": 8192}, tmp_path
+    ).read_text(encoding="utf-8")
+    assert needle_text in text
+    assert "_No stored needle output._" not in text
+    assert "_No stored speed output._" not in text
+    assert "measured prompt_tokens=7000" in text

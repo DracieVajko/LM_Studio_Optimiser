@@ -389,8 +389,11 @@ def save_context_report(
     """Save a context-sweep .md with per-try table + full verbatim outputs.
 
     probes: per-try probe dicts {ctx, ok, tok_s, prompt_tok_s, ttft_ms,
-    recall, error, skipped_needle, prompt_tokens, fill_chars,
-    speed_output, needle_output}. Missing keys render as N/A/empty.
+    recall, error, skipped_needle, prompt_tokens, fill_chars, output_text,
+    thinking_text, prompt, speed_output, speed_thinking_text}
+    (legacy speed_output/needle_output/output keys still honored).
+    Missing keys render as honest placeholders. Texts render verbatim in
+    fenced blocks (inner fences escaped, pipes untouched inside fences).
     trio: {stable, optimal, recommended} (also accepts
     maximum_stable_context/performance_optimal/balanced_recommended
     spellings; dict values with "ctx" are unwrapped).
@@ -467,16 +470,51 @@ def save_context_report(
         lines += [f"### ctx {p.get('ctx')} ({status})", ""]
         speed_out = p.get("speed_output", p.get("speed_text", ""))
         needle_out = p.get(
-            "needle_output", p.get("output", p.get("response_text", p.get("text", "")))
+            "output_text",
+            p.get("needle_output", p.get("output", p.get("response_text", p.get("text", "")))),
         )
+        thinking_out = p.get("thinking_text", "")
+        prompt_out = p.get("prompt", "")
         if speed_out:
             lines += ["Speed probe output:", "", "```", _escape_fence(speed_out), "```", ""]
         else:
             lines += ["_No stored speed output._", ""]
+        speed_thinking = p.get("speed_thinking_text", "")
+        if speed_thinking:
+            lines += [
+                "Speed probe thinking:",
+                "",
+                "```",
+                _escape_fence(speed_thinking),
+                "```",
+                "",
+            ]
         if needle_out:
             lines += ["Needle probe output:", "", "```", _escape_fence(needle_out), "```", ""]
         else:
             lines += ["_No stored needle output._", ""]
+        if thinking_out:
+            lines += [
+                "Needle probe thinking:",
+                "",
+                "```",
+                _escape_fence(thinking_out),
+                "```",
+                "",
+            ]
+        else:
+            lines += ["_No stored thinking._", ""]
+        if prompt_out:
+            lines += [
+                f"Needle prompt sent ({len(str(prompt_out))} chars):",
+                "",
+                "```",
+                _escape_fence(prompt_out),
+                "```",
+                "",
+            ]
+        else:
+            lines += ["_No stored needle prompt._", ""]
     lines += [""]
     path.write_text("\n".join(lines), encoding="utf-8")
     logger.info("Context sweep report saved", model=model_id, path=str(path))

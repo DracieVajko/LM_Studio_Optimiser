@@ -133,6 +133,14 @@ def _extract(response: dict) -> tuple[dict, str, dict]:
     return usage, text, stats
 
 
+def _thinking(response: dict) -> str:
+    """Reasoning trace, if the backend returned one ("" otherwise)."""
+    try:
+        return response.get("thinking_text", "") or ""
+    except Exception:
+        return ""
+
+
 def _speeds(usage: dict, stats: dict, wall_ms: float) -> tuple[float, float, float]:
     """(tok_s, prompt_tok_s, ttft_ms) mirroring benchmark case math."""
     prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
@@ -168,15 +176,19 @@ async def run_needle(
     """Needle recall against the already-loaded model (no load/unload here).
 
     load_config is accepted for interface symmetry; filler size derives
-    from ctx. Returns {recall, asked, fill_chars, prompt_tokens} with
-    recall = hits/asked over asked facts only.
+    from ctx. Returns {recall, asked, fill_chars, prompt_tokens,
+    output_text, thinking_text, prompt} with recall = hits/asked over
+    asked facts only. output_text/thinking_text are the verbatim needle
+    response (and reasoning trace, if any); prompt is the needle prompt
+    sent; prompt_tokens is the measured server-reported value.
     """
     _ = load_config
     target_chars = int(ctx * fill_ratio * CHARS_PER_TOKEN)
     filler = build_filler(target_chars)
+    prompt = NEEDLE_INSTRUCTION.format(doc=filler)
     resp = await client.chat_completion(
         model=model_id,
-        input_text=NEEDLE_INSTRUCTION.format(doc=filler),
+        input_text=prompt,
         temperature=NEEDLE_TEMPERATURE,
         max_output_tokens=NEEDLE_MAX_TOKENS,
     )
@@ -189,6 +201,9 @@ async def run_needle(
         "asked": asked,
         "fill_chars": len(filler),
         "prompt_tokens": int(usage.get("prompt_tokens", 0) or 0),
+        "output_text": text,
+        "thinking_text": _thinking(resp),
+        "prompt": prompt,
     }
 
 
@@ -204,17 +219,29 @@ async def probe_context(
     """Load best config at ctx, run speed + needle gates, always unload.
 
     Returns {ctx, ok, tok_s, prompt_tok_s, ttft_ms, recall, skipped_needle,
-    error}. ok requires load ok AND tok_s >= min_speed AND recall >=
-    min_recall. With skip_needle=True the 90%-fill needle chat is not sent
+    error, output_text, thinking_text, prompt, prompt_tokens, fill_chars,
+    speed_output, speed_thinking_text}. ok requires load ok AND
+    tok_s >= min_speed AND recall >= min_recall. output_text/thinking_text
+    are the verbatim needle response (and reasoning trace, if any);
+    prompt is the needle prompt sent; prompt_tokens is the measured
+    server-reported value; speed_* are the verbatim speed-chat response.
+    Keys default to ""/0 on paths where that chat never ran, so the
+    report can always render real texts instead of placeholders.
+    With skip_needle=True the 90%-fill needle chat is not sent
     (recall reported 1.0 with skipped_needle True; speed gate still applies).
     """
 
     skipped = bool(skip_needle)
 
     def _fail(
-        tok_s: float, prompt_tok_s: float, ttft_ms: float, recall: float, error: str
+        tok_s: float,
+        prompt_tok_s: float,
+        ttft_ms: float,
+        recall: float,
+        error: str,
+        extra: dict | None = None,
     ) -> dict:
-        return {
+        out = {
             "ctx": ctx,
             "ok": False,
             "tok_s": tok_s,
@@ -223,7 +250,17 @@ async def probe_context(
             "recall": recall,
             "skipped_needle": skipped,
             "error": error,
+            "output_text": "",
+            "thinking_text": "",
+            "prompt": "",
+            "prompt_tokens": 0,
+            "fill_chars": 0,
+            "speed_output": "",
+            "speed_thinking_text": "",
         }
+        if extra:
+            out.update(extra)
+        return out
 
     try:
         try:
@@ -251,7 +288,12 @@ async def probe_context(
                 0.0, 0.0, 0.0, 0.0, f"generation failed: {type(e).__name__}: {e}"
             )
         wall_ms = (time.perf_counter() - start) * 1000
-        usage, _text, stats = _extract(resp)
+        usage, speed_text, stats = _extract(resp)
+        speed_thinking = _thinking(resp)
+        speed_extra = {
+            "speed_output": speed_text,
+            "speed_thinking_text": speed_thinking,
+        }
         tok_s, prompt_tok_s, ttft_ms = _speeds(usage, stats, wall_ms)
         if tok_s < min_speed:
             return _fail(
@@ -260,6 +302,7 @@ async def probe_context(
                 ttft_ms,
                 0.0,
                 f"speed {tok_s:.1f} tok/s below floor {min_speed:.1f} tok/s",
+                extra=speed_extra,
             )
         if skipped:
             return {
@@ -271,6 +314,12 @@ async def probe_context(
                 "recall": 1.0,
                 "skipped_needle": True,
                 "error": "",
+                "output_text": "",
+                "thinking_text": "",
+                "prompt": "",
+                "prompt_tokens": 0,
+                "fill_chars": 0,
+                **speed_extra,
             }
         try:
             needle = await run_needle(client, model_id, probe_cfg, ctx)
@@ -281,9 +330,18 @@ async def probe_context(
                 ttft_ms,
                 0.0,
                 f"needle failed: {type(e).__name__}: {e}",
+                extra=speed_extra,
             )
         recall = float(needle["recall"])
         asked = int(needle["asked"])
+        needle_extra = {
+            "output_text": needle.get("output_text", ""),
+            "thinking_text": needle.get("thinking_text", ""),
+            "prompt": needle.get("prompt", ""),
+            "prompt_tokens": needle.get("prompt_tokens", 0),
+            "fill_chars": needle.get("fill_chars", 0),
+            **speed_extra,
+        }
         if recall < min_recall:
             hits = int(round(recall * asked))
             return _fail(
@@ -292,6 +350,7 @@ async def probe_context(
                 ttft_ms,
                 recall,
                 f"recall {recall:.2f} ({hits}/{asked}) below floor {min_recall:.2f}",
+                extra=needle_extra,
             )
         return {
             "ctx": ctx,
@@ -302,6 +361,7 @@ async def probe_context(
             "recall": recall,
             "skipped_needle": skipped,
             "error": "",
+            **needle_extra,
         }
     finally:
         try:
