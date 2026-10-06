@@ -49,7 +49,12 @@ from lm_optimizer.services.model_recommendations import (
     recommend_for_vram,
     threads_advice,
 )
-from lm_optimizer.services.reporting import save_best_report, save_failed_report, save_fit_report
+from lm_optimizer.services.reporting import (
+    save_best_report,
+    save_context_report,
+    save_failed_report,
+    save_fit_report,
+)
 from lm_optimizer.services.unload_guard import UnloadNotClean, assert_unloaded
 from lm_optimizer.services.optimizer import AdaptiveOptimizer
 from lm_optimizer.services.quality import QualityConfig, QualityEvaluator
@@ -2171,39 +2176,20 @@ def _format_probe_row(p: dict) -> str:
     )
 
 
-def _save_context_sweep_report(model_id: str, result: dict, out_dir: Path) -> Path | None:
-    """Minimal per-try markdown report (Task 3 provides the full version)."""
-    from lm_optimizer.services.reporting import sanitize_model_filename
+def _ctx_trio(report: dict) -> dict:
+    """Trio verdicts from a context_sweep.sweep() result dict."""
 
-    out = Path(out_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    safe = sanitize_model_filename(model_id)
-    path = out / f"{safe}-context-{stamp}.md"
-    tried = list(result.get("geometric", [])) + list(result.get("refinement", []))
-    lines = [
-        f"# Context sweep: {model_id} ({stamp})",
-        "",
-        f"- Maximum stable context: {result.get('maximum_stable_context')}",
-        f"- Failed boundary: {result.get('failed_boundary')}",
-        "",
-        "| ctx | gen tok/s | prompt tok/s | TTFT ms | recall | status | error |",
-        "| --- | --- | --- | --- | --- | --- | --- |",
-    ]
-    for p in tried:
-        recall = "skipped" if p.get("skipped_needle") else f"{p.get('recall', 0.0):.2f}"
-        status = "PASS" if p.get("ok") else "FAIL"
-        lines.append(
-            f"| {p['ctx']} | {p.get('tok_s', 0.0):.1f} | "
-            f"{p.get('prompt_tok_s', 0.0):.0f} | {p.get('ttft_ms', 0.0):.0f} | "
-            f"{recall} | {status} | {(p.get('error') or '')[:80]} |"
-        )
-    try:
-        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    except OSError as e:
-        console.print(f"[red]Cannot write report {path}: {e}[/red]")
-        return None
-    return path
+    def _ctx_of(value):
+        if isinstance(value, dict):
+            return value.get("ctx")
+        return value
+
+    return {
+        "stable": report.get("maximum_stable_context"),
+        "optimal": _ctx_of(report.get("performance_optimal")),
+        "recommended": _ctx_of(report.get("balanced_recommended")),
+        "failed_boundary": report.get("failed_boundary"),
+    }
 
 
 @app.command(name="context-sweep")
@@ -2289,7 +2275,12 @@ def context_sweep(
             report = await _ctx_sweep(_probe, lo, hi, step=1000)
             console.print("")
             console.print(_ctx_format(report, model))
-            saved = _save_context_sweep_report(model, report, output)
+            probes = list(report.get("geometric", [])) + list(report.get("refinement", []))
+            try:
+                saved = save_context_report(model, probes, _ctx_trio(report), output)
+            except OSError as e:
+                console.print(f"[red]Cannot write report: {e}[/red]")
+                saved = None
             if saved is not None:
                 console.print(f"[green]Report saved: {saved}[/green]")
             if report["maximum_stable_context"] is None:

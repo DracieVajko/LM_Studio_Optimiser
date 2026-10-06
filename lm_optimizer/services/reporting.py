@@ -355,6 +355,134 @@ def save_fit_report(
     return path
 
 
+def _escape_fence(text: str) -> str:
+    """Break inner triple-fences so the outer fenced block stays intact."""
+    return str(text or "").replace("```", "`` `")
+
+
+def _trio_ctx(trio: dict | None, *keys, default=None):
+    """Trio value as plain ctx (int/None); accepts int or {"ctx": N}."""
+    if not isinstance(trio, dict):
+        return default
+    for key in keys:
+        if key in trio and trio[key] is not None:
+            val = trio[key]
+            if isinstance(val, dict):
+                return val.get("ctx")
+            return val
+    return default
+
+
+def _cell(text: object, limit: int = 80) -> str:
+    """Single-line table cell (pipe-safe). Only used OUTSIDE fenced blocks."""
+    flat = str(text or "").replace("\n", " ").replace("\r", " ").replace("|", "/")
+    return flat[:limit].strip()
+
+
+def save_context_report(
+    model_id: str,
+    probes: list,
+    trio: dict | None = None,
+    out_dir: str | Path = "results",
+    stamp: str | None = None,
+) -> Path:
+    """Save a context-sweep .md with per-try table + full verbatim outputs.
+
+    probes: per-try probe dicts {ctx, ok, tok_s, prompt_tok_s, ttft_ms,
+    recall, error, skipped_needle, prompt_tokens, fill_chars,
+    speed_output, needle_output}. Missing keys render as N/A/empty.
+    trio: {stable, optimal, recommended} (also accepts
+    maximum_stable_context/performance_optimal/balanced_recommended
+    spellings; dict values with "ctx" are unwrapped).
+    Returns the written <model>-context-<stamp>.md path.
+    """
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    stamp = stamp or datetime.now().strftime("%Y%m%d-%H%M%S")
+    path = out / f"{sanitize_model_filename(model_id)}-context-{stamp}.md"
+    tried = list(probes or [])
+    trio = dict(trio or {})
+    stable = _trio_ctx(trio, "stable", "maximum_stable_context", "max_stable")
+    optimal = _trio_ctx(trio, "optimal", "performance_optimal", "perf_optimal")
+    recommended = _trio_ctx(
+        trio, "recommended", "balanced_recommended", "balanced", "recommendation"
+    )
+    failed_boundary = trio.get("failed_boundary")
+
+    lines = [
+        f"# Context sweep: {model_id} ({stamp})",
+        "",
+        f"- Date: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        f"- Probes: {len(tried)}",
+        "",
+        "## Verdicts",
+        "",
+        f"- Maximum stable context: {stable}",
+        f"- Performance-optimal context: {optimal}",
+        f"- Balanced recommended context: {recommended}",
+    ]
+    if failed_boundary is not None:
+        lines.append(f"- Failed boundary: {failed_boundary}")
+    lines += [
+        "",
+        "## Per-try results",
+        "",
+        "| ctx | gen tok/s | prompt tok/s | TTFT | recall | status | error |",
+        "| --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    for p in tried:
+        recall = "skipped" if p.get("skipped_needle") else f"{float(p.get('recall', 0.0) or 0.0):.2f}"
+        status = "PASS" if p.get("ok") else "FAIL"
+        lines.append(
+            f"| {p.get('ctx')} | {float(p.get('tok_s', 0.0) or 0.0):.1f} | "
+            f"{float(p.get('prompt_tok_s', 0.0) or 0.0):.0f} | "
+            f"{float(p.get('ttft_ms', 0.0) or 0.0):.0f} | "
+            f"{recall} | {status} | {_cell(p.get('error', ''))} |"
+        )
+    lines += [
+        "",
+        "## Fill ratio (target 0.9, measured values)",
+        "",
+        "- Fill target: 0.9 of ctx sized with an approximate ~4 chars/token heuristic.",
+        "- Filler size is an approximation; measured prompt_tokens below is what "
+        "the server reported for each needle probe.",
+        "- Recall is computed over asked facts only (hits/asked); a truncated "
+        "filler still scores only the facts actually asked.",
+        "",
+    ]
+    for p in tried:
+        prompt_tokens = p.get("prompt_tokens")
+        measured = str(prompt_tokens) if prompt_tokens is not None else "not recorded"
+        fill_chars = p.get("fill_chars")
+        fill_txt = str(fill_chars) if fill_chars is not None else "not recorded"
+        lines.append(
+            f"- ctx {p.get('ctx')}: measured prompt_tokens={measured} "
+            f"(fill target 0.9 of ctx, fill_chars={fill_txt}, approximate sizing)"
+        )
+    lines += ["", "## Full outputs (verbatim)", ""]
+    if not tried:
+        lines.append("_No probes ran._")
+    for p in tried:
+        status = "PASS" if p.get("ok") else "FAIL"
+        lines += [f"### ctx {p.get('ctx')} ({status})", ""]
+        speed_out = p.get("speed_output", p.get("speed_text", ""))
+        needle_out = p.get(
+            "needle_output", p.get("output", p.get("response_text", p.get("text", "")))
+        )
+        if speed_out:
+            lines += ["Speed probe output:", "", "```", _escape_fence(speed_out), "```", ""]
+        else:
+            lines += ["_No stored speed output._", ""]
+        if needle_out:
+            lines += ["Needle probe output:", "", "```", _escape_fence(needle_out), "```", ""]
+        else:
+            lines += ["_No stored needle output._", ""]
+    lines += [""]
+    path.write_text("\n".join(lines), encoding="utf-8")
+    logger.info("Context sweep report saved", model=model_id, path=str(path))
+    return path
+
+
 def _drives_str(drives: list) -> str:
     """One-line drive inventory (detection only)."""
     parts = []

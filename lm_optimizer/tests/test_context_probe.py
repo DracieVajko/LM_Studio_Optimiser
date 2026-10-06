@@ -255,3 +255,97 @@ def test_probe_row_marks_skipped_recall():
         }
     )
     assert "8192" in row and "PASS" in row and "skip" in row
+
+
+# ---- Task 3: context-sweep report (per-try table + full outputs) ----
+
+
+def probe_ok(ctx: int, **over) -> dict:
+    base = {
+        "ctx": ctx,
+        "ok": True,
+        "tok_s": 40.0,
+        "prompt_tok_s": 900.0,
+        "ttft_ms": 120.0,
+        "recall": 1.0,
+        "error": "",
+        "prompt_tokens": 7000,
+        "fill_chars": 28000,
+        "speed_output": "hash tables map keys fast.",
+        "needle_output": "fact one | with pipe\nsecond line",
+    }
+    base.update(over)
+    return base
+
+
+def probe_fail(ctx: int, **over) -> dict:
+    base = {
+        "ctx": ctx,
+        "ok": False,
+        "tok_s": 0.4,
+        "prompt_tok_s": 0.0,
+        "ttft_ms": 0.0,
+        "recall": 0.0,
+        "error": "speed 0.4 tok/s below floor 1.0 tok/s",
+        "prompt_tokens": 0,
+        "fill_chars": 0,
+        "speed_output": "",
+        "needle_output": "",
+    }
+    base.update(over)
+    return base
+
+
+def trio() -> dict:
+    return {"stable": 4096, "optimal": 4096, "recommended": 4096}
+
+
+def test_context_report_lists_every_try(tmp_path):
+    from lm_optimizer.services.reporting import save_context_report
+
+    path = save_context_report("m", [probe_ok(4096), probe_fail(8192)], trio(), tmp_path)
+    text = path.read_text(encoding="utf-8")
+    assert "4096" in text and "8192" in text and "Maximum stable context" in text
+    assert "Performance-optimal context" in text
+    assert "Balanced recommended context" in text
+    assert "| ctx | gen tok/s | prompt tok/s | TTFT | recall | status | error |" in text
+
+
+def test_context_report_fill_ratio_notes(tmp_path):
+    from lm_optimizer.services.reporting import save_context_report
+
+    text = save_context_report(
+        "m", [probe_ok(4096), probe_fail(8192)], trio(), tmp_path
+    ).read_text(encoding="utf-8")
+    assert "0.9" in text
+    assert "7000" in text  # measured prompt_tokens alongside target
+    assert "exact" not in text.lower()  # heuristic, never claimed exact
+
+
+def test_context_report_outputs_verbatim(tmp_path):
+    from lm_optimizer.services.reporting import save_context_report
+
+    tricky = probe_ok(4096, needle_output="line with | pipe\n```\ninner fence\n```\nend")
+    text = save_context_report("m", [tricky], trio(), tmp_path).read_text(encoding="utf-8")
+    assert "## Full outputs (verbatim)" in text
+    assert "line with | pipe" in text  # no pipe-escaping inside fences
+    assert text.count("```") >= 2  # fenced blocks present
+    # inner fences escaped: no raw triple-fence line from payload survives
+    assert "\n```\ninner fence\n```\n" not in text
+
+
+def test_context_report_filename_and_ascii(tmp_path):
+    from lm_optimizer.services.reporting import save_context_report
+
+    path = save_context_report("m", [probe_ok(4096)], trio(), tmp_path)
+    assert path.name.startswith("m-context-") and path.name.endswith(".md")
+    text = path.read_text(encoding="utf-8")
+    text.encode("ascii")  # structure is ASCII-only
+
+
+def test_context_sweep_uses_save_context_report():
+    import lm_optimizer.cli.main as cli_main
+    from lm_optimizer.services import reporting
+
+    assert callable(getattr(reporting, "save_context_report", None))
+    assert not hasattr(cli_main, "_save_context_sweep_report")
