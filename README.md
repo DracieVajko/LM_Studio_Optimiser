@@ -5,10 +5,10 @@ Finds empirically validated inference configurations for your hardware, model an
 not theoretical optima. Includes a model-vs-model sandbox (text / HTML / 3D-scene duels),
 transparent results with per-test outputs, and a dark-mode web UI.
 
-**Status: v1.5.0b1.** Speed-first search (cheap probes → quality validation on
-finalists → bounded causal recovery → adaptive validation), sandbox duels with history,
-Prompt/Thinking/Output transparency, OS-following dark mode, resilient Web UI.
-513 automated tests green, E2E-validated on a live server + live LM Studio.
+**Status: v1.5.2.** Pause/resume for partial successes (Web UI + CLI), AI-assisted model selection,
+speed-first search (cheap probes → quality validation on finalists → bounded causal recovery → adaptive validation),
+sandbox duels with history, Prompt/Thinking/Output transparency, OS-following dark mode, resilient Web UI.
+543 automated tests green, E2E-validated on a live server + live LM Studio.
 
 | Platform | Status |
 |-|-|
@@ -132,6 +132,8 @@ python -m pytest -q
 |`cleanup_test_runs`|remove test runs|no|
 |`python hw_monitor.py [--model M]`|VRAM/RAM/swap snapshot; optional tok/s probe|only with `--model`|
 |`python vram_matrix.py <model>`|12-config ctx×flash×KV fit/speed matrix|yes|
+|`resume-menu [--status] [--limit]`|interactive menu to resume paused/incomplete runs|no|
+|`judge <run_id> [--priority] [--vram-limit]`|AI-assisted model selection (second opinion)|no|
 
 Benchmark styles: `precise` (code/math temp 0.1), `balanced` (suite defaults),
 `creative` (summarization temp 0.9). Every command first unloads stale models and
@@ -149,6 +151,38 @@ charts, per-test Prompt/Thinking/Output, full JSON page), **Sandbox** (text/HTML
 duels with presets), **Settings**. API under single `/api` prefix + websocket progress.
 Dark mode follows the OS (toggle in nav). Read endpoints are load-free and degrade
 gracefully when LM Studio is down.
+
+**Pause/Resume (v1.5.2):** Running and paused runs show **Pause** / **Resume** buttons
+on the Results page. History page has **Resume All Pending** to bulk-resume paused runs.
+API: `POST /api/runs/{run_id}/pause` and `POST /api/runs/{run_id}/resume`.
+Resume from checkpoint skips already-completed candidates (no re-runs).
+
+## CLI Pause/Resume Menu (v1.5.2)
+
+```bash
+lm-optimizer resume-menu                    # interactive selection
+lm-optimizer resume-menu --status paused    # filter by status
+lm-optimizer checkpoints                    # list all checkpoints
+lm-optimizer resume <run-id>                # direct resume (existing)
+```
+
+The `resume-menu` shows runs in `running`, `paused`, `resumed`, `partial_success` states
+with progress info (completed configs, stage, VRAM). Select by number to resume.
+
+## AI Model Judge (v1.5.2) — Second Opinion
+
+```bash
+lm-optimizer judge <run_id> --priority balanced --vram-limit 6
+lm-optimizer judge <run_id> --priority speed --use-case coding
+lm-optimizer judge <run_id> --backend heuristic  # default, no AI needed
+```
+
+**User decides first.** The judge provides analysis to help you choose:
+- Heuristic backend (default): rule-based, fast, no external dependencies
+- Local backend: uses a local model via LM Studio/Ollama (planned)
+- API backend: uses external API like OpenRouter (planned)
+
+Outputs: recommended config, reasoning, confidence, pros/cons, alternatives, VRAM warnings.
 
 ## How it works (Phase-A strategy)
 

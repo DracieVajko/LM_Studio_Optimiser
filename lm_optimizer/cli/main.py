@@ -2512,6 +2512,284 @@ def checkpoints():
     console.print(table)
 
 
+@app.command(name="resume-menu")
+def resume_menu(
+    status: list[str] | None = typer.Option(
+        None,
+        "--status",
+        "-s",
+        help="Filter by status (running, paused, resumed, partial_success). Can repeat.",
+    ),
+    limit: int = typer.Option(20, "--limit", "-l", help="Max runs to show"),
+):
+    """Interactive menu to resume paused/incomplete runs.
+
+    Shows runs with checkpoints that can be resumed (not terminal states).
+    Select a run by number to resume from its checkpoint.
+    """
+    setup_logging()
+
+    # Default to resumable states
+    target_statuses = set(status) if status else {"running", "paused", "resumed", "partial_success"}
+
+    runs = run_repo.list_all(limit=limit)
+    if not runs:
+        console.print("[yellow]No optimization runs found[/yellow]")
+        return
+
+    # Filter to resumable states
+    resumable_runs = [r for r in runs if r.status.value in target_statuses]
+    if not resumable_runs:
+        console.print(f"[yellow]No runs with status in {target_statuses}[/yellow]")
+        return
+
+    # Build display table
+    table = Table(title="Resumable Runs (select by number)")
+    table.add_column("#", style="cyan", justify="right")
+    table.add_column("Run ID", style="dim")
+    table.add_column("Model", style="green")
+    table.add_column("Status", style="yellow")
+    table.add_column("Profile", style="blue")
+    table.add_column("Stage", style="magenta")
+    table.add_column("Configs", justify="right")
+    table.add_column("Completed", justify="right")
+    table.add_column("Created", style="dim")
+
+    for idx, run in enumerate(resumable_runs, 1):
+        # Get checkpoint info
+        from lm_optimizer.storage.run_checkpoint import load_checkpoint
+        ckpt = load_checkpoint(str(run.id))
+        completed = len(ckpt.get("completed_candidate_ids", [])) if ckpt else 0
+        total = run.config_count or len(run.configurations) if run.configurations else 0
+
+        status_badge = _status_badge(run.status.value)
+        table.add_row(
+            str(idx),
+            str(run.id)[:8] + "...",
+            run.model.name or run.model.id,
+            status_badge,
+            run.profile.value,
+            run.stage.value if run.stage else "?",
+            str(total),
+            str(completed),
+            run.created_at.strftime("%Y-%m-%d %H:%M"),
+        )
+
+    console.print(table)
+    console.print()
+
+    # Prompt for selection
+    try:
+        choice = typer.prompt(
+            "Select run number to resume (or Enter to cancel)",
+            type=int,
+            default=0,
+            show_default=False,
+        )
+    except (typer.Abort, ValueError):
+        console.print("[yellow]Cancelled[/yellow]")
+        return
+
+    if choice <= 0 or choice > len(resumable_runs):
+        console.print("[red]Invalid selection[/red]")
+        return
+
+    selected = resumable_runs[choice - 1]
+
+    # Confirm
+    console.print(f"\nSelected: [bold]{selected.model.name}[/bold] (run {selected.id})")
+    console.print(f"Status: {_status_badge(selected.status.value)} | Stage: {selected.stage}")
+    if not typer.confirm("Resume this run?", default=True):
+        console.print("[yellow]Cancelled[/yellow]")
+        return
+
+    # Run resume (reuse existing logic)
+    _run_resume(str(selected.id), revalidate=False, style="balanced")
+
+
+def _run_resume(run_id: str, revalidate: bool, style: str):
+    """Internal: run the resume logic."""
+    style = _require_style(style)
+
+    async def _resume():
+        client = get_client()
+        try:
+            await client.connect()
+            from lm_optimizer.storage.run_checkpoint import load_checkpoint
+
+            try:
+                ckpt = load_checkpoint(run_id)
+            except ValueError as e:
+                console.print(f"[red]Corrupted checkpoint: {e}[/red]")
+                sys.exit(1)
+            if not ckpt:
+                console.print(f"[red]No checkpoint for run {run_id}[/red]")
+                sys.exit(1)
+            run = run_repo.get(run_id)
+            if not run:
+                console.print(f"[red]Run not found: {run_id}[/red]")
+                sys.exit(1)
+            completed = ckpt.get("completed_candidate_ids", [])
+            console.print("[bold]Resuming optimization[/bold]")
+            console.print(f"Completed:\n{len(completed)} configurations")
+            hardware = hardware_detector.detect()
+            benchmark_service = BenchmarkService(client, style=style)
+            quality_evaluator = QualityEvaluator(QualityConfig(minimum_score=run.quality_threshold))
+            search_generator = SearchSpaceGenerator(client)
+            optimizer = AdaptiveOptimizer(
+                client, benchmark_service, quality_evaluator, search_generator
+            )
+            try:
+                resumed = await optimizer.resume_from_checkpoint(
+                    run_id, revalidate=revalidate, style=style
+                )
+            except KeyboardInterrupt:
+                optimizer.checkpoint_now(reason="interrupted-resume")
+                console.print("\n[yellow]Interrupted — checkpoint saved.[/yellow]")
+                sys.exit(130)
+            remaining = [
+                c for c in resumed.configurations if c.status != ConfigurationStatus.PASSED
+            ]
+            console.print(
+                f"Remaining:\n{len(remaining)} non-passing / "
+                f"{len(resumed.configurations)} total tested"
+            )
+            _display_optimization_result(resumed)
+        except SystemExit:
+            raise
+        except Exception as e:
+            logger.exception("Resume failed")
+            console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
+        finally:
+            await client.close()
+
+    _acquire_run_lock(f"resume:{run_id}")
+    try:
+        asyncio.run(_resume())
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Interrupted.[/yellow]")
+        sys.exit(130)
+    finally:
+        release_lock()
+
+
+def _status_badge(status: str) -> str:
+    """Return styled status badge."""
+    badges = {
+        "running": "[green]running[/green]",
+        "paused": "[yellow]paused[/yellow]",
+        "resumed": "[blue]resumed[/blue]",
+        "partial_success": "[magenta]partial_success[/magenta]",
+        "success": "[green]success[/green]",
+        "failed": "[red]failed[/red]",
+        "cancelled": "[dim]cancelled[/dim]",
+        "interrupted": "[dim]interrupted[/dim]",
+    }
+    return badges.get(status, status)
+
+
+@app.command(name="judge")
+def judge_models(
+    run_id: str = typer.Argument(..., help="Run ID to evaluate"),
+    priority: str = typer.Option("balanced", "--priority", "-p", help="Priority: speed, quality, balanced, context"),
+    use_case: str = typer.Option("general", "--use-case", "-u", help="Use case: coding, chat, reasoning, general"),
+    vram_limit: float | None = typer.Option(None, "--vram-limit", help="VRAM limit in GB (optional)"),
+    backend: str = typer.Option("heuristic", "--backend", "-b", help="Judge backend: heuristic, local, api"),
+    model: str | None = typer.Option(None, "--model", "-m", help="Judge model (for local/api backend)"),
+):
+    """AI-assisted model selection - get a second opinion on which config to keep.
+
+    The USER decides first. This provides analysis to help make informed decisions.
+    """
+    from lm_optimizer.services.model_judge import JudgeConfig, JudgeBackend, create_judge, ModelComparison
+
+    setup_logging()
+
+    run = run_repo.get(run_id)
+    if not run:
+        console.print(f"[red]Run not found: {run_id}[/red]")
+        sys.exit(1)
+
+    configs = run.configurations or []
+    passed = [c for c in configs if c.status == "passed"]
+    if not passed:
+        console.print("[red]No passing configurations to evaluate[/red]")
+        sys.exit(1)
+
+    # Hardware constraints
+    hw = hardware_detector.detect()
+    hardware_constraints = {
+        "vram_gb": vram_limit or (hw.gpu.vram_gb if hw.gpu else None),
+        "ram_gb": hw.ram_total_gb,
+    }
+
+    # Create judge
+    judge_config = JudgeConfig(
+        backend=JudgeBackend(backend),
+        model=model,
+    )
+    judge = create_judge(judge_config)
+
+    # Run evaluation
+    async def _evaluate():
+        comparison = ModelComparison(
+            run=run,
+            configs=configs,
+            use_case=use_case,
+            hardware_constraints=hardware_constraints,
+            priority=priority,
+        )
+        return await judge.evaluate(comparison)
+
+    try:
+        verdict = asyncio.run(_evaluate())
+    except Exception as e:
+        console.print(f"[red]Judge evaluation failed: {e}[/red]")
+        sys.exit(1)
+    finally:
+        asyncio.run(judge.close())
+
+    # Display results
+    console.print(Panel.fit(f"[bold]Model Judge Verdict[/bold] — Run: {run_id[:8]}..."))
+
+    # Find recommended config
+    rec_config = next((c for c in configs if c.id == verdict.recommended_config_id), None)
+    if rec_config:
+        table = Table(title="Recommended Configuration")
+        table.add_column("Parameter", style="cyan")
+        table.add_column("Value", style="green")
+        table.add_row("Config ID", str(rec_config.id)[:8] + "...")
+        table.add_row("Context", str(rec_config.context_length))
+        table.add_row("Speed", f"{rec_config.avg_generation_tok_s:.1f} tok/s" if rec_config.avg_generation_tok_s else "N/A")
+        table.add_row("Quality", f"{rec_config.quality.overall:.3f}" if rec_config.quality else "N/A")
+        table.add_row("VRAM", f"{rec_config.peak_vram_gb:.1f} GB" if rec_config.peak_vram_gb else "N/A")
+        table.add_row("Score", f"{rec_config.score:.3f}" if rec_config.score else "N/A")
+        console.print(table)
+
+    console.print(f"\n[bold]Reasoning:[/bold] {verdict.reasoning}")
+    console.print(f"[bold]Confidence:[/bold] {verdict.confidence:.0%}")
+
+    if verdict.pros:
+        console.print("\n[bold green]Pros:[/bold green]")
+        for pro in verdict.pros:
+            console.print(f"  ✓ {pro}")
+
+    if verdict.cons:
+        console.print("\n[bold red]Cons / Warnings:[/bold red]")
+        for con in verdict.cons:
+            console.print(f"  ✗ {con}")
+
+    if verdict.alternative_config_ids:
+        console.print("\n[bold]Alternatives:[/bold]")
+        for alt_id in verdict.alternative_config_ids:
+            alt = next((c for c in configs if c.id == alt_id), None)
+            if alt:
+                console.print(f"  • {alt_id[:8]}... — {alt.context_length} ctx, {alt.avg_generation_tok_s:.1f} tok/s, Q:{alt.quality.overall:.3f}" if alt.quality and alt.avg_generation_tok_s else f"  • {alt_id[:8]}...")
+
+    console.print("\n[dim]Remember: YOU decide. This is just a second opinion.[/dim]")
+
+
 @app.command(name="param-matrix")
 def param_matrix(
     record: bool = typer.Option(False, "--record", help="Save capability snapshot to DB"),
