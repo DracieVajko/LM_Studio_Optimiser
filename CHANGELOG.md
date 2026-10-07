@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.5.1] - 2026-10-07
+
+### Added
+- **Web UI Pause/Resume**: Pause and Resume buttons on Results page for running/paused runs
+- **Resume All Pending**: "Resume All Pending" button on History page to bulk-resume paused runs
+- **API endpoints**: `POST /api/runs/{run_id}/pause` and `POST /api/runs/{run_id}/resume` for any run with checkpoint
+- **Partial Success Resume**: Resume from checkpoint skips already-completed candidates (no re-runs)
+
+### Fixed
+- **DB Cleanup**: Removed 7 model entries not present in LM Studio
+- **API imports**: Moved `checkpoint_dir`, `load_checkpoint`, `orjson`, `Path`, `datetime` to module level for testability
+
 ## [1.5.0b1] - 2026-10-03 - BETA
 
 Ollama backend is beta (implemented, mocked-test evidence only, no live

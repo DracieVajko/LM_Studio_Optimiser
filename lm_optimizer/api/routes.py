@@ -46,6 +46,10 @@ from lm_optimizer.services.benchmark import BenchmarkService
 from lm_optimizer.services.hardware import hardware_detector
 from lm_optimizer.services.joblock import JobBusyError, acquire_lock, release_lock
 from lm_optimizer.services.lm_studio import LMStudioClient, create_client
+from lm_optimizer.storage.run_checkpoint import checkpoint_dir, load_checkpoint
+from pathlib import Path
+from datetime import datetime
+import orjson
 from lm_optimizer.services.optimizer import AdaptiveOptimizer
 from lm_optimizer.services.quality import QualityConfig, QualityEvaluator
 from lm_optimizer.services.search_space import SearchSpaceGenerator
@@ -599,6 +603,52 @@ async def resume_optimization(run_id: UUID):
         _current_optimizer.resume()
         return {"success": True}
     raise HTTPException(status_code=404, detail="Run not found or not running")
+
+
+@router.post("/runs/{run_id}/pause")
+async def pause_run(run_id: UUID):
+    """Pause any running optimization by run ID (creates pause flag for next safe boundary)."""
+    run = run_repo.get(str(run_id))
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    status_value = run.status.value if hasattr(run.status, 'value') else run.status
+    if status_value not in ("running", "resumed"):
+        raise HTTPException(status_code=409, detail=f"Run is {status_value}, not running")
+    
+    flag = Path(str(checkpoint_dir())) / f"pause_{run_id}.flag"
+    try:
+        payload = {
+            "requested_at": datetime.now().isoformat(timespec="seconds"),
+            "reason": "user_requested",
+        }
+        flag.write_bytes(orjson.dumps(payload))
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"Cannot write pause flag: {e}")
+    
+    return {"success": True, "message": "Pause requested; will take effect at next safe boundary"}
+
+
+@router.post("/runs/{run_id}/resume")
+async def resume_run(run_id: UUID):
+    """Resume a paused run from its checkpoint (no re-runs)."""
+    run = run_repo.get(str(run_id))
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    status_value = run.status.value if hasattr(run.status, 'value') else run.status
+    if status_value not in ("paused",):
+        raise HTTPException(status_code=409, detail=f"Run is {status_value}, not paused")
+    
+    ckpt = load_checkpoint(run_id)
+    if not ckpt:
+        raise HTTPException(status_code=404, detail="No checkpoint for run")
+    
+    # Resume via the existing background task mechanism
+    from fastapi import BackgroundTasks
+    
+    background_tasks = BackgroundTasks()
+    result = await resume_run_from_checkpoint(run_id, background_tasks)
+    
+    return {"success": True, "run_id": str(run_id), "completed": len(ckpt.get("completed_candidate_ids", []))}
 
 
 @router.post("/optimize/{run_id}/cancel")

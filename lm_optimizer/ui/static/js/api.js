@@ -97,6 +97,15 @@ export const API = {
         return this.request(`/optimize/${runId}/resume`, { method: 'POST' });
     },
 
+    // New pause/resume for any run (not just current optimizer)
+    async pauseRun(runId) {
+        return this.request(`/runs/${runId}/pause`, { method: 'POST' });
+    },
+
+    async resumeRunFromCheckpoint(runId) {
+        return this.request(`/runs/${runId}/resume`, { method: 'POST' });
+    },
+
     async cancelOptimization(runId) {
         return this.request(`/optimize/${runId}/cancel`, { method: 'POST' });
     },

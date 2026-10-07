@@ -61,6 +61,13 @@ const HistoryPage = {
                         <p class="text-gray-500 mt-1">View and manage all optimization runs</p>
                     </div>
                     <div class="flex gap-2">
+                        <button id="resume-all-pending" class="btn btn-success" title="Resume all paused runs from checkpoints">
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"></path>
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                            </svg>
+                            Resume All Pending
+                        </button>
                         <button id="refresh-history" class="btn btn-outline">
                             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
@@ -296,6 +303,9 @@ const HistoryPage = {
     },
 
     attachEvents() {
+        // Resume All Pending
+        document.getElementById('resume-all-pending')?.addEventListener('click', () => this.resumeAllPending());
+
         // Refresh
         document.getElementById('refresh-history')?.addEventListener('click', () => this.loadRuns());
 
@@ -446,6 +456,43 @@ const HistoryPage = {
         await this.loadDuels();
         this.state.filteredRuns = this.state.runs;
         this.render(); // full re-render: fresh nodes, single attachEvents
+    },
+
+    async resumeAllPending() {
+        const btn = document.getElementById('resume-all-pending');
+        if (btn) btn.disabled = true;
+        UI.showLoading('Resuming all paused runs...');
+        try {
+            const pausedRuns = this.state.runs.filter(r => r.status === 'paused');
+            if (!pausedRuns.length) {
+                UI.hideLoading();
+                UI.showToast('No paused runs to resume', 'info');
+                if (btn) btn.disabled = false;
+                return;
+            }
+            let successCount = 0;
+            let errorCount = 0;
+            for (const run of pausedRuns) {
+                try {
+                    await API.resumeRunFromCheckpoint(run.id);
+                    successCount++;
+                } catch (error) {
+                    errorCount++;
+                    console.error(`Failed to resume ${run.id}:`, error);
+                }
+            }
+            UI.hideLoading();
+            if (successCount > 0) {
+                UI.showToast(`Resumed ${successCount} run(s)${errorCount ? `, ${errorCount} failed` : ''}`, 'success');
+            } else {
+                UI.showToast(`All ${errorCount} resume attempts failed`, 'error');
+            }
+            await this.refresh();
+        } catch (error) {
+            UI.hideLoading();
+            UI.showToast(error.message || 'Resume all failed', 'error');
+            if (btn) btn.disabled = false;
+        }
     },
 };
 
