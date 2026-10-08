@@ -281,7 +281,6 @@ async def _run_optimization(
     style: str,
     advanced: dict,
     max_tokens_scale: float = 1.0,
-    min_speed: float = 0.0,
 ):
     """Shared optimize flow for the optimize/auto commands. Returns the run."""
     from lm_optimizer.services import lms_cli as _lms
@@ -320,7 +319,6 @@ async def _run_optimization(
         advanced_settings=advanced,
         style=style,
         progress_cb=advanced.pop("progress_cb", None),
-        min_speed=min_speed,
     )
 
 
@@ -2721,7 +2719,7 @@ def judge_models(
     hw = hardware_detector.detect()
     hardware_constraints = {
         "vram_gb": vram_limit or (hw.gpu.vram_gb if hw.gpu else None),
-        "ram_gb": hw.ram_total_gb,
+        "ram_gb": hw.total_ram_gb,
     }
 
     # Create judge
@@ -2756,13 +2754,17 @@ def judge_models(
     # Find recommended config
     rec_config = next((c for c in configs if c.id == verdict.recommended_config_id), None)
     if rec_config:
+        avg_gen = rec_config.get_avg_generation_tok_s()
+        avg_prompt = rec_config.get_avg_prompt_tok_s()
         table = Table(title="Recommended Configuration")
         table.add_column("Parameter", style="cyan")
         table.add_column("Value", style="green")
         table.add_row("Config ID", str(rec_config.id)[:8] + "...")
         table.add_row("Context", str(rec_config.context_length))
-        table.add_row("Speed", f"{rec_config.avg_generation_tok_s:.1f} tok/s" if rec_config.avg_generation_tok_s else "N/A")
-        table.add_row("Quality", f"{rec_config.quality.overall:.3f}" if rec_config.quality else "N/A")
+        table.add_row("Speed", f"{avg_gen:.1f} tok/s" if avg_gen else "N/A")
+        table.add_row("Prompt Speed", f"{avg_prompt:.0f} tok/s" if avg_prompt else "N/A")
+        qual = rec_config.quality_score.overall if rec_config.quality_score else None
+        table.add_row("Quality", f"{qual:.3f}" if qual else "N/A")
         table.add_row("VRAM", f"{rec_config.peak_vram_gb:.1f} GB" if rec_config.peak_vram_gb else "N/A")
         table.add_row("Score", f"{rec_config.score:.3f}" if rec_config.score else "N/A")
         console.print(table)
@@ -2785,7 +2787,10 @@ def judge_models(
         for alt_id in verdict.alternative_config_ids:
             alt = next((c for c in configs if c.id == alt_id), None)
             if alt:
-                console.print(f"  • {alt_id[:8]}... — {alt.context_length} ctx, {alt.avg_generation_tok_s:.1f} tok/s, Q:{alt.quality.overall:.3f}" if alt.quality and alt.avg_generation_tok_s else f"  • {alt_id[:8]}...")
+                avg_gen = alt.get_avg_generation_tok_s()
+                qual = alt.quality_score.overall if alt.quality_score else None
+                aid = str(alt.id)[:8]
+                console.print(f"  • {aid}... — {alt.context_length} ctx, {avg_gen:.1f} tok/s, Q:{qual:.3f}" if avg_gen and qual else f"  • {aid}...")
 
     console.print("\n[dim]Remember: YOU decide. This is just a second opinion.[/dim]")
 

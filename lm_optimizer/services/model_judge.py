@@ -95,12 +95,16 @@ class HeuristicJudge(ModelJudge):
                 warnings=["All configurations failed quality checks"],
             )
 
+        # Helper to get quality
+        def get_quality(c):
+            return c.quality_score.overall if c.quality_score else 0
+
         # Score based on priority
         if comparison.priority == "speed":
-            best = max(passed, key=lambda c: c.avg_generation_tok_s or 0)
+            best = max(passed, key=lambda c: c.get_avg_generation_tok_s() or 0)
             reasoning = "Highest generation speed among passing configs"
         elif comparison.priority == "quality":
-            best = max(passed, key=lambda c: c.quality.overall if c.quality else 0)
+            best = max(passed, key=lambda c: get_quality(c))
             reasoning = "Highest quality score among passing configs"
         elif comparison.priority == "context":
             best = max(passed, key=lambda c: c.context_length)
@@ -108,8 +112,8 @@ class HeuristicJudge(ModelJudge):
         else:  # balanced
             # Weighted score: speed * quality
             def balanced_score(c):
-                speed = c.avg_generation_tok_s or 0
-                qual = c.quality.overall if c.quality else 0
+                speed = c.get_avg_generation_tok_s() or 0
+                qual = get_quality(c)
                 return speed * qual
             best = max(passed, key=balanced_score)
             reasoning = "Best speed×quality balance among passing configs"
@@ -123,22 +127,24 @@ class HeuristicJudge(ModelJudge):
             within_limit = [c for c in passed if c.peak_vram_gb and c.peak_vram_gb <= vram_limit]
             if within_limit:
                 if comparison.priority == "speed":
-                    best = max(within_limit, key=lambda c: c.avg_generation_tok_s or 0)
+                    best = max(within_limit, key=lambda c: c.get_avg_generation_tok_s() or 0)
                 elif comparison.priority == "quality":
-                    best = max(within_limit, key=lambda c: c.quality.overall if c.quality else 0)
+                    best = max(within_limit, key=lambda c: get_quality(c))
                 else:
-                    best = max(within_limit, key=lambda c: (c.avg_generation_tok_s or 0) * (c.quality.overall if c.quality else 0))
+                    best = max(within_limit, key=lambda c: (c.get_avg_generation_tok_s() or 0) * get_quality(c))
                 warnings.append(f"Auto-selected alternative within VRAM limit: {best.context_length} ctx")
 
         alternatives = [c.id for c in passed if c.id != best.id][:3]
+        best_speed = best.get_avg_generation_tok_s()
+        best_qual = get_quality(best)
 
         return JudgeVerdict(
             recommended_config_id=best.id,
             reasoning=reasoning,
             confidence=0.85,
             pros=[
-                f"Speed: {best.avg_generation_tok_s:.1f} tok/s" if best.avg_generation_tok_s else "Speed: N/A",
-                f"Quality: {best.quality.overall:.3f}" if best.quality else "Quality: N/A",
+                f"Speed: {best_speed:.1f} tok/s" if best_speed else "Speed: N/A",
+                f"Quality: {best_qual:.3f}" if best_qual else "Quality: N/A",
                 f"Context: {best.context_length}",
                 f"VRAM: {best.peak_vram_gb:.1f}GB" if best.peak_vram_gb else "VRAM: N/A",
             ],
