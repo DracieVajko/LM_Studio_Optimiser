@@ -13,7 +13,7 @@ import typer
 from rich.console import Console
 from rich.json import JSON
 from rich.panel import Panel
-from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
+from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.table import Table
 
 from lm_optimizer.config import config
@@ -414,7 +414,7 @@ def _optimize_advanced(
     }
 
 
-EXPERIMENTAL_PROMPT = "Test experimental RoPE / CPU-MoE / speculative?"
+EXPERIMENTAL_PROMPT = "Test experimental features? (RoPE / CPU-MoE / Speculative)"
 
 
 def _prompt_experimental_optins() -> dict:
@@ -422,12 +422,18 @@ def _prompt_experimental_optins() -> dict:
     from lm_optimizer.services.optimizer import parse_experimental_flags
 
     try:
-        answer = typer.prompt(EXPERIMENTAL_PROMPT, default="no")
+        rope = typer.confirm("Enable RoPE (rotary position embedding) probes?", default=False)
     except Exception:
-        return parse_experimental_flags()
-    if str(answer).strip().lower() in ("yes", "y", "true", "1", "ano", "a"):
-        return parse_experimental_flags(True, True, True)
-    return parse_experimental_flags()
+        rope = False
+    try:
+        cpu_moe = typer.confirm("Enable CPU-MoE (Mixture of Experts) probes?", default=False)
+    except Exception:
+        cpu_moe = False
+    try:
+        speculative = typer.confirm("Enable Speculative decoding probes?", default=False)
+    except Exception:
+        speculative = False
+    return parse_experimental_flags(rope, cpu_moe, speculative)
 
 
 def _resolve_experimental_flags(
@@ -1181,18 +1187,14 @@ def optimize(
             with Progress(
                 SpinnerColumn(),
                 TextColumn("[progress.description]{task.description}"),
-                BarColumn(),
-                TaskProgressColumn(),
                 console=console,
             ) as progress:
-                task = progress.add_task(f"Optimizing {model}...", total=100)
+                task = progress.add_task(f"Optimizing {model}...", total=None)
 
                 def _bar(stage: str, tested: int, total: int) -> None:
-                    pct = min(99, int(tested / max(total, 1) * 100)) if total else 0
                     progress.update(
                         task,
-                        completed=pct,
-                        description=f"Optimizing {model}... [{stage} {tested}/{total}]",
+                        description=f"Optimizing {model}... [{stage} {tested}/{total} configs]",
                     )
 
                 advanced["progress_cb"] = _bar
@@ -1207,10 +1209,6 @@ def optimize(
                     advanced,
                     max_tokens_scale=max_tokens_scale,
                 )
-
-                progress.update(task, completed=100)
-
-            _display_optimization_result(result)
 
             _save_preset_and_report(
                 model,
