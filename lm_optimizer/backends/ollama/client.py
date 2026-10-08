@@ -107,6 +107,7 @@ class OllamaClient:
         self._capabilities: OllamaCapabilities | None = None
         self._connected = False
         self._models_cache: list[ModelIdentity] = []
+        self._running_models: set[str] = set()
 
     async def __aenter__(self) -> "OllamaClient":
         await self.connect()
@@ -143,8 +144,12 @@ class OllamaClient:
             raise RuntimeError("Capabilities not detected. Call connect() first.")
         return self._capabilities
 
-    async def connect(self) -> None:
-        """Establish connection and detect capabilities (idempotent)."""
+    async def connect(self, echo_probe: bool = True) -> None:
+        """Establish connection and detect capabilities (idempotent).
+
+        `echo_probe` is accepted for BackendClient signature parity
+        (LM Studio probes with a real load); Ollama needs no echo load.
+        """
         if self._connected and self._client is not None:
             return
         self._ensure_client()
@@ -230,7 +235,30 @@ class OllamaClient:
             )
 
         self._models_cache = models
+        try:
+            await self.refresh_running_models()
+        except Exception:
+            logger.debug("Ollama /api/ps refresh failed; Loaded column may be stale")
         return models
+
+    async def refresh_running_models(self) -> set[str]:
+        """Refresh the in-memory set of currently loaded models via /api/ps."""
+        try:
+            ps = await self._request_with_retry("GET", "/api/ps")
+            payload = ps.json()
+            items = payload.get("models", []) if isinstance(payload, dict) else []
+            self._running_models = {
+                str(m.get("name") or m.get("model", ""))
+                for m in items
+                if isinstance(m, dict)
+            }
+        except Exception:
+            self._running_models = set()
+        return self._running_models
+
+    def get_loaded_model(self, model_id: str) -> str | None:
+        """Loaded-model lookup for CLI parity (reads the /api/ps snapshot)."""
+        return model_id if model_id in self._running_models else None
 
     async def get_model(self, model_id: str) -> ModelIdentity | None:
         """Get specific model information."""
@@ -264,13 +292,20 @@ class OllamaClient:
         return {"success": True, "model": model_id}
 
     async def generate(
-        self, model_id: str, prompt: str, options: dict | None = None
+        self, model_id: str, prompt: str, options: dict | None = None,
+        think: bool = False,
     ) -> OllamaMetrics:
-        """Generate via ``POST /api/generate`` (stream=false), metrics normalized."""
+        """Generate via ``POST /api/generate`` (stream=false), metrics normalized.
+
+        Thinking is OFF by default (benchmark parity with the LM Studio
+        reasoning-off path): reasoning models otherwise spend the whole
+        token budget in ``thinking`` and return an empty ``response``.
+        """
         body: dict = {
             "model": model_id,
             "prompt": prompt,
             "stream": False,
+            "think": think,
             "options": dict(options or {}),
         }
         response = await self._request_with_retry(

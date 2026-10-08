@@ -666,8 +666,12 @@ def status(
     """Show LM Studio connection status and hardware info."""
     setup_logging()
 
-    # Resolve URL: CLI override > .env > default
-    effective_url = url or config.lm_studio.base_url
+    # Resolve URL: CLI override > backend default (.env) > hardcoded default.
+    # Ollama must never inherit the LM Studio URL (different port/server).
+    if (config.backend or "lm-studio") == "ollama":
+        effective_url = url or config.ollama_base_url
+    else:
+        effective_url = url or config.lm_studio.base_url
 
     async def _status():
         client = get_client(base_url=effective_url)
@@ -693,13 +697,13 @@ def status(
             else:
                 console.print("  GPU: Not detected")
 
-            console.print("\n[bold]LM Studio[/bold]")
+            console.print(f"\n[bold]{'Ollama' if (config.backend or 'lm-studio') == 'ollama' else 'LM Studio'}[/bold]")
             console.print(f"  URL: {client.base_url}")
             console.print("  Status: [green]Connected[/green]")
             console.print(f"  API Version: {client.capabilities.version}")
-            console.print(
-                f"  Supported Parameters: {', '.join(client.capabilities.get_supported_load_params())}"
-            )
+            supported = getattr(client.capabilities, "get_supported_load_params", None)
+            if callable(supported):
+                console.print(f"  Supported Parameters: {', '.join(supported())}")
             if url:
                 console.print("  [dim]Using CLI override (not persisted to .env)[/dim]")
 
