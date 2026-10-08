@@ -26,6 +26,7 @@ from lm_optimizer.domain.models import (
     ConfigurationStatus,
     LoadConfiguration,
     OptimizationProfile,
+    OptimizationStage,
 )
 from lm_optimizer.logging_config import get_logger, setup_logging
 from lm_optimizer.services.benchmark import VALID_STYLES, BenchmarkService
@@ -2310,6 +2311,222 @@ def ctx(
         sys.exit(130)
     finally:
         release_lock()
+
+
+@app.command(name="quality-ladder")
+def quality_ladder(
+    run: str = typer.Option(..., "--run", help="Source run ID (prefix accepted) with no quality winner"),
+    contexts: str | None = typer.Option(
+        None, "--contexts", help="Comma-separated context rungs (default: fine 2048-steps below max)"
+    ),
+    min_ctx: int = typer.Option(8192, "--min-ctx", help="Lowest context rung"),
+    step: int = typer.Option(2048, "--step", help="Rung granularity (fine steps, not power-of-2 only)"),
+    threshold: float = typer.Option(0.97, "--threshold", help="Standard quality threshold"),
+    fallback_threshold: float = typer.Option(
+        0.90, "--fallback-threshold", help="Single lowered-threshold attempt on max-ctx result"
+    ),
+    repetitions: int = typer.Option(3, "--repetitions", "-r", help="Benchmark repetitions per rung"),
+    profile: str = typer.Option("balanced", "--profile", "-p", help="Optimization profile"),
+    style: str = typer.Option("balanced", "--style", help="Benchmark style"),
+):
+    """Context fallback for a quality-failed run: lower ctx until quality passes.
+
+    Re-tests the source run's fastest runtime at progressively lower contexts
+    (fine steps, not power-of-2 only). Stops at the first rung passing the
+    standard threshold. Then makes exactly ONE lowered-threshold attempt on
+    the max-context result: pass or not, no further lowering afterwards.
+    Prints both options (max ctx + lower quality vs lower ctx + quality OK)
+    so the USER picks. Saves a JSON report next to the other results.
+    """
+    from lm_optimizer.services.quality_ladder import (
+        RungOutcome,
+        build_quality_ladder,
+        pick_options,
+    )
+
+    setup_logging()
+
+    resolved = _resolve_run_id(run)
+    if resolved is None:
+        # Fall back to DB prefix match.
+        candidates = [r for r in run_repo.list_all(200) if str(r.id).startswith(run)]
+        if len(candidates) != 1:
+            console.print(f"[red]No unique run for prefix {run!r}[/red]")
+            sys.exit(1)
+        resolved = str(candidates[0].id)
+    source = run_repo.get(resolved)
+    if not source:
+        console.print(f"[red]Run not found: {run}[/red]")
+        sys.exit(1)
+
+    passed_cfgs = [c for c in (source.configurations or []) if c.status == ConfigurationStatus.PASSED]
+    if not passed_cfgs:
+        console.print("[red]Source run has no passed configs to derive a runtime from[/red]")
+        sys.exit(1)
+    base = max(passed_cfgs, key=lambda c: c.get_avg_generation_tok_s())
+    max_ctx = max((c.context_length for c in source.configurations or []), default=0)
+    if not max_ctx:
+        console.print("[red]Source run has no measured contexts[/red]")
+        sys.exit(1)
+
+    explicit = None
+    if contexts:
+        try:
+            explicit = [int(x.strip()) for x in contexts.split(",") if x.strip()]
+        except ValueError:
+            console.print("[red]Invalid --contexts (comma-separated integers)[/red]")
+            sys.exit(2)
+    model_limit = None
+    try:
+        _mi = source.model
+        model_limit = getattr(_mi, "context_limit", None)
+    except Exception:
+        model_limit = None
+    ladder = build_quality_ladder(
+        max_ctx, min_ctx=min_ctx, step=step, model_limit=model_limit, explicit=explicit
+    )
+    if not ladder:
+        console.print("[red]Empty ladder: check --contexts/--min-ctx/--step[/red]")
+        sys.exit(2)
+
+    # Max-context source evidence (already measured, below standard threshold).
+    src_q = [c for c in (source.configurations or [])
+             if c.context_length == max_ctx and c.quality_score is not None]
+    src_best = max(src_q, key=lambda c: c.quality_score.overall) if src_q else None
+    source_outcome = RungOutcome(
+        context=max_ctx,
+        status="quality_failed",
+        quality_overall=src_best.quality_score.overall if src_best else None,
+        checks=(f"{src_best.quality_score.checks_passed}/{src_best.quality_score.checks_total}"
+                if src_best else ""),
+        gen_tok_s=src_best.get_avg_generation_tok_s() if src_best else None,
+        config_id=str(src_best.id) if src_best else "",
+    ) if src_best else None
+
+    console.print(f"[bold]Quality ladder for {source.model.id}[/bold]")
+    console.print(f"  Base runtime: fastest passed config {str(base.id)[:8]} "
+                  f"({base.get_avg_generation_tok_s():.1f} tok/s @ ctx {base.context_length})")
+    console.print(f"  Max ctx (known failed): {max_ctx}")
+    console.print(f"  Ladder: {ladder}")
+    console.print(f"  Standard threshold: {threshold} | single fallback attempt: {fallback_threshold}")
+
+    async def _ladder():
+        client = get_client()
+        try:
+            snap = await _connect_guarded_or_abort(client, "quality-ladder")
+            for line in format_snapshot(snap):
+                console.print(f"  {line}")
+            hardware = hardware_detector.detect()
+            benchmark_service = BenchmarkService(
+                client,
+                benchmark_config=_benchmark_config_obj(repetitions),
+                style=style,
+            )
+            quality_evaluator = QualityEvaluator(QualityConfig(minimum_score=threshold))
+            search_generator = SearchSpaceGenerator(client)
+            optimizer = AdaptiveOptimizer(
+                client, benchmark_service, quality_evaluator, search_generator
+            )
+            new_run, _, advanced = await optimizer.prepare_run(
+                source.model, hardware, OptimizationProfile(profile),
+                quality_threshold=threshold, advanced_settings={}, style=style,
+            )
+            new_run.stage = OptimizationStage.QUALITY_CHECK
+            run_repo.save(new_run)
+            console.print(f"  Ladder run: {new_run.id}")
+
+            outcomes: list[RungOutcome] = []
+            for ctx_len in ladder:
+                data = {k: v for k, v in base.config.to_dict().items()}
+                data["context_length"] = ctx_len
+                qcfg = LoadConfiguration(
+                    **{k: v for k, v in data.items() if hasattr(LoadConfiguration, k)}
+                )
+                qcfg.context_length = ctx_len
+                console.print(f"\n[bold]Rung ctx={ctx_len}[/bold]")
+                try:
+                    result = await optimizer._test_config(qcfg, ctx_len, score_context=True)
+                except KeyboardInterrupt:
+                    optimizer.checkpoint_now(reason="interrupted-ladder")
+                    console.print("\n[yellow]Interrupted — checkpoint saved.[/yellow]")
+                    sys.exit(130)
+                if result is None:
+                    outcomes.append(RungOutcome(context=ctx_len, status="failed"))
+                    continue
+                qs = result.quality_score
+                outcomes.append(RungOutcome(
+                    context=ctx_len,
+                    status=result.status.value if hasattr(result.status, "value") else str(result.status),
+                    quality_overall=qs.overall if qs else None,
+                    checks=(f"{qs.checks_passed}/{qs.checks_total}" if qs else ""),
+                    gen_tok_s=result.get_avg_generation_tok_s(),
+                    config_id=str(result.id),
+                ))
+                if result.status == ConfigurationStatus.PASSED:
+                    console.print(f"[green]PASS @ ctx={ctx_len} — stopping ladder[/green]")
+                    break
+            return new_run, outcomes
+        finally:
+            await client.close()
+
+    _acquire_run_lock(f"quality-ladder:{resolved[:8]}")
+    try:
+        try:
+            new_run, outcomes = asyncio.run(_ladder())
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Interrupted.[/yellow]")
+            sys.exit(130)
+    finally:
+        release_lock()
+
+    verdict = pick_options(outcomes, source_max_ctx=source_outcome,
+                           fallback_threshold=fallback_threshold)
+
+    table = Table(title=f"Quality ladder: {source.model.id}")
+    table.add_column("Option", style="cyan")
+    table.add_column("Context", justify="right")
+    table.add_column("Quality", justify="right")
+    table.add_column("Checks", justify="right")
+    table.add_column("Gen tok/s", justify="right")
+    if verdict.max_ctx_option:
+        m = verdict.max_ctx_option
+        table.add_row("A: max context", str(m.context),
+                      f"{m.quality_overall:.3f}" if m.quality_overall else "—",
+                      m.checks or "—",
+                      f"{m.gen_tok_s:.1f}" if m.gen_tok_s else "—")
+    if verdict.quality_ok_option:
+        q = verdict.quality_ok_option
+        table.add_row("B: quality OK", str(q.context),
+                      f"{q.quality_overall:.3f}" if q.quality_overall else "—",
+                      q.checks or "—",
+                      f"{q.gen_tok_s:.1f}" if q.gen_tok_s else "—")
+    else:
+        table.add_row("B: quality OK", "—", "no rung passed", "—", "—")
+    console.print(table)
+    console.print(f"\n[bold]Single fallback attempt (max ctx vs {fallback_threshold}):[/bold] "
+                  f"{verdict.fallback_message}")
+
+    report = {
+        "source_run_id": resolved,
+        "ladder_run_id": str(new_run.id),
+        "model": source.model.id,
+        "standard_threshold": threshold,
+        "fallback_threshold": fallback_threshold,
+        "rungs": [vars(o) for o in verdict.rungs],
+        "option_max_ctx": vars(verdict.max_ctx_option) if verdict.max_ctx_option else None,
+        "option_quality_ok": vars(verdict.quality_ok_option) if verdict.quality_ok_option else None,
+        "fallback_passed": verdict.fallback_passed,
+        "fallback_message": verdict.fallback_message,
+    }
+    out_path = Path("results") / f"{source.model.id.replace('/', '-')}-ladder.json"
+    try:
+        import orjson as _orjson
+
+        out_path.write_bytes(_orjson.dumps(report, option=_orjson.OPT_INDENT_2))
+        console.print(f"\nReport saved: {out_path}")
+    except OSError as e:
+        console.print(f"[red]Cannot write report: {e}[/red]")
+    console.print("\n[dim]YOU pick: A (max context, lower quality) or B (lower context, quality OK).[/dim]")
 
 
 @app.command()
