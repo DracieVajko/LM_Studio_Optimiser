@@ -23,6 +23,7 @@ job in ``lm_optimizer/cli/main.py``.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -207,6 +208,12 @@ def parse_show_parameters(show: dict) -> dict:
     return params
 
 
+#: Default folder for exported Modelfiles (bare `-o name` lands here).
+OLLAMA_CONFIG_DIR_NAME = "ollama-configs"
+
+OLLAMA_CONFIG_DIR = Path(OLLAMA_CONFIG_DIR_NAME)
+
+
 #: Descending num_ctx probe ladder for --probe-max-ctx (largest first).
 MAX_CTX_PROBE_LADDER = (131072, 65536, 32768, 16384, 8192, 4096)
 
@@ -245,6 +252,8 @@ __all__ = [
     "FLOAT_KEYS",
     "INT_KEYS",
     "MAX_CTX_PROBE_LADDER",
+    "OLLAMA_CONFIG_DIR",
+    "OLLAMA_CONFIG_DIR_NAME",
     "apply_modelfile_text",
     "coerce_param_value",
     "default_tag_for",

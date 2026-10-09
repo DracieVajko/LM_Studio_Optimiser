@@ -178,3 +178,19 @@ def test_cli_export_writes_file(tmp_path):
         "num_ctx": 8192,
         "temperature": 0.7,
     }
+
+
+def test_cli_export_bare_filename_lands_in_ollama_configs(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+
+    from lm_optimizer.cli.main import app
+
+    monkeypatch.chdir(tmp_path)
+    result = CliRunner().invoke(
+        app,
+        ["ollama-export", "--model", "qwen3:8b", "--output", "qwen3-best.modelfile.md"],
+    )
+    assert result.exit_code == 0, result.output
+    out = tmp_path / "ollama-configs" / "qwen3-best.modelfile.md"
+    assert out.exists()
+    assert parse_modelfile(out.read_text(encoding="utf-8")) == {"from": "qwen3:8b"}

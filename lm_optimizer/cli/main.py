@@ -3656,7 +3656,7 @@ def ollama_export(
         None, "--param", help="Option override KEY=VALUE (repeatable, wins over --from-show)"
     ),
     output: Path | None = typer.Option(
-        None, "--output", "-o", help="Write the Modelfile here (default: print only)"
+        None, "--output", "-o", help="Write the Modelfile here (bare filename -> ollama-configs/)"
     ),
     from_show: bool = typer.Option(
         False, "--from-show", help="Prefill with live /api/show parameters (needs server)"
@@ -3726,6 +3726,11 @@ def ollama_export(
         sys.exit(2)
     if output is not None:
         try:
+            from lm_optimizer.backends.ollama.modelfile import OLLAMA_CONFIG_DIR
+
+            if output.parent == Path("."):
+                OLLAMA_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+                output = OLLAMA_CONFIG_DIR / output.name
             output.write_text(text, encoding="utf-8")
         except OSError as e:
             console.print(f"[red]Cannot write {output}: {e}[/red]")
