@@ -2510,6 +2510,21 @@ def quality_ladder(
     console.print(f"\n[bold]Single fallback attempt (max ctx vs {fallback_threshold}):[/bold] "
                   f"{verdict.fallback_message}")
 
+    from datetime import datetime as _dt
+
+    from lm_optimizer.domain.models import RunStatus as _RunStatus
+
+    new_run.status = (
+        _RunStatus.PARTIAL_SUCCESS if verdict.quality_ok_option else _RunStatus.FAILED
+    )
+    new_run.completed_at = _dt.now()
+    new_run.error = (
+        f"ladder done: {len(verdict.rungs)} rungs, "
+        + ("quality OK @ " + str(verdict.quality_ok_option.context)
+           if verdict.quality_ok_option else "no rung passed standard threshold")
+    )
+    run_repo.save(new_run)
+
     report = {
         "source_run_id": resolved,
         "ladder_run_id": str(new_run.id),
