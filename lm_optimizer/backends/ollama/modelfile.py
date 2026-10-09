@@ -172,12 +172,43 @@ def parse_modelfile(text: str) -> dict:
 
 
 def default_tag_for(base: str) -> str:
-    """Default apply target for a base tag (``<name>:opt``)."""
+    """Default apply target for a base tag (``<base>-best``)."""
     base = (base or "").strip()
     if not base:
         raise ValueError("default_tag_for: base model must be a non-empty tag")
-    name = base.rsplit("/", 1)[-1].split(":")[0].strip() or base
-    return f"{name}:opt"
+    return f"{base}-best"
+
+
+def parse_show_parameters(show: dict) -> dict:
+    """Extract effective options from a ``POST /api/show`` response.
+
+    Ollama returns ``parameters`` as a multi-line ``"key value"`` string;
+    each line is coerced with the same rules as Modelfile ``PARAMETER``
+    lines. Unparseable lines are skipped (server defaults, never fatal).
+    """
+    params: dict = {}
+    if not isinstance(show, dict):
+        return params
+    raw = show.get("parameters", "")
+    if not isinstance(raw, str):
+        return params
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            continue
+        key, value = parts
+        try:
+            params[key] = coerce_param_value(key, value)
+        except ValueError:
+            continue
+    return params
+
+
+#: Descending num_ctx probe ladder for --probe-max-ctx (largest first).
+MAX_CTX_PROBE_LADDER = (131072, 65536, 32768, 16384, 8192, 4096)
 
 
 async def ensure_tag_free(client: OllamaClient, tag: str) -> None:
@@ -213,11 +244,13 @@ __all__ = [
     "BOOL_KEYS",
     "FLOAT_KEYS",
     "INT_KEYS",
+    "MAX_CTX_PROBE_LADDER",
     "apply_modelfile_text",
     "coerce_param_value",
     "default_tag_for",
     "ensure_tag_free",
     "parse_modelfile",
     "parse_param_assignment",
+    "parse_show_parameters",
     "render_modelfile",
 ]

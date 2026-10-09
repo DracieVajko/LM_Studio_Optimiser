@@ -3653,14 +3653,34 @@ def sample_sweep(
 def ollama_export(
     model: str = typer.Option(..., "--model", help="Base Ollama model tag for the FROM line"),
     param: list[str] | None = typer.Option(
-        None, "--param", help="Option override KEY=VALUE (repeatable)"
+        None, "--param", help="Option override KEY=VALUE (repeatable, wins over --from-show)"
     ),
     output: Path | None = typer.Option(
         None, "--output", "-o", help="Write the Modelfile here (default: print only)"
     ),
+    from_show: bool = typer.Option(
+        False, "--from-show", help="Prefill with live /api/show parameters (needs server)"
+    ),
+    probe_max_ctx: bool = typer.Option(
+        False, "--probe-max-ctx", help="Measure largest working num_ctx (tiny probe per rung)"
+    ),
+    base_url: str | None = typer.Option(
+        None, "--base-url", help="Ollama URL (default http://127.0.0.1:11434)"
+    ),
 ):
-    """Render an editable Ollama Modelfile from a base tag + options (no server calls)."""
-    from lm_optimizer.backends.ollama.modelfile import parse_param_assignment, render_modelfile
+    """Render an editable Ollama Modelfile: live defaults + optimal overrides.
+
+    Without flags: base tag + options only (no server calls). With
+    --from-show: prefill the server's effective parameters, then apply
+    --param overrides on top. With --probe-max-ctx: measure the largest
+    loadable num_ctx ladder rung (unless --param num_ctx is given).
+    """
+    from lm_optimizer.backends.ollama.modelfile import (
+        MAX_CTX_PROBE_LADDER,
+        parse_param_assignment,
+        parse_show_parameters,
+        render_modelfile,
+    )
 
     setup_logging()
     params: dict = {}
@@ -3671,6 +3691,34 @@ def ollama_export(
             console.print(f"[red]Invalid --param: {e}[/red]")
             sys.exit(2)
         params[key] = value
+
+    if from_show or probe_max_ctx:
+        from lm_optimizer.backends.ollama.client import OLLAMA_DEFAULT_URL, OllamaClient
+
+        async def _live():
+            client = OllamaClient(base_url=base_url or OLLAMA_DEFAULT_URL)
+            try:
+                await client.connect(echo_probe=False)
+                show = await client.show(model)
+                probed = None
+                if probe_max_ctx and "num_ctx" not in params:
+                    probed = await _probe_max_ctx(client, model)
+                return show, probed
+            finally:
+                await client.close()
+
+        try:
+            show, probed_ctx = asyncio.run(_live())
+        except Exception as e:
+            console.print(f"[red]Ollama query failed: {type(e).__name__} ({e})[/red]")
+            sys.exit(1)
+        if from_show:
+            live = parse_show_parameters(show)
+            params = {**live, **params}
+            console.print(f"[dim]Prefilled {len(live)} live parameter(s) from /api/show[/dim]")
+        if probed_ctx is not None:
+            params["num_ctx"] = probed_ctx
+            console.print(f"[green]Probed max working num_ctx: {probed_ctx}[/green]")
     try:
         text = render_modelfile(model, params)
     except ValueError as e:
@@ -3686,11 +3734,29 @@ def ollama_export(
     console.print(text, highlight=False)
 
 
+async def _probe_max_ctx(client, model: str) -> int | None:
+    """Largest working num_ctx rung (tiny non-streaming probe each)."""
+    from lm_optimizer.backends.ollama.modelfile import MAX_CTX_PROBE_LADDER
+
+    for ctx_len in MAX_CTX_PROBE_LADDER:
+        try:
+            m = await client.generate(
+                model, "Reply with exactly: OK",
+                options={"num_ctx": ctx_len, "num_predict": 8, "temperature": 0.0},
+            )
+            if (m.text or "").strip():
+                return ctx_len
+        except Exception as e:
+            logger.debug("num_ctx probe failed", ctx=ctx_len, error=str(e)[:120])
+            continue
+    return None
+
+
 @app.command(name="ollama-apply")
 def ollama_apply(
     file: Path = typer.Option(..., "--file", help="Edited Modelfile (.md) to apply"),
     as_tag: str | None = typer.Option(
-        None, "--as", help="New model tag (default: <base>:opt, never overwrite)"
+        None, "--as", help="New model tag (default: <base>-best, never overwrite)"
     ),
     yes: bool = typer.Option(
         False, "--yes", help="Confirm without prompting (required when non-interactive)"

@@ -46,9 +46,18 @@ def test_parse_ignores_blanks_and_comments():
     assert parse_modelfile(text) == {"from": "qwen3:8b", "num_ctx": 8192}
 
 
-def test_default_tag_appends_opt():
-    assert default_tag_for("qwen3:8b") == "qwen3:opt"
-    assert default_tag_for("qwen3") == "qwen3:opt"
+def test_default_tag_appends_best():
+    assert default_tag_for("qwen3:8b") == "qwen3:8b-best"
+    assert default_tag_for("qwen3") == "qwen3-best"
+
+
+def test_parse_show_parameters():
+    from lm_optimizer.backends.ollama.modelfile import parse_show_parameters
+
+    show = {"parameters": "num_ctx 8192\ntemperature 0.7\n# comment\nbadline\n"}
+    assert parse_show_parameters(show) == {"num_ctx": 8192, "temperature": 0.7}
+    assert parse_show_parameters({}) == {}
+    assert parse_show_parameters({"parameters": 123}) == {}
 
 
 TAGS_EMPTY = {"models": []}
