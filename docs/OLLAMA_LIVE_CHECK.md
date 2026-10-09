@@ -15,6 +15,18 @@
 >   per-backend status URL, get_loaded_model via /api/ps,
 >   generate(think=False) default, default tag <base>-best,
 >   probe ladder capped at model context_length.
+> - 2026-10-09: all 10 OLLAMA_OPTIONS verified persisting via
+>   Modelfile create + show-back (num_ctx/batch/thread/gpu/mmap +
+>   5 sampling keys 10/10 OK); verify tag loaded + served 'OK',
+>   then deleted. New `ollama-probe` command: connect/list/show/
+>   generate/think-fallback/ctx-timings/unload-verify matrix.
+> - Coverage honesty: ollama is NOT a full LM Studio equivalent.
+>   No flash_attention, KV placement, parallel, checkpoints, MoE
+>   experts, speculative drafts, or reasoning budget — different
+>   control model (per-request options vs load-time). Conversely
+>   ollama has num_thread/use_mmap which LM Studio REST lacks.
+>   Enough for benchmarking (ctx/batch/gpu/sampling), not for
+>   deep tuning.
 > Suite: 554 passed after fixes.
 
 Phase-1 Ollama support is implemented and unit-tested (mocked httpx), but no
