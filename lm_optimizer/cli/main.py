@@ -3880,5 +3880,71 @@ def ollama_apply(
     asyncio.run(_apply())
 
 
+@app.command(name="ollama-probe")
+def ollama_probe(
+    model: str = typer.Argument(..., help="Ollama model tag to exercise"),
+    ctx: int = typer.Option(8192, "--ctx", help="Second num_ctx timing rung (first is 2048)"),
+    keep_loaded: bool = typer.Option(
+        False, "--keep-loaded", help="Skip the final unload verification step"
+    ),
+    base_url: str | None = typer.Option(
+        None, "--base-url", help="Ollama URL (default http://127.0.0.1:11434)"
+    ),
+):
+    """Endpoint control matrix for one Ollama model (no optimization).
+
+    Connect, list/show details, tiny generate (one automatic think-on
+    retry when the model spends tokens but answers empty), a num_ctx
+    timing pair, and unload verification. Prints a step table.
+    """
+    from lm_optimizer.backends.ollama.client import OLLAMA_DEFAULT_URL, OllamaClient
+    from lm_optimizer.backends.ollama.probe import probe_model
+
+    setup_logging()
+
+    async def _probe():
+        client = OllamaClient(base_url=base_url or OLLAMA_DEFAULT_URL)
+        try:
+            report = await probe_model(client, model, ctx_pair=(2048, ctx))
+            if keep_loaded:
+                report["steps"]["unload_verify"] = {"ok": True, "skipped": True}
+            return report
+        finally:
+            await client.close()
+
+    try:
+        report = asyncio.run(_probe())
+    except Exception as e:
+        logger.exception("Ollama probe failed")
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+    table = Table(title=f"Ollama endpoint probe: {model}")
+    table.add_column("Step", style="cyan")
+    table.add_column("Result", style="green")
+
+    def _add_step(name: str, step) -> None:
+        if not isinstance(step, dict):
+            table.add_row(name, str(step))
+            return
+        if step.get("ok"):
+            detail = step.get("text") or step.get("version") or ""
+            if "gen_tok_s" in step:
+                detail = f"{step.get('text', '')!r} {step.get('gen_tok_s')} tok/s"
+            table.add_row(name, f"OK {detail}".strip())
+        elif step.get("skipped"):
+            table.add_row(name, "[dim]skipped[/dim]")
+        else:
+            table.add_row(name, f"[red]FAIL: {step.get('error', '?')}[/red]")
+
+    for name, step in report.get("steps", {}).items():
+        if name == "ctx_timings" and isinstance(step, dict):
+            for ctx_len, timing in step.items():
+                _add_step(f"ctx {ctx_len}", timing)
+        else:
+            _add_step(name, step)
+    console.print(table)
+
+
 if __name__ == "__main__":
     app()
