@@ -300,6 +300,11 @@ class OllamaClient:
         Thinking is OFF by default (benchmark parity with the LM Studio
         reasoning-off path): reasoning models otherwise spend the whole
         token budget in ``thinking`` and return an empty ``response``.
+
+        Exception: gpt-oss models REQUIRE reasoning (their output flows
+        through the reasoning channel, so ``think=False`` yields empty
+        text). Pass ``think=True`` (or ``"low"``/``"medium"``/``"high"``)
+        explicitly for that family. Verified live 2026-10-09.
         """
         body: dict = {
             "model": model_id,

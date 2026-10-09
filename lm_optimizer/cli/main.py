@@ -3755,10 +3755,23 @@ def ollama_export(
 
 
 async def _probe_max_ctx(client, model: str) -> int | None:
-    """Largest working num_ctx rung (tiny non-streaming probe each)."""
+    """Largest working num_ctx rung (tiny non-streaming probe each).
+
+    Rungs above the model's own context limit are skipped without probing.
+    """
     from lm_optimizer.backends.ollama.modelfile import MAX_CTX_PROBE_LADDER
 
-    for ctx_len in MAX_CTX_PROBE_LADDER:
+    try:
+        info = await client.show(model)
+        details = info.get("details") if isinstance(info, dict) else None
+        model_max = None
+        if isinstance(details, dict):
+            raw_max = details.get("context_length")
+            model_max = int(raw_max) if raw_max else None
+    except Exception:
+        model_max = None
+    rungs = [c for c in MAX_CTX_PROBE_LADDER if model_max is None or c <= model_max]
+    for ctx_len in rungs:
         try:
             m = await client.generate(
                 model, "Reply with exactly: OK",

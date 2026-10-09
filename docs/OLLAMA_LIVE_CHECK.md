@@ -1,5 +1,22 @@
 # Ollama Backend — Live Verification Checklist (owner-run)
 
+> LIVE RESULTS 2026-10-09 (Ollama 0.40.2, RTX 3060 6GB / 31GB RAM):
+> - status/models/generate verified on 3 scenarios:
+>   - qwen3.5:4b (3.3GB, fits VRAM): 85.6 tok/s, think:false REQUIRED
+>     (thinking eats whole budget -> empty response)
+>   - phi4-reasoning (11GB > VRAM): works, 0.6 tok/s (RAM/CPU offload)
+>   - gpt-oss-safeguard:20b (13.8GB, limit): 500 with default ctx 131072
+>     (KV OOM); works on CPU small ctx; REQUIRES thinking (think:false
+>     yields empty text for gpt-oss family)
+> - Modelfile workflow verified: --from-show (4 live params) +
+>   --probe-max-ctx (131072 measured) + apply as qwen3.5:4b-best + show
+>   confirms params + serving verified. Test tags removed.
+> - Fixed from live testing: connect(echo_probe=...) parity,
+>   per-backend status URL, get_loaded_model via /api/ps,
+>   generate(think=False) default, default tag <base>-best,
+>   probe ladder capped at model context_length.
+> Suite: 554 passed after fixes.
+
 Phase-1 Ollama support is implemented and unit-tested (mocked httpx), but no
 live Ollama server has been touched by CI. Work through this checklist on a
 local machine with Ollama installed before trusting an Ollama sweep. Check
