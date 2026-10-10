@@ -62,6 +62,7 @@ class OllamaMetrics:
     prompt_eval_count: int = 0
     total_duration_ns: int = 0
     done_reason: str | None = None
+    thinking: str = ""
     raw: dict = field(default_factory=dict)
 
     @property
@@ -332,6 +333,7 @@ class OllamaClient:
             prompt_eval_count=prompt_count,
             total_duration_ns=int(data.get("total_duration") or 0),
             done_reason=data.get("done_reason"),
+            thinking=str(data.get("thinking") or ""),
             raw=data,
         )
 
@@ -408,3 +410,60 @@ class OllamaClient:
             return True
         except Exception:
             return False
+
+    # --- Benchmark/optimizer parity (thin adapters, no logic change) ---
+
+    async def ensure_unloaded(self, model_id: str) -> bool:
+        """Unload a model and verify it is really gone (delegates to unload)."""
+        return await self.unload(model_id)
+
+    async def chat_completion(
+        self,
+        model: str,
+        input_text: str,
+        temperature: float = 0.7,
+        max_output_tokens: int = 512,
+        top_p: float | None = None,
+        top_k: int | None = None,
+        min_p: float | None = None,
+        presence_penalty: float | None = None,
+        reasoning: str | None = None,
+    ) -> dict:
+        """OpenAI-shaped completion over ``POST /api/generate``.
+
+        Parameter mapping: ``max_output_tokens`` → ``num_predict``;
+        sampling keys pass through as options; ``presence_penalty`` maps
+        to the closest analog ``repeat_penalty`` (documented approximation:
+        Ollama has no presence penalty); ``reasoning="off"``/None disables
+        thinking, any other value enables it (gpt-oss REQUIRES reasoning —
+        its output flows through the thinking channel).
+
+        Returns ``{"usage", "choices": [{"message": {"content"}}],
+        "_stats", "thinking_text"}`` matching what
+        ``BenchmarkService._extract_response`` consumes.
+        """
+        options: dict = {"num_predict": max_output_tokens, "temperature": temperature}
+        for key, value in (
+            ("top_p", top_p),
+            ("top_k", top_k),
+            ("min_p", min_p),
+            ("repeat_penalty", presence_penalty),
+        ):
+            if value is not None:
+                options[key] = value
+        think = reasoning is not None and str(reasoning).lower() != "off"
+        metrics = await self.generate(model, input_text, options=options, think=think)
+        return {
+            "usage": {
+                "prompt_tokens": metrics.prompt_eval_count,
+                "completion_tokens": metrics.eval_count,
+            },
+            "choices": [{"message": {"content": metrics.text}}],
+            "_stats": {
+                "gen_tok_s": metrics.gen_tok_s,
+                "prompt_tok_s": metrics.prompt_tok_s,
+                "load_ms": metrics.load_ms,
+                "done_reason": metrics.done_reason,
+            },
+            "thinking_text": metrics.thinking,
+        }
