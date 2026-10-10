@@ -1,6 +1,7 @@
 """CLI commands for LM Studio Optimizer."""
 
 import asyncio
+import dataclasses
 import sys
 import time
 from datetime import datetime
@@ -1267,7 +1268,11 @@ def apply(
         preset = preset_repo.get_by_model_and_profile(model, profile)
         if not preset:
             console.print(f"[red]No preset found for {model} with profile {profile}[/red]")
-            console.print("Run 'lm-optimizer optimize' first to create a preset.")
+            console.print("What you can do:")
+            console.print("  - Run 'lm-optimizer optimize' first to create a preset.")
+            console.print(f"  - Check results/<model>-best.md for the measured winner and apply it manually.")
+            console.print(f"  - Run 'lm-optimizer judge <run-id>' to pick a config from an existing run.")
+            console.print(f"  - List presets with 'lm-optimizer presets'.")
             sys.exit(1)
 
         console.print(f"Preset for {model} ({profile}):")
@@ -1289,6 +1294,10 @@ def apply(
                 console.print(f"Identifier: {result.identifier}")
             else:
                 console.print(f"[red]Failed to load: {result.error}[/red]")
+                console.print("What you can do:")
+                console.print("  - The host may be busy: unload other models in LM Studio first.")
+                console.print("  - The config may exceed VRAM: try a preset with smaller context.")
+                console.print(f"  - Check run state with 'lm-optimizer run-status' and host with 'lm-optimizer status'.")
                 sys.exit(1)
 
         except Exception as e:
@@ -1299,6 +1308,150 @@ def apply(
             await client.close()
 
     asyncio.run(_apply())
+
+
+@dataclasses.dataclass
+class ApplyEntry:
+    """One applicable configuration in the apply-menu picker."""
+
+    backend: str  # "lmstudio" | "ollama"
+    label: str  # human-readable model/tag
+    detail: str  # one-line config summary
+    model: str = ""  # LM Studio model id (lmstudio backend)
+    profile: str = "balanced"  # preset profile (lmstudio backend)
+    path: str = ""  # modelfile path (ollama backend)
+
+
+def _collect_apply_entries(presets: list[dict], modelfiles: list[dict]) -> list[ApplyEntry]:
+    """Build picker entries from DB presets + local ollama modelfiles.
+
+    Pure function (no servers, no DB): callers pass
+    ``preset_repo.list_all()`` and parsed ``ollama-configs/*.modelfile.md``.
+    """
+    entries: list[ApplyEntry] = []
+    for p in presets or []:
+        model_id = str(p.get("model_id", "") or "")
+        profile = str(p.get("profile", "") or "balanced")
+        if not model_id:
+            continue
+        cfg = p.get("config") or {}
+        ctx = cfg.get("context_length", "?")
+        entries.append(
+            ApplyEntry(
+                backend="lmstudio",
+                label=f"{model_id} [{profile}]",
+                detail=f"ctx {ctx}",
+                model=model_id,
+                profile=profile,
+            )
+        )
+    for m in modelfiles or []:
+        path = str(m.get("path", "") or "")
+        base = str(m.get("from", "") or "?")
+        if not path:
+            continue
+        n_params = max(0, len(m) - 2)  # minus path/from keys
+        entries.append(
+            ApplyEntry(
+                backend="ollama",
+                label=f"{path} (from {base})",
+                detail=f"{n_params} option(s)",
+                path=path,
+            )
+        )
+    return entries
+
+
+def _resolve_apply_choice(entries: list[ApplyEntry], choice: int) -> ApplyEntry | None:
+    """1-based picker resolution (0/Enter/out-of-range → None = cancel)."""
+    if not entries or choice <= 0 or choice > len(entries):
+        return None
+    return entries[choice - 1]
+
+
+def _scan_ollama_config_dir() -> list[dict]:
+    """Parse local ollama-configs/*.modelfile.md (no server calls)."""
+    from lm_optimizer.backends.ollama.modelfile import OLLAMA_CONFIG_DIR, parse_modelfile
+
+    found: list[dict] = []
+    try:
+        files = sorted(OLLAMA_CONFIG_DIR.glob("*.modelfile.md"))
+    except Exception:
+        return found
+    for f in files:
+        try:
+            parsed = parse_modelfile(f.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        parsed["path"] = str(f)
+        found.append(parsed)
+    return found
+
+
+@app.command(name="apply-menu")
+def apply_menu(
+    backend: str = typer.Option(
+        "lmstudio", "--backend", "-b", help="Backend to list: lmstudio or ollama"
+    ),
+):
+    """Interactive picker for applying optimized configs (no benchmarks).
+
+    lmstudio: applies a saved DB preset (loads the model once).
+    ollama: applies a local ollama-configs/*.modelfile.md as a NEW tag.
+    """
+    setup_logging()
+    normalized = (backend or "").strip().lower()
+    if normalized not in ("lmstudio", "ollama"):
+        console.print(f"[red]Invalid --backend: {backend} (expected lmstudio|ollama)[/red]")
+        sys.exit(2)
+
+    if normalized == "lmstudio":
+        entries = _collect_apply_entries(preset_repo.list_all(), [])
+    else:
+        entries = _collect_apply_entries([], _scan_ollama_config_dir())
+    if not entries:
+        if normalized == "lmstudio":
+            console.print("[yellow]No saved presets. Run 'lm-optimizer optimize' first.[/yellow]")
+        else:
+            console.print(
+                "[yellow]No local modelfiles. Create one with 'lm-optimizer ollama-export -o name.modelfile.md'.[/yellow]"
+            )
+        return
+
+    table = Table(title=f"Apply configs ({normalized}, select by number)")
+    table.add_column("#", style="cyan", justify="right")
+    table.add_column("Config", style="green")
+    table.add_column("Detail", style="dim")
+    for idx, e in enumerate(entries, 1):
+        table.add_row(str(idx), e.label, e.detail)
+    console.print(table)
+    console.print()
+
+    try:
+        choice = typer.prompt(
+            "Select config number to apply (or Enter to cancel)",
+            type=int,
+            default=0,
+            show_default=False,
+        )
+    except (typer.Abort, ValueError):
+        console.print("[yellow]Cancelled[/yellow]")
+        return
+    selected = _resolve_apply_choice(entries, choice)
+    if selected is None:
+        console.print("[red]Invalid selection[/red]")
+        return
+
+    console.print(f"\nSelected: [bold]{selected.label}[/bold] ({selected.detail})")
+    if not typer.confirm("Apply this config? (loads the model)", default=True):
+        console.print("[yellow]Cancelled[/yellow]")
+        return
+    if selected.backend == "lmstudio":
+        apply(selected.model, selected.profile)
+    else:
+        from pathlib import Path as _Path
+
+        ollama_apply(file=_Path(selected.path), as_tag=None, yes=True, base_url=None)
 
 
 @app.command()
