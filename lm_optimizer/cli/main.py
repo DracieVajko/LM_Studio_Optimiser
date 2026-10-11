@@ -253,18 +253,23 @@ def _require_style(style: str) -> str:
     return style
 
 
-def _benchmark_config_obj(repetitions: int, max_tokens_scale: float = 1.0):
+def _benchmark_config_obj(repetitions: int, max_tokens_scale: float = 1.0, warmup_runs: int = 1):
     """Duck-typed benchmark config (repetitions/warmup/timeouts/scale)."""
     try:
         scale = min(1.0, max(0.25, float(max_tokens_scale)))
     except (TypeError, ValueError):
         scale = 1.0
+    try:
+        warmups = int(warmup_runs)
+    except (TypeError, ValueError):
+        warmups = 1
+    warmups = min(5, max(0, warmups))
     return type(
         "obj",
         (object,),
         {
             "repetitions": repetitions,
-            "warmup_repetitions": 1,
+            "warmup_repetitions": warmups,
             "timeout_seconds": 300,
             "load_timeout_seconds": 60,
             "generation_timeout_seconds": 120,
@@ -300,13 +305,9 @@ async def _run_optimization(
         )
     benchmark_service = BenchmarkService(
         client,
-        benchmark_config=_benchmark_config_obj(repetitions, max_tokens_scale),
-        style=style,
-        gpu_via_cli=gpu_via_cli,
-    )
-    benchmark_service = BenchmarkService(
-        client,
-        benchmark_config=_benchmark_config_obj(repetitions),
+        benchmark_config=_benchmark_config_obj(
+            repetitions, max_tokens_scale, advanced.get("warmup_runs", 1)
+        ),
         style=style,
         gpu_via_cli=gpu_via_cli,
     )
@@ -578,6 +579,7 @@ def _save_preset_and_report(
     generation=None,
     model_info=None,
     note=None,
+    sort="run",
 ) -> bool:
     """Save preset + per-model .md report. Returns True if best existed."""
     best_config = run.get_best_config()
@@ -628,6 +630,7 @@ def _save_preset_and_report(
         host=_host_info_dict(hardware, note=note),
         extra=extra,
         generation=generation,
+        sort=sort,
     )
     if report_path:
         console.print(f"[green]Report saved: {report_path}[/green]")
@@ -1091,6 +1094,22 @@ def optimize(
         "--optimize-context",
         help="Phase B opt-in: max-context sweep on the frozen runtime winner",
     ),
+    warmup_runs: int = typer.Option(
+        1, "--warmup-runs", help="Warmup suite passes per config 0-5 (0 = fastest, noisier)"
+    ),
+    report_sort: str = typer.Option(
+        "run", "--report-sort", help="Tested-configs table order: run, speed, quality"
+    ),
+    skip_phases: str | None = typer.Option(
+        None,
+        "--skip-phases",
+        help="Comma-separated phases to skip: speed,quality,recovery,validation,context",
+    ),
+    physical_batches: str | None = typer.Option(
+        None,
+        "--physical-batches",
+        help="Comma-separated physical batch sizes to test (e.g. 256,512,1024)",
+    ),
     enable_rope: bool = typer.Option(
         False,
         "--enable-rope",
@@ -1183,6 +1202,37 @@ def optimize(
                 _resolve_experimental_flags(enable_rope, enable_cpu_moe, enable_speculative)
             )
             advanced["min_speed"] = min_speed
+            if not 0 <= warmup_runs <= 5:
+                console.print("[red]Invalid --warmup-runs (0-5)[/red]")
+                sys.exit(2)
+            advanced["warmup_runs"] = warmup_runs
+            if report_sort not in ("run", "speed", "quality"):
+                console.print("[red]Invalid --report-sort (run|speed|quality)[/red]")
+                sys.exit(2)
+            if skip_phases:
+                from lm_optimizer.services.optimizer import parse_phase_skips
+
+                try:
+                    advanced["skip_phases"] = sorted(parse_phase_skips(skip_phases))
+                except ValueError as e:
+                    console.print(f"[red]{e}[/red]")
+                    sys.exit(2)
+            if physical_batches:
+                try:
+                    batches = sorted(
+                        {int(x.strip()) for x in physical_batches.split(",") if x.strip()}
+                    )
+                except ValueError:
+                    console.print(
+                        "[red]Invalid --physical-batches (comma-separated integers)[/red]"
+                    )
+                    sys.exit(2)
+                if not batches or any(b <= 0 for b in batches):
+                    console.print(
+                        "[red]Invalid --physical-batches (positive integers required)[/red]"
+                    )
+                    sys.exit(2)
+                advanced["physical_batches"] = batches
 
             console.print(f"[bold]Starting optimization for {model}[/bold]")
             console.print(f"  Profile: {profile}")
@@ -1223,6 +1273,7 @@ def optimize(
                 hardware,
                 generation=_generation_for(model, model_info.architecture),
                 model_info=model_info,
+                sort=report_sort,
             )
 
             # Fail-closed post-hygiene: the host must be clean for whatever runs next.
@@ -1788,6 +1839,22 @@ def auto(
         "--min-speed",
         help="Minimum generation tok/s to accept a config; slower configs are skipped and marked as too slow",
     ),
+    warmup_runs: int = typer.Option(
+        1, "--warmup-runs", help="Warmup suite passes per config 0-5 (0 = fastest, noisier)"
+    ),
+    report_sort: str = typer.Option(
+        "run", "--report-sort", help="Tested-configs table order: run, speed, quality"
+    ),
+    skip_phases: str | None = typer.Option(
+        None,
+        "--skip-phases",
+        help="Comma-separated phases to skip: speed,quality,recovery,validation,context",
+    ),
+    physical_batches: str | None = typer.Option(
+        None,
+        "--physical-batches",
+        help="Comma-separated physical batch sizes to test (e.g. 256,512,1024)",
+    ),
     enable_rope: bool = typer.Option(
         False,
         "--enable-rope",
@@ -1875,6 +1942,40 @@ def auto(
             experimental_flags = _resolve_experimental_flags(
                 enable_rope, enable_cpu_moe, enable_speculative
             )
+
+            from lm_optimizer.services.optimizer import parse_phase_skips
+
+            auto_skips: list[str] = []
+            if skip_phases:
+                try:
+                    auto_skips = sorted(parse_phase_skips(skip_phases))
+                except ValueError as e:
+                    console.print(f"[red]{e}[/red]")
+                    sys.exit(2)
+            auto_physical_batches: list[int] | None = None
+            if physical_batches:
+                try:
+                    auto_physical_batches = sorted(
+                        {int(x.strip()) for x in physical_batches.split(",") if x.strip()}
+                    )
+                except ValueError:
+                    console.print(
+                        "[red]Invalid --physical-batches (comma-separated integers)[/red]"
+                    )
+                    sys.exit(2)
+                if not auto_physical_batches or any(
+                    b <= 0 for b in auto_physical_batches
+                ):
+                    console.print(
+                        "[red]Invalid --physical-batches (positive integers required)[/red]"
+                    )
+                    sys.exit(2)
+            if not 0 <= warmup_runs <= 5:
+                console.print("[red]Invalid --warmup-runs (0-5)[/red]")
+                sys.exit(2)
+            if report_sort not in ("run", "speed", "quality"):
+                console.print("[red]Invalid --report-sort (run|speed|quality)[/red]")
+                sys.exit(2)
 
             smoke_service = BenchmarkService(client, style=style)
             quality_evaluator = QualityEvaluator(QualityConfig(minimum_score=quality_threshold))
@@ -2022,8 +2123,12 @@ def auto(
                             "selection_threshold": 0.05,
                             "gpu_via_cli": gpu_via_cli,
                             "min_speed": min_speed,
+                            "skip_phases": auto_skips,
                             **experimental_flags,
                         }
+                        if auto_physical_batches:
+                            advanced["physical_batches"] = auto_physical_batches
+                        advanced["warmup_runs"] = warmup_runs
                         run = await _run_optimization(
                             client,
                             m,
@@ -2098,6 +2203,7 @@ def auto(
                                 generation=_generation_for(m.id, m.architecture),
                                 model_info=m,
                                 note=remote_note,
+                                sort=report_sort,
                             )
                             row["detail"] += (
                                 f"; best ctx {best.context_length} "
@@ -2318,6 +2424,89 @@ def fit(
         release_lock()
 
 
+async def _ctx_quality_suites(
+    client,
+    model: str,
+    report: dict,
+    top_n: int,
+    threshold: float,
+    repetitions: int,
+    gpu_ratio: float,
+    flash: bool,
+    kv_gpu: bool,
+    batch: int,
+    style: str = "balanced",
+    warmup_runs: int = 1,
+) -> list[dict]:
+    """Full quality suites on the top-N stable sweep rungs (ctx --quality).
+
+    Same runtime as the capacity probes, descending ctx. Returns per-rung
+    dicts (ctx, tok/s, quality, checks, VRAM, TTFT, pass). Never raises
+    for a single failed rung (records it, continues).
+    """
+    from lm_optimizer.services.benchmark import BenchmarkService
+    from lm_optimizer.services.context_sweep import pick_quality_rungs
+    from lm_optimizer.services.quality import QualityConfig, QualityEvaluator
+
+    rungs = pick_quality_rungs(report, top_n)
+    if not rungs:
+        console.print("[yellow]No stable rungs for quality suites[/yellow]")
+        return []
+    svc = BenchmarkService(
+        client, benchmark_config=_benchmark_config_obj(max(1, repetitions), 1.0, warmup_runs)
+    )
+    evaluator = QualityEvaluator(QualityConfig(minimum_score=threshold))
+    rows: list[dict] = []
+    table = Table(title=f"Quality suites (top-{len(rungs)} stable contexts): {model}")
+    table.add_column("Context", justify="right")
+    table.add_column("Gen tok/s", justify="right")
+    table.add_column("Quality", justify="right")
+    table.add_column("Checks", justify="right")
+    table.add_column("VRAM GB", justify="right")
+    table.add_column("TTFT ms", justify="right")
+    table.add_column("Verdict")
+    for ctx_len in rungs:
+        cfg = LoadConfiguration(
+            context_length=ctx_len,
+            gpu_ratio=gpu_ratio,
+            flash_attention=flash,
+            offload_kv_cache_to_gpu=kv_gpu,
+            eval_batch_size=batch,
+        )
+        try:
+            with console.status(f"Quality suite ctx={ctx_len}..."):
+                res = await svc.run_benchmark(model, cfg, ctx_len, style=style)
+            scores = evaluator.evaluate_all(model, res.metrics)
+            agg = evaluator.aggregate_quality(scores)
+            ok = agg.overall >= threshold
+            row = {
+                "ctx": ctx_len,
+                "tok_s": round(res.get_avg_generation_tok_s(), 1),
+                "quality": round(agg.overall, 3),
+                "checks": f"{agg.checks_passed}/{agg.checks_total}",
+                "vram_gb": round(res.peak_vram_gb, 1) if res.peak_vram_gb else None,
+                "ttft_ms": round(res.get_avg_estimated_ttft_ms(), 0),
+                "pass": bool(ok),
+            }
+        except Exception as e:
+            logger.exception("Quality rung failed", ctx=ctx_len)
+            row = {"ctx": ctx_len, "tok_s": 0.0, "quality": 0.0, "checks": "0/0",
+                   "vram_gb": None, "ttft_ms": 0, "pass": False,
+                   "error": f"{type(e).__name__}: {e}"[:160]}
+        rows.append(row)
+        table.add_row(
+            str(row["ctx"]),
+            f"{row['tok_s']:.1f}",
+            f"{row['quality']:.3f}",
+            str(row["checks"]),
+            f"{row['vram_gb']:.1f}" if row["vram_gb"] is not None else "—",
+            f"{row['ttft_ms']:.0f}",
+            "[green]PASS[/green]" if row["pass"] else "[red]FAIL[/red]",
+        )
+    console.print(table)
+    return rows
+
+
 @app.command()
 def ctx(
     model: str = typer.Argument(..., help="Model ID to probe"),
@@ -2330,6 +2519,15 @@ def ctx(
     flash: bool = typer.Option(True, "--flash/--no-flash", help="Flash attention"),
     batch: int = typer.Option(256, "--batch", "-b", help="Eval batch size"),
     repetitions: int = typer.Option(1, "--repetitions", "-r", help="Smoke repetitions per point"),
+    warmup_runs: int = typer.Option(
+        1, "--warmup-runs", help="Warmup suite passes per quality rung 0-5 (0 = fastest)"
+    ),
+    quality_rungs: int = typer.Option(
+        0, "--quality-rungs", help="Full quality suites on top-N stable rungs (0 = off)"
+    ),
+    quality_threshold: float = typer.Option(
+        0.97, "--quality-threshold", help="Pass threshold for quality-rung verdicts"
+    ),
     dry_run: bool = typer.Option(False, "--dry-run", help="Show plan without running"),
     wait_interval: float = typer.Option(
         60.0,
@@ -2438,6 +2636,15 @@ def ctx(
                 )
             if bal:
                 console.print(f"\nBalanced recommended:\n{bal['ctx']}")
+            if quality_rungs > 0:
+                if not 0 <= warmup_runs <= 5:
+                    console.print("[red]Invalid --warmup-runs (0-5)[/red]")
+                    sys.exit(2)
+                await _ctx_quality_suites(
+                    client, model, report, quality_rungs, quality_threshold,
+                    repetitions, gpu_ratio, flash, kv_gpu, batch, style="balanced",
+                    warmup_runs=warmup_runs,
+                )
         except KeyboardInterrupt:
             console.print(
                 "\n[yellow]Interrupted — partial sweep results above are preserved.[/yellow]"
@@ -2706,6 +2913,11 @@ def resume(
     run_id: str = typer.Argument(..., help="Run ID to resume from checkpoint"),
     revalidate: bool = typer.Option(False, "--revalidate", help="Re-run completed candidates"),
     style: str = typer.Option("balanced", "--style", help="Benchmark style"),
+    skip_phases: str | None = typer.Option(
+        None,
+        "--skip-phases",
+        help="Comma-separated phases to skip for the remainder: speed,quality,recovery,validation,context",
+    ),
 ):
     """Resume an interrupted run from its checkpoint without re-running completed work."""
     setup_logging()
@@ -2729,6 +2941,7 @@ def resume(
             if not run:
                 console.print(f"[red]Run not found: {run_id}[/red]")
                 sys.exit(1)
+            _apply_resume_skips(run, skip_phases)
             completed = ckpt.get("completed_candidate_ids", [])
             console.print("[bold]Resuming optimization[/bold]")
             console.print(f"Completed:\n{len(completed)} configurations")
@@ -2809,6 +3022,33 @@ def pause(
     console.print(f"[yellow]Pause requested for run {resolved}[/yellow]")
     console.print("The running process pauses after its current operation finishes.")
     console.print(f"Check status with: run-status {resolved}")
+
+
+def _apply_resume_skips(run, skip_phases: str | None) -> None:
+    """Merge --skip-phases into a stored run before resume (CLI wins).
+
+    Exits 2 on unknown phase names. No-op when skip_phases is falsy.
+    """
+    if not skip_phases:
+        return
+    from lm_optimizer.services.optimizer import parse_phase_skips
+
+    try:
+        skips = sorted(parse_phase_skips(skip_phases))
+        merged = dict(run.advanced_settings or {})
+        merged["skip_phases"] = skips
+        run.advanced_settings = merged
+        params = dict(run.benchmark_params or {})
+        params["skip_phases"] = skips
+        run.benchmark_params = params
+        run_repo.save(run)
+        console.print(
+            f"[yellow]Skipping phases for the remainder: "
+            f"{', '.join(skips)}[/yellow]"
+        )
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        sys.exit(2)
 
 
 def _resolve_run_id(prefix: str) -> str | None:
@@ -2906,11 +3146,15 @@ def resume_menu(
         help="Filter by status (running, paused, resumed, partial_success). Can repeat.",
     ),
     limit: int = typer.Option(20, "--limit", "-l", help="Max runs to show"),
+    all: bool = typer.Option(
+        False, "--all", help="Resume every listed run sequentially (one confirmation)"
+    ),
 ):
     """Interactive menu to resume paused/incomplete runs.
 
     Shows runs with checkpoints that can be resumed (not terminal states).
-    Select a run by number to resume from its checkpoint.
+    Select a run by number to resume from its checkpoint, or pass --all
+    to finish every listed run one after another.
     """
     setup_logging()
 
@@ -2926,6 +3170,10 @@ def resume_menu(
     resumable_runs = [r for r in runs if r.status.value in target_statuses]
     if not resumable_runs:
         console.print(f"[yellow]No runs with status in {target_statuses}[/yellow]")
+        return
+
+    if all:
+        resume_all_runs(resumable_runs)
         return
 
     # Build display table
@@ -2992,7 +3240,49 @@ def resume_menu(
     _run_resume(str(selected.id), revalidate=False, style="balanced")
 
 
-def _run_resume(run_id: str, revalidate: bool, style: str):
+def resume_all_runs(runs: list) -> dict:
+    """Resume every given run sequentially (bulk finish, --all path).
+
+    One confirmation up front; per-run failures are collected, never abort
+    the batch. Returns {"resumed": [...ids], "failed": {id: error}}.
+    """
+    result: dict = {"resumed": [], "failed": {}}
+    if not runs:
+        console.print("[yellow]Nothing to resume[/yellow]")
+        return result
+    console.print(f"[bold]About to resume {len(runs)} run(s), one after another.[/bold]")
+    try:
+        go = typer.confirm("Resume all?", default=True)
+    except (typer.Abort, ValueError):
+        console.print("[yellow]Cancelled[/yellow]")
+        return result
+    if not go:
+        console.print("[yellow]Cancelled[/yellow]")
+        return result
+    for run in runs:
+        rid = str(run.id)
+        try:
+            console.print(f"\n[bold]=== {run.model.name or run.model.id} ({rid[:8]}...) ===[/bold]")
+            _run_resume(rid, revalidate=False, style="balanced")
+            result["resumed"].append(rid)
+        except SystemExit as e:
+            # _run_resume exits nonzero on failure; keep going with the rest.
+            if getattr(e, "code", 1) in (0, None):
+                result["resumed"].append(rid)
+            else:
+                result["failed"][rid] = f"exit {e.code}"
+        except Exception as e:
+            result["failed"][rid] = f"{type(e).__name__}: {e}"[:200]
+    console.print(
+        f"\n[bold]Resume-all done: {len(result['resumed'])} resumed, "
+        f"{len(result['failed'])} failed[/bold]"
+    )
+    for rid, err in result["failed"].items():
+        console.print(f"  [red]{rid[:8]}...: {err}[/red]")
+    return result
+
+
+def _run_resume(run_id: str, revalidate: bool, style: str, skip_phases: str | None = None):
     """Internal: run the resume logic."""
     style = _require_style(style)
 
@@ -3014,6 +3304,7 @@ def _run_resume(run_id: str, revalidate: bool, style: str):
             if not run:
                 console.print(f"[red]Run not found: {run_id}[/red]")
                 sys.exit(1)
+            _apply_resume_skips(run, skip_phases)
             completed = ckpt.get("completed_candidate_ids", [])
             console.print("[bold]Resuming optimization[/bold]")
             console.print(f"Completed:\n{len(completed)} configurations")
@@ -3212,6 +3503,10 @@ def param_matrix(
     console.print(
         "[dim]Control: REST = native API verified live; CLI = lms flags verified; "
         "SDK/schema = known but programmatically unverified; none = not exposed.[/dim]"
+    )
+    console.print(
+        "[dim]What you get from this table: which knobs the optimizer can turn "
+        "itself during a run (and how), vs what stays fixed or needs manual/CLI steps.[/dim]"
     )
     if record:
         try:

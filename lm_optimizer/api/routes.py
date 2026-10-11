@@ -472,20 +472,27 @@ async def start_optimization(request: OptimizationRequest, background_tasks: Bac
         # Get hardware
         hardware = hardware_detector.detect()
 
-        # Create services
-        benchmark_service = BenchmarkService(client)
-        quality_evaluator = QualityEvaluator(QualityConfig(minimum_score=request.quality_threshold))
-        search_generator = SearchSpaceGenerator(client)
-        optimizer = AdaptiveOptimizer(
-            client, benchmark_service, quality_evaluator, search_generator
-        )
-
         # Merge top-level workload into advanced settings (canonical source).
         from lm_optimizer.services.workload import normalize_workload
 
         adv = request.advanced_settings.dict() if request.advanced_settings else {}
         adv.setdefault("workload_type", normalize_workload(request.workload_type))
         adv["workload_type"] = normalize_workload(adv.get("workload_type"))
+
+        # Create services
+        benchmark_service = BenchmarkService(client)
+        if adv.get("warmup_runs") is not None:
+            try:
+                benchmark_service.config.warmup_repetitions = min(
+                    5, max(0, int(adv["warmup_runs"]))
+                )
+            except (TypeError, ValueError):
+                pass
+        quality_evaluator = QualityEvaluator(QualityConfig(minimum_score=request.quality_threshold))
+        search_generator = SearchSpaceGenerator(client)
+        optimizer = AdaptiveOptimizer(
+            client, benchmark_service, quality_evaluator, search_generator
+        )
         weights = (
             ProfileWeights(**request.custom_weights.dict())
             if request.custom_weights
@@ -635,8 +642,10 @@ async def resume_run(run_id: UUID):
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
     status_value = run.status.value if hasattr(run.status, 'value') else run.status
-    if status_value not in ("paused",):
-        raise HTTPException(status_code=409, detail=f"Run is {status_value}, not paused")
+    # Finishable states: paused, partial_success, interrupted. Live runs
+    # (running/resumed) and explicit cancels stay manual.
+    if status_value not in ("paused", "partial_success", "interrupted"):
+        raise HTTPException(status_code=409, detail=f"Run is {status_value}, not resumable")
     
     ckpt = load_checkpoint(run_id)
     if not ckpt:

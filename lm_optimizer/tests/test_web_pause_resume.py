@@ -99,7 +99,7 @@ class TestWebPauseResume:
     @patch("lm_optimizer.api.routes.run_repo")
     @patch("lm_optimizer.api.routes.load_checkpoint")
     def test_resume_not_paused(self, mock_load_checkpoint, mock_run_repo, client):
-        """Test resume on non-paused run returns 409."""
+        """Test resume on non-resumable run returns 409."""
         mock_run = MagicMock()
         mock_run.status = "running"
         run_repo = MagicMock()
@@ -110,7 +110,43 @@ class TestWebPauseResume:
              patch("lm_optimizer.api.routes.load_checkpoint", mock_load_checkpoint):
             response = client.post(f"/api/runs/{uuid4()}/resume")
             assert response.status_code == 409
-            assert "not paused" in response.json()["detail"].lower()
+            assert "not resumable" in response.json()["detail"].lower()
+
+    @patch("lm_optimizer.api.routes.run_repo")
+    @patch("lm_optimizer.api.routes.load_checkpoint")
+    @patch("lm_optimizer.api.routes.BackgroundTasks")
+    @patch("lm_optimizer.api.routes.resume_run_from_checkpoint")
+    def test_resume_partial_success_accepted(
+        self, mock_resume_from_checkpoint, mock_background_tasks,
+        mock_load_checkpoint, mock_run_repo, client,
+    ):
+        """Partial-success runs are finishable via resume."""
+        mock_run_repo.get.return_value = MagicMock(id=uuid4(), status="partial_success")
+        mock_load_checkpoint.return_value = {"completed_candidate_ids": [1]}
+
+        with patch("lm_optimizer.api.routes.resume_run_from_checkpoint") as mock_resume:
+            mock_resume.return_value = {"completed_candidate_ids": [1]}
+            response = client.post(f"/api/runs/{uuid4()}/resume")
+            assert response.status_code == 200
+            assert response.json()["success"] is True
+
+    @patch("lm_optimizer.api.routes.run_repo")
+    @patch("lm_optimizer.api.routes.load_checkpoint")
+    @patch("lm_optimizer.api.routes.BackgroundTasks")
+    @patch("lm_optimizer.api.routes.resume_run_from_checkpoint")
+    def test_resume_interrupted_accepted(
+        self, mock_resume_from_checkpoint, mock_background_tasks,
+        mock_load_checkpoint, mock_run_repo, client,
+    ):
+        """Interrupted runs are finishable via resume."""
+        mock_run_repo.get.return_value = MagicMock(id=uuid4(), status="interrupted")
+        mock_load_checkpoint.return_value = {"completed_candidate_ids": [1, 2]}
+
+        with patch("lm_optimizer.api.routes.resume_run_from_checkpoint") as mock_resume:
+            mock_resume.return_value = {"completed_candidate_ids": [1, 2]}
+            response = client.post(f"/api/runs/{uuid4()}/resume")
+            assert response.status_code == 200
+            assert response.json()["success"] is True
 
 
 if __name__ == "__main__":

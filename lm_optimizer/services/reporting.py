@@ -550,13 +550,16 @@ def save_best_report(
     host: dict | None = None,
     extra: dict | None = None,
     generation: dict | None = None,
+    sort: str = "run",
 ) -> Path | None:
     """Save a per-model .md file with the best settings. Returns path or None.
 
     Filename and every identity claim derive from the run's own stored
     model_id (never execution order or selection state). `generation`:
     recommended sampling settings {temperature, top_p, top_k, min_p,
-    presence_penalty, reasoning, source}.
+    presence_penalty, reasoning, source}. `sort`: tested-configs table
+    order — "run" (execution order), "speed" (gen tok/s desc) or
+    "quality" (overall desc); unknown falls back to "run".
     """
     best = run.get_best_config()
     if best is None:
@@ -580,6 +583,22 @@ def save_best_report(
     storage = host.get("storage") or {}
     drives = storage.get("drives") or []
     trio = _context_trio([c for c in configs if c.status.value == "passed"])
+    tested = [c for c in configs if c.status.value == "passed"]
+    failed = [c for c in configs if c.status.value != "passed"]
+    pareto = run.get_pareto_configs()
+
+    order = (sort or "run").lower()
+    if order == "speed":
+        ordered = sorted(tested, key=lambda c: c.get_avg_generation_tok_s(), reverse=True)
+    elif order == "quality":
+        ordered = sorted(
+            tested,
+            key=lambda c: (c.quality_score.overall if c.quality_score else -1.0),
+            reverse=True,
+        )
+    else:
+        order = "run"
+        ordered = list(tested)
 
     def tried(get):
         return _tried(configs, get)
@@ -593,6 +612,21 @@ def save_best_report(
             f"- Run: {run.id} (status: {run.status.value})",
             f"- Optimizer: {run.optimizer_version}",
             f"- Elapsed: {run.duration_seconds:.1f}s" if run.duration_seconds else "- Elapsed: N/A",
+            "",
+            "## Results",
+            "",
+            f"- Generation: {best.get_avg_generation_tok_s():.1f} tok/s",
+            f"- Prompt: {best.get_avg_prompt_tok_s():.0f} tok/s",
+            f"- Est. TTFT: {best.get_avg_estimated_ttft_ms():.0f} ms",
+            (
+                f"- Quality: {qs_best.overall:.3f} "
+                f"({qs_best.checks_passed}/{qs_best.checks_total} checks)"
+                if (qs_best := best.quality_score) is not None
+                else "- Quality: N/A"
+            ),
+            f"- Context: {best.context_length}",
+            f"- Verdict: fastest quality-passing of {len(tested)} "
+            f"(profile {run.profile.value})",
             "",
             "## Model identity (from this run, not execution order)",
             "",
@@ -649,13 +683,6 @@ def save_best_report(
             "(gpu_ratio excluded). GUI-only items (KV quant, offload ratio, threads) "
             "must be set on the host.",
             "",
-            "## Control channels (per parameter, registry-driven)",
-            "",
-            "| Parameter | Channel | Programmatic |",
-            "| --- | --- | --- |",
-        ]
-        + _channel_rows(best)
-        + [
             "",
             "## Requested vs applied (winner load verification)",
             "",
@@ -710,8 +737,6 @@ def save_best_report(
             "",
         ]
 
-    pareto = run.get_pareto_configs()
-    tested = [c for c in run.configurations if c.status.value == "passed"]
     max_passing_ctx = max((c.context_length for c in tested), default=None)
     lines += [
         f"Max passing context: {max_passing_ctx} (among {len(tested)} passed configurations)",
@@ -762,21 +787,28 @@ def save_best_report(
             )
         lines += [""]
     lines += ["## Tested configurations (passed)", ""]
-    lines += ["| ctx | flash | KV | batch | gen tok/s | quality | score | status |"]
-    lines += ["| --- | --- | --- | --- | --- | --- | --- | --- |"]
-    for c in tested:
+    lines += [
+        "| # | ctx | flash | KV | batch | phys | par | gen tok/s | prompt tok/s | "
+        "TTFT ms | VRAM GB | quality | score | status |"
+    ]
+    lines += [
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
+    ]
+    for i, c in enumerate(ordered, 1):
         q = f"{c.quality_score.overall:.3f}" if c.quality_score else "N/A"
+        vram = f"{c.peak_vram_gb:.1f}" if c.peak_vram_gb is not None else "—"
         lines.append(
-            f"| {c.context_length} | {_fmt(c.config.flash_attention)} | "
+            f"| {i} | {c.context_length} | {_fmt(c.config.flash_attention)} | "
             f"{'GPU' if c.config.offload_kv_cache_to_gpu else 'CPU'} | "
-            f"{_fmt(c.config.eval_batch_size)} | {c.get_avg_generation_tok_s():.1f} | "
-            f"{q} | {_score_str(c.score)} | PASS |"
+            f"{_fmt(c.config.eval_batch_size)} | {_fmt(c.config.physical_batch_size)} | "
+            f"{_fmt(c.config.parallel)} | {c.get_avg_generation_tok_s():.1f} | "
+            f"{c.get_avg_prompt_tok_s():.0f} | {c.get_avg_estimated_ttft_ms():.0f} | "
+            f"{vram} | {q} | {_score_str(c.score)} | PASS |"
         )
     if len(pareto) != len(tested):
         lines += ["", f"Pareto-optimal: {len(pareto)} of {len(tested)} passed."]
     lines += [""]
 
-    failed = [c for c in run.configurations if c.status.value != "passed"]
     if failed:
         lines += ["## Failed configurations (with reasons)", ""]
         lines += ["| ctx | flash | KV | batch | status | reason |"]
@@ -823,6 +855,18 @@ def save_best_report(
         if best_val is None and name in server_defaults:
             best_val = f"server default ({server_defaults[name]})"
         lines.append(f"| {name} | {shown} | {best_val} |")
+    lines += [""]
+
+    lines += [
+        "## Control channels (per parameter, registry-driven)",
+        "",
+        "Which knobs the optimizer can turn itself during a run (and how), "
+        "vs what stays fixed or needs manual/CLI steps.",
+        "",
+        "| Parameter | Channel | Programmatic |",
+        "| --- | --- | --- |",
+    ]
+    lines += _channel_rows(best)
     lines += [""]
 
     notes = _prune_notes(run, configs)

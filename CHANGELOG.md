@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.6.0] - 2026-10-11
+
+### Added
+- **Phase skipping** (`--skip-phases speed,quality,recovery,validation,context`) on `optimize`, `auto`, `resume`, `resume-menu --all` — skips persist in run checkpoints and survive restarts
+- **Quality ladder** (`ctx --quality-rungs N --quality-threshold 0.97`) runs full quality suites on top-N stable ladder rungs (ctx, tok/s, quality, checks, VRAM, TTFT, PASS/FAIL table)
+- **Faster tests**: `--warmup-runs 0-5` (default 1) on `optimize` / `auto` / `ctx` — `0` skips warmup suite pass per config (~15-20% faster, slightly noisier first measurements)
+- **Richer reports**: `--report-sort run|speed|quality` reorders tested-configs table; Results block first, then best config, HW details, test details, tried configs, methodology last
+- **Wider grid**: `--physical-batches 256,512,1024` adds eval batch size as search dimension (`optimize` / `auto`)
+- **GUI Dashboard**: Skip phases checkboxes, Warmup runs input, Report sort selector
+- **GUI History**: "Resume All Pending" finishes `paused`, `partial_success`, `interrupted` runs
+- **Ollama probe matrix** (`ollama-probe`): connect/list/show/generate/think-fallback/ctx-timings/unload-verify
+- **Ollama adapters**: `chat_completion` + `ensure_unloaded` + thinking capture
+- **Ollama Modelfile workflow**: `--from-show` (live defaults) + `--probe-max-ctx` (ladder probe) + apply as `<base>-best`; config dir `ollama-configs/`
+- **Apply-menu picker**: `apply-menu --backend lmstudio|ollama` (presets + modelfiles); `apply` failure hints (no preset / failed load)
+
+### Fixed
+- **Bugfix**: `_benchmark_config_obj` double-construction lost `max_tokens_scale` — now single construction with `warmup_runs`
+- **macOS CI**: `get_cpu_info()` frequency fallback already in place (1.5.1)
+
 ## [1.5.1] - 2026-10-07
 
 ### Added

@@ -461,18 +461,21 @@ const HistoryPage = {
     async resumeAllPending() {
         const btn = document.getElementById('resume-all-pending');
         if (btn) btn.disabled = true;
-        UI.showLoading('Resuming all paused runs...');
+        UI.showLoading('Resuming all unfinished runs...');
         try {
-            const pausedRuns = this.state.runs.filter(r => r.status === 'paused');
-            if (!pausedRuns.length) {
+            // Finishable states: paused, partial_success, interrupted.
+            // Live (running/resumed) and explicitly cancelled runs are left alone.
+            const resumable = ['paused', 'partial_success', 'interrupted'];
+            const pendingRuns = this.state.runs.filter(r => resumable.includes(r.status));
+            if (!pendingRuns.length) {
                 UI.hideLoading();
-                UI.showToast('No paused runs to resume', 'info');
+                UI.showToast('No unfinished runs to resume', 'info');
                 if (btn) btn.disabled = false;
                 return;
             }
             let successCount = 0;
             let errorCount = 0;
-            for (const run of pausedRuns) {
+            for (const run of pendingRuns) {
                 try {
                     await API.resumeRunFromCheckpoint(run.id);
                     successCount++;

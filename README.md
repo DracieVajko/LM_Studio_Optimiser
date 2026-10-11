@@ -124,8 +124,8 @@ python -m pytest -q
 |`compare <model> --config-a A --config-b B [--tests T]`|A/B configs on the same tests|yes|
 |`auto [models] [--skip X,Y]`|smoke → precision → ladder → matrix → optimize|yes|
 |`fit [models]`|max-context ladder per KV path|yes|
-|`ctx <model>`|geometric context sweep + bisect|yes|
-|`pause <id>` / `resume <id>` / `run-status`|graceful pause + resume under same ID|no|
+|`ctx <model> [--quality-rungs N]`|geometric context sweep + bisect (+ full quality suites)|yes|
+|`pause <id>` / `resume <id> [--skip-phases]` / `run-status`|graceful pause + resume under same ID|no|
 |`checkpoints`|list interrupt checkpoints|no|
 |`param-matrix [--record]`|parameter control matrix (+ DB snapshot)|no|
 |`apply / restore / presets / runs`|presets and history management|apply/restore yes|
@@ -183,6 +183,41 @@ lm-optimizer judge <run_id> --backend heuristic  # default, no AI needed
 - API backend: uses external API like OpenRouter (planned)
 
 Outputs: recommended config, reasoning, confidence, pros/cons, alternatives, VRAM warnings.
+
+## Phase Skips, Fast Tests & Full Reports (v1.6.0)
+
+**Skip phases** (CLI, API i GUI Dashboard): `speed,quality,recovery,validation,context`.
+
+```bash
+lm-optimizer optimize <model> --skip-phases recovery,validation
+lm-optimizer auto --skip-phases context --skip a,b
+lm-optimizer resume <run-id> --skip-phases quality   # finish the rest faster
+lm-optimizer resume-menu --all                       # finish every pending run
+```
+
+Skips are stored on the run, so `resume` keeps them. Skipping `quality`
+means no winner path (run ends without best config); skipping `context`
+forces Phase B off. GUI: Dashboard → Advanced → Skip phases checkboxes
+(same names); History → Resume All Pending finishes `paused`,
+`partial_success` and `interrupted` runs.
+
+**Faster tests.** `--warmup-runs 0-5` (default 1) on `optimize` / `auto` /
+`ctx` — `0` skips the warmup suite pass per config (~15–20% faster quality
+suites, slightly noisier first measurements). GUI: Advanced → Warmup runs.
+
+**Full context + quality.** `ctx <model> --quality-rungs N
+--quality-threshold 0.97` runs full quality suites on the top-N stable
+ladder rungs (ctx, tok/s, quality, checks, VRAM, TTFT, PASS/FAIL table).
+
+**Richer best reports.** Tested-configs table now shows run order `#`,
+prompt tok/s, TTFT, VRAM per row; `--report-sort run|speed|quality`
+(`optimize` / `auto`) reorders it. Report layout: Results first, then
+best config, HW details, test details, tried configs, methodology last.
+
+**Wider grid.** `--physical-batches 256,512,1024` adds a real search
+dimension (`optimize` / `auto`). RoPE stays opt-in (`--enable-rope`);
+temperatures are covered by `--style` (precise/balanced/creative),
+`sample-sweep` and the auto precision probe.
 
 ## How it works (Phase-A strategy)
 
