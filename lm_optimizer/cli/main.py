@@ -2,6 +2,7 @@
 
 import asyncio
 import dataclasses
+import os
 import sys
 import time
 from datetime import datetime
@@ -4392,6 +4393,89 @@ def ollama_probe(
         else:
             _add_step(name, step)
     console.print(table)
+
+
+@app.command(name="deepresearch-bench")
+def deepresearch_bench(
+    model: str = typer.Argument(..., help="Model name to evaluate (must be available in LM Studio)"),
+    dr_bench_dir: Path = typer.Option(
+        Path("deep_research_bench"), "--dr-bench-dir", help="Path to DeepResearch Bench repository"
+    ),
+    limit: int | None = typer.Option(None, "--limit", help="Limit number of queries to process (for testing)"),
+    skip_cleaning: bool = typer.Option(False, "--skip-cleaning", help="Skip article cleaning step"),
+    only_zh: bool = typer.Option(False, "--only-zh", help="Only process Chinese queries"),
+    only_en: bool = typer.Option(False, "--only-en", help="Only process English queries"),
+    force: bool = typer.Option(False, "--force", help="Force re-evaluation even if results exist"),
+    max_workers: int = typer.Option(5, "--max-workers", help="Maximum number of worker threads"),
+    openrouter_api_key: str | None = typer.Option(None, "--openrouter-api-key", help="OpenRouter API key"),
+    openai_api_key: str | None = typer.Option(None, "--openai-api-key", help="OpenAI API key"),
+    jina_api_key: str | None = typer.Option(None, "--jina-api-key", help="Jina API key for web scraping"),
+    llm_backend: str = typer.Option("openrouter", "--llm-backend", help="LLM backend: openrouter or openai"),
+    race_model: str = typer.Option("openai/gpt-5.5", "--race-model", help="Model for RACE evaluation"),
+    clean_model: str = typer.Option("openai/gpt-5.6-luna", "--clean-model", help="Model for article cleaning"),
+    fact_model: str = typer.Option("openai/gpt-5.4-mini", "--fact-model", help="Model for FACT evaluation"),
+    base_url: str | None = typer.Option(None, "--base-url", help="LM Studio base URL (default from config)"),
+) -> None:
+    """Run DeepResearch Bench evaluation on a local LM Studio model.
+
+    This command runs the complete DeepResearch Bench pipeline:
+    1. Clones/updates the DeepResearch Bench repository
+    2. Installs requirements
+    3. Runs the local model on 100 PhD-level research queries
+    4. Runs RACE evaluation (report quality)
+    5. Runs FACT evaluation (citation accuracy)
+
+    Results are saved to deep_research_bench/results/
+    """
+    from lm_optimizer.services.deepresearch import DeepResearchConfig, run_deepresearch_benchmark, print_results_summary
+    from lm_optimizer.config import config as global_config
+
+    setup_logging()
+
+    # Use provided base_url or fall back to config
+    lm_studio_url = base_url or global_config.lmstudio_base_url or "http://127.0.0.1:1234"
+
+    console.print("[cyan]DeepResearch Bench Evaluation[/cyan]")
+    console.print(f"  Model: {model}")
+    console.print(f"  LM Studio: {lm_studio_url}")
+    console.print(f"  DR Bench Dir: {dr_bench_dir}")
+
+    # API keys: explicit CLI flags win, env vars are the fallback
+    # (avoids leaking secrets via shell history when possible).
+    # Build config
+    dr_config = DeepResearchConfig(
+        model_name=model,
+        dr_bench_dir=dr_bench_dir,
+        limit=limit,
+        skip_cleaning=skip_cleaning,
+        only_zh=only_zh,
+        only_en=only_en,
+        force=force,
+        max_workers=max_workers,
+        openrouter_api_key=openrouter_api_key or os.environ.get("OPENROUTER_API_KEY"),
+        openai_api_key=openai_api_key or os.environ.get("OPENAI_API_KEY"),
+        jina_api_key=jina_api_key or os.environ.get("JINA_API_KEY"),
+        llm_backend=llm_backend,
+        race_model=race_model,
+        clean_model=clean_model,
+        fact_model=fact_model,
+    )
+
+    try:
+        success = asyncio.run(run_deepresearch_benchmark(dr_config, lm_studio_url))
+        if success:
+            print_results_summary(dr_config)
+            console.print("[green]DeepResearch Bench evaluation completed successfully![/green]")
+        else:
+            console.print("[red]DeepResearch Bench evaluation failed![/red]")
+            sys.exit(1)
+    except KeyboardInterrupt:
+        console.print("[yellow]Evaluation interrupted by user[/yellow]")
+        sys.exit(1)
+    except Exception as e:
+        logger.exception("DeepResearch Bench evaluation failed")
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
