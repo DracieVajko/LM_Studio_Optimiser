@@ -152,6 +152,22 @@ async def sweep(
     }
 
 
+def pick_quality_rungs(report: dict, n: int) -> list[int]:
+    """Top-N empirically stable contexts, descending (for quality suites).
+
+    Only points with a REAL passing load count; precheck-only `estimated`
+    points never count as proof. Returns [] for n <= 0 or no stable points.
+    """
+    if n <= 0 or not isinstance(report, dict):
+        return []
+    points = list(report.get("geometric") or []) + list(report.get("refinement") or [])
+    stable = sorted(
+        {p["ctx"] for p in points if p.get("ok") and not p.get("estimated")},
+        reverse=True,
+    )
+    return stable[:n]
+
+
 def format_report(report: dict, model: str) -> str:
     """Human-readable CLI report lines."""
     lines = [f"Context sweep: {model}", ""]

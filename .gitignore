@@ -46,3 +46,6 @@ pause_*.flag
 Thumbs.db
 .vscode/
 .idea/
+
+# Linked git worktrees (local checkouts, never commit)
+.worktrees/

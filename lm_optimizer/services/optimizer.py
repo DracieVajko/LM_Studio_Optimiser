@@ -103,6 +103,56 @@ def format_diagnostic(exc: BaseException) -> dict:
     }
 
 
+# Canonical skippable phases (CLI --skip-phases, API skip_phases, GUI).
+PHASE_SKIP_NAMES = ("speed", "quality", "recovery", "validation", "context")
+
+
+def parse_phase_skips(value) -> set[str]:
+    """Parse user phase skips into a validated set (case-insensitive).
+
+    Accepts a comma string or a list/tuple/set. Raises ValueError naming
+    the first unknown phase (callers fail fast: CLI exit 2).
+    """
+    if value is None:
+        return set()
+    if isinstance(value, str):
+        items = [p.strip() for p in value.split(",")]
+    else:
+        try:
+            items = [str(p).strip() for p in value]
+        except TypeError:
+            raise ValueError(f"Invalid skip_phases: {value!r}")
+    names = {p.lower() for p in items if p}
+    unknown = sorted(names - set(PHASE_SKIP_NAMES))
+    if unknown:
+        raise ValueError(
+            f"Unknown phase(s) to skip: {', '.join(unknown)} "
+            f"(expected one of: {', '.join(PHASE_SKIP_NAMES)})"
+        )
+    return names
+
+
+def phase_skips_of(advanced_settings) -> set[str]:
+    """Lenient skip set for run/resume paths (warn + ignore unknowns)."""
+    try:
+        return parse_phase_skips((advanced_settings or {}).get("skip_phases"))
+    except ValueError as e:
+        logger.warning("Ignoring invalid skip_phases", error=str(e)[:160])
+        return set()
+
+
+def run_skip_phases(run) -> set[str]:
+    """Skip set for a persisted run: memory first, DB fallback.
+
+    `advanced_settings` lives only in memory; `benchmark_params` is the
+    persisted copy (written by prepare_run and _apply_resume_skips).
+    """
+    skips = phase_skips_of(getattr(run, "advanced_settings", None))
+    if skips:
+        return skips
+    return phase_skips_of(getattr(run, "benchmark_params", None))
+
+
 @dataclass
 class OptimizationState:
     """Current state of optimization run."""
@@ -284,6 +334,7 @@ class AdaptiveOptimizer:
             search_space={},
             is_experimental=False,
             experimental_reason=None,
+            advanced_settings=advanced_settings or {},
             benchmark_params={
                 "benchmark_repetitions": config.optimization.benchmark_runs,
                 "validation_repetitions": 5,
@@ -299,6 +350,7 @@ class AdaptiveOptimizer:
                 "recovery_budget": advanced_settings.get("recovery_budget", 3),
                 "quality_finalist_limit": advanced_settings.get("quality_finalist_limit"),
                 "optimize_context": bool(advanced_settings.get("optimize_context", False)),
+                "skip_phases": sorted(phase_skips_of(advanced_settings)),
             },
         )
         # Any experimental opt-in marks the run (single marking path).
@@ -654,7 +706,8 @@ class AdaptiveOptimizer:
             self.state.current_config_id = None
             self._log_event("Next candidate", f"ctx={cfg.context_length} gpu={cfg.gpu_ratio}")
             result = await self._test_config(
-                cfg, cfg.context_length or self.state.run.model.context_limit or 4096
+                cfg, cfg.context_length or self.state.run.model.context_limit or 4096,
+                min_speed=self.state.run.advanced_settings.get("min_speed", 0.0)
             )
 
             if result and result.status == ConfigurationStatus.PASSED:
@@ -874,7 +927,7 @@ class AdaptiveOptimizer:
                     break
                 while self.state.should_pause:
                     await asyncio.sleep(1)
-                result = await self._test_config(cfg, cfg.context_length or 4096)
+                result = await self._test_config(cfg, cfg.context_length or 4096, min_speed=self.state.run.advanced_settings.get("min_speed", 0.0))
                 tested_keys.add(key)
                 if result and result.status == ConfigurationStatus.PASSED:
                     self.state.tested_configs.append(result)
@@ -917,7 +970,7 @@ class AdaptiveOptimizer:
                             num_experts=bc.num_experts,
                         )
 
-                        result = await self._test_config(config, ctx)
+                        result = await self._test_config(config, ctx, min_speed=self.state.run.advanced_settings.get("min_speed", 0.0))
                         tested_keys.add(key)
                         if result and result.status == ConfigurationStatus.PASSED:
                             self.state.tested_configs.append(result)
@@ -1056,7 +1109,7 @@ class AdaptiveOptimizer:
             while self.state.should_pause:
                 await asyncio.sleep(1)
 
-            result = await self._test_config(config, best.context_length)
+            result = await self._test_config(config, best.context_length, min_speed=self.state.run.advanced_settings.get("min_speed", 0.0))
             if result and result.status == ConfigurationStatus.PASSED:
                 self.state.tested_configs.append(result)
                 self._update_best(result)
@@ -1129,7 +1182,7 @@ class AdaptiveOptimizer:
         for i in range(self.state.run.validation_repetitions):
             if self.state.should_cancel:
                 break
-            result = await self._test_config(config, best.context_length)
+            result = await self._test_config(config, best.context_length, min_speed=self.state.run.advanced_settings.get("min_speed", 0.0))
             if result and result.status == ConfigurationStatus.PASSED:
                 validation_results.append(result)
 
@@ -1247,6 +1300,7 @@ class AdaptiveOptimizer:
         load_config: LoadConfiguration,
         context_length: int,
         score_context: bool | None = None,
+        min_speed: float = 0.0,
     ) -> ConfigurationResult | None:
         """Test a single configuration through the strict phase machine.
 
@@ -1325,6 +1379,35 @@ class AdaptiveOptimizer:
                 )
             self._log_event("BENCHMARK_STARTED", f"ctx={context_length}")
             self._log_event("BENCHMARK_COMPLETED", f"ctx={context_length}")
+
+            # Check minimum speed threshold (if set)
+            if min_speed > 0.0:
+                gen_tok_s = result.get_avg_generation_tok_s()
+                if gen_tok_s < min_speed:
+                    result.status = ConfigurationStatus.FAILED
+                    result.error = f"Generation speed {gen_tok_s:.1f} tok/s below minimum threshold {min_speed:.1f} tok/s"
+                    result.score = None
+                    result.quality_score = None
+                    result.score_breakdown = None
+                    result.generation = {
+                        **(result.generation or {}),
+                        "stage": self.state.run.stage.value,
+                    }
+                    try:
+                        config_repo.save(result)
+                    except Exception as e:
+                        logger.error("Failure record save failed", error=str(e))
+                    self._log_event(
+                        "SPEED_BELOW_THRESHOLD",
+                        f"ctx={context_length} gen={gen_tok_s:.1f} tok/s < min={min_speed:.1f} tok/s",
+                    )
+                    logger.warning(
+                        "SPEED_BELOW_THRESHOLD",
+                        config_id=str(result.id),
+                        speed=gen_tok_s,
+                        min_speed=min_speed,
+                    )
+                    return result
 
             # Server demands flash attention (non-F16 KV quant): prune flash=False (R28)
             self._note_flash_requirement(result)
@@ -2345,7 +2428,7 @@ class AdaptiveOptimizer:
         self, rolled: LoadConfiguration, ctx: int
     ) -> ConfigurationResult | None:
         """Full-suite admission of a subset-passing rollback (PASSED + scored)."""
-        admitted = await self._test_config(rolled, ctx, score_context=False)
+        admitted = await self._test_config(rolled, ctx, score_context=False, min_speed=self.state.run.advanced_settings.get("min_speed", 0.0))
         if admitted is not None and admitted.status == ConfigurationStatus.PASSED:
             self._tag_phase(admitted, OptimizationPhase.RECOVERY.value)
             if admitted.id not in [c.id for c in self.state.tested_configs]:
@@ -2449,7 +2532,7 @@ class AdaptiveOptimizer:
             vcfg = LoadConfiguration(
                 **{k: v for k, v in data.items() if hasattr(LoadConfiguration, k)}
             )
-            result = await self._test_config(vcfg, best.context_length, score_context=False)
+            result = await self._test_config(vcfg, best.context_length, score_context=False, min_speed=self.state.run.advanced_settings.get("min_speed", 0.0))
             if result is not None and result.status == ConfigurationStatus.PASSED:
                 self._tag_phase(result, OptimizationPhase.FINAL_VALIDATION.value)
                 validated.append(result)
@@ -2627,16 +2710,34 @@ class AdaptiveOptimizer:
             "Phase A contexts frozen", f"speed={speed_ctx} quality={quality_ctx}"
         )
 
-        frontier = await self._phase_speed()
+        skips = phase_skips_of(advanced_settings)
+        if skips:
+            self._log_event(
+                "Phase skips active", f"skipped: {', '.join(sorted(skips))}"
+            )
+
+        if "speed" in skips:
+            self._log_event("Phase SPEED skipped", "--skip-phases")
+            frontier = {"winner": None, "finalists": [], "contrarian": None}
+        else:
+            frontier = await self._phase_speed()
         if self.state.should_cancel:
             raise asyncio.CancelledError()
-        safe, failed = await self._phase_quality(frontier)
+        if "quality" in skips:
+            self._log_event("Phase QUALITY skipped", "--skip-phases (no winner path)")
+            safe, failed = [], []
+        else:
+            safe, failed = await self._phase_quality(frontier)
         if self.state.should_cancel:
             raise asyncio.CancelledError()
 
         # Recovery reference: fastest safe config, else passed S0 anchor.
         ref_config, ref_kind = self._recovery_reference(safe)
-        recovered, _ref = await self._recover_failed(failed, ref_config, ref_kind)
+        if "recovery" in skips:
+            self._log_event("Phase RECOVERY skipped", "--skip-phases")
+            recovered, _ref = [], None
+        else:
+            recovered, _ref = await self._recover_failed(failed, ref_config, ref_kind)
         if self.state.should_cancel:
             raise asyncio.CancelledError()
 
@@ -2646,10 +2747,17 @@ class AdaptiveOptimizer:
             self.state.best_config = fastest
             self.state.run.best_config_id = fastest.id
         await self._pause_point()
-        await self._phase_final_validation()
+        if "validation" in skips:
+            self._log_event("Phase FINAL_VALIDATION skipped", "--skip-phases")
+        else:
+            await self._phase_final_validation()
         if self.state.should_cancel:
             raise asyncio.CancelledError()
         await self._pause_point()
+        if "context" in skips and self.state.phase_b_enabled:
+            self._log_event("Phase CONTEXT skipped", "--skip-phases (Phase B off)")
+            self.state.phase_b_enabled = False
+            self.state.run.phase_b_enabled = False
         if self.state.phase_b_enabled and self.state.best_config is not None:
             await self._phase_context_optional(self.state.best_config)
 
@@ -3186,7 +3294,16 @@ class AdaptiveOptimizer:
 
     async def _resume_phase_pipeline(self) -> None:
         """Phase continuation for Phase A/B runs (all steps skip tested)."""
-        frontier = await self._phase_speed()
+        skips = run_skip_phases(self.state.run)
+        if skips:
+            self._log_event(
+                "Phase skips active", f"skipped: {', '.join(sorted(skips))}"
+            )
+        if "speed" in skips:
+            self._log_event("Phase SPEED skipped", "--skip-phases")
+            frontier = {"winner": None, "finalists": [], "contrarian": None}
+        else:
+            frontier = await self._phase_speed()
         if self.state.should_cancel:
             raise asyncio.CancelledError()
         # Prefer checkpoint-recorded finalists that are still tested.
@@ -3199,17 +3316,36 @@ class AdaptiveOptimizer:
                 "finalists": [by_id[i] for i in kept if i in by_id],
                 "contrarian": frontier.get("contrarian"),
             }
-        safe, failed = await self._phase_quality(frontier)
+        if "quality" in skips:
+            self._log_event("Phase QUALITY skipped", "--skip-phases (no winner path)")
+            safe, failed = [], []
+        else:
+            safe, failed = await self._phase_quality(frontier)
         if self.state.should_cancel:
             raise asyncio.CancelledError()
-        await self._resume_recover(safe, failed)
+        if "recovery" in skips:
+            self._log_event("Phase RECOVERY skipped", "--skip-phases")
+            all_safe = [r for r in safe if r.status == ConfigurationStatus.PASSED]
+            if all_safe:
+                fastest = max(all_safe, key=lambda r: r.get_avg_generation_tok_s())
+                self.state.best_config = fastest
+                self.state.run.best_config_id = fastest.id
+        else:
+            await self._resume_recover(safe, failed)
         if self.state.should_cancel:
             raise asyncio.CancelledError()
         await self._pause_point()
-        await self._phase_final_validation()
+        if "validation" in skips:
+            self._log_event("Phase FINAL_VALIDATION skipped", "--skip-phases")
+        else:
+            await self._phase_final_validation()
         if self.state.should_cancel:
             raise asyncio.CancelledError()
         await self._pause_point()
+        if "context" in skips and self.state.phase_b_enabled:
+            self._log_event("Phase CONTEXT skipped", "--skip-phases (Phase B off)")
+            self.state.phase_b_enabled = False
+            self.state.run.phase_b_enabled = False
         if self.state.phase_b_enabled and self.state.best_config is not None:
             await self._phase_context_optional(self.state.best_config)
         self._recompute_all_scores()

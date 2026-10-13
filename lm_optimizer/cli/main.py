@@ -1,6 +1,8 @@
 """CLI commands for LM Studio Optimizer."""
 
 import asyncio
+import dataclasses
+import os
 import sys
 import time
 from datetime import datetime
@@ -13,7 +15,7 @@ import typer
 from rich.console import Console
 from rich.json import JSON
 from rich.panel import Panel
-from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
+from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.table import Table
 
 from lm_optimizer.config import config
@@ -26,6 +28,7 @@ from lm_optimizer.domain.models import (
     ConfigurationStatus,
     LoadConfiguration,
     OptimizationProfile,
+    OptimizationStage,
 )
 from lm_optimizer.logging_config import get_logger, setup_logging
 from lm_optimizer.services.benchmark import VALID_STYLES, BenchmarkService
@@ -35,7 +38,14 @@ from lm_optimizer.services.context_sweep import sweep as _ctx_sweep
 from lm_optimizer.services.hardware import hardware_detector
 from lm_optimizer.services.fit import ladder as ctx_ladder
 from lm_optimizer.services.generation_defaults import lookup as generation_lookup
-from lm_optimizer.services.hostguard import format_snapshot, prepare_host
+from lm_optimizer.services.hostguard import (
+    HostBusyTimeout,
+    HostUnreachableError,
+    format_snapshot,
+    is_connection_error,
+    prepare_host,
+)
+from lm_optimizer.services.joblock import JobBusyError, acquire_lock, release_lock
 from lm_optimizer.services.matrix import build_matrix, recommendation_line, run_one
 from lm_optimizer.services.model_recommendations import (
     diagnose_load_error,
@@ -136,6 +146,102 @@ def _handle_connection_error(url: str, error: Exception) -> None:
     # Do not log full URL with credentials or stack trace containing secrets
 
 
+def _acquire_run_lock(purpose: str) -> None:
+    """Claim the cross-process optimizer job lock for this run.
+
+    A second concurrent job is refused with holder info (exit 1); the
+    existing lock file is never disturbed. Callers release in `finally`.
+    """
+    try:
+        acquire_lock(purpose)
+    except JobBusyError as e:
+        holder = e.holder or {}
+        console.print("[red]Another optimizer job is already running:[/red]")
+        console.print(f"  pid {holder.get('pid')} purpose {holder.get('purpose')!r}")
+        console.print("Run one job at a time; retry when it finishes.")
+        sys.exit(1)
+
+
+def _client_base_url(client) -> str:
+    """Backend URL for messages (never raises)."""
+    return getattr(client, "base_url", None) or config.lm_studio.base_url
+
+
+def _busy_blockers(exc: HostBusyTimeout) -> str:
+    """Blocker model ids for messages (never empty)."""
+    return ", ".join(str(b) for b in (exc.blocker or [])) or "unknown model"
+
+
+def _print_host_busy_abort(exc: HostBusyTimeout) -> None:
+    """Clear abort message for a persistently busy host."""
+    console.print(f"[red]Host busy: {_busy_blockers(exc)} still loaded; aborting.[/red]")
+    console.print(f"  {exc}")
+    console.print("Unload the model in LM Studio (disable Keep Model in Memory) and retry.")
+
+
+def _print_host_busy_paused(model: str, exc: HostBusyTimeout) -> None:
+    """Pause-framed busy message for optimize, with a resume hint.
+
+    Nothing started (no run id, no checkpoint), so "pause" here means the
+    pre-start wait budget ran out: free the host and re-run; in-progress
+    runs resume via the normal checkpoint flow.
+    """
+    console.print(
+        f"[yellow]Host busy: {_busy_blockers(exc)} still loaded "
+        "- pausing before start.[/yellow]"
+    )
+    console.print(f"  {exc}")
+    console.print("Nothing was started, so no checkpoint was needed.")
+    console.print("Unload the model in LM Studio (disable Keep Model in Memory),")
+    console.print(f"then re-run: lm-optimizer optimize {model}")
+    console.print("In-progress runs resume with: lm-optimizer resume <run-id>")
+    console.print("  (list them with: lm-optimizer checkpoints)")
+
+
+async def _connect_guarded(
+    client, purpose: str, wait_interval_s: float = 60.0, max_waits: int = 30
+):
+    """Connect + exclusive-access guard with typed failures.
+
+    Raises HostUnreachableError when the backend cannot be reached (caller
+    shows the friendly connection message) or HostBusyTimeout when a foreign
+    model never leaves (caller pauses or aborts). Other errors propagate.
+    """
+    try:
+        await client.connect()
+    except Exception as e:
+        if is_connection_error(e):
+            raise HostUnreachableError(
+                f"Cannot reach backend at {_client_base_url(client)}", cause=e
+            ) from e
+        raise
+    return await prepare_host(
+        client,
+        purpose=purpose,
+        wait_interval_s=wait_interval_s,
+        max_waits=max_waits,
+    )
+
+
+async def _connect_guarded_or_abort(
+    client, purpose: str, wait_interval_s: float = 60.0, max_waits: int = 30
+):
+    """_connect_guarded that aborts (exit 1) with a clear message.
+
+    Shared by every command except optimize (which pauses with a resume
+    hint instead). Unreachable shows the friendly connection message, busy
+    shows the abort message; never the twain.
+    """
+    try:
+        return await _connect_guarded(client, purpose, wait_interval_s, max_waits)
+    except HostBusyTimeout as e:
+        _print_host_busy_abort(e)
+        sys.exit(1)
+    except HostUnreachableError as e:
+        _handle_connection_error(_client_base_url(client), e.cause or e)
+        sys.exit(1)
+
+
 def _require_style(style: str) -> str:
     """Validate benchmark style, exiting with usage hint on error."""
     if style not in VALID_STYLES:
@@ -148,18 +254,23 @@ def _require_style(style: str) -> str:
     return style
 
 
-def _benchmark_config_obj(repetitions: int, max_tokens_scale: float = 1.0):
+def _benchmark_config_obj(repetitions: int, max_tokens_scale: float = 1.0, warmup_runs: int = 1):
     """Duck-typed benchmark config (repetitions/warmup/timeouts/scale)."""
     try:
         scale = min(1.0, max(0.25, float(max_tokens_scale)))
     except (TypeError, ValueError):
         scale = 1.0
+    try:
+        warmups = int(warmup_runs)
+    except (TypeError, ValueError):
+        warmups = 1
+    warmups = min(5, max(0, warmups))
     return type(
         "obj",
         (object,),
         {
             "repetitions": repetitions,
-            "warmup_repetitions": 1,
+            "warmup_repetitions": warmups,
             "timeout_seconds": 300,
             "load_timeout_seconds": 60,
             "generation_timeout_seconds": 120,
@@ -195,13 +306,9 @@ async def _run_optimization(
         )
     benchmark_service = BenchmarkService(
         client,
-        benchmark_config=_benchmark_config_obj(repetitions, max_tokens_scale),
-        style=style,
-        gpu_via_cli=gpu_via_cli,
-    )
-    benchmark_service = BenchmarkService(
-        client,
-        benchmark_config=_benchmark_config_obj(repetitions),
+        benchmark_config=_benchmark_config_obj(
+            repetitions, max_tokens_scale, advanced.get("warmup_runs", 1)
+        ),
         style=style,
         gpu_via_cli=gpu_via_cli,
     )
@@ -311,7 +418,7 @@ def _optimize_advanced(
     }
 
 
-EXPERIMENTAL_PROMPT = "Test experimental RoPE / CPU-MoE / speculative?"
+EXPERIMENTAL_PROMPT = "Test experimental features? (RoPE / CPU-MoE / Speculative)"
 
 
 def _prompt_experimental_optins() -> dict:
@@ -319,12 +426,18 @@ def _prompt_experimental_optins() -> dict:
     from lm_optimizer.services.optimizer import parse_experimental_flags
 
     try:
-        answer = typer.prompt(EXPERIMENTAL_PROMPT, default="no")
+        rope = typer.confirm("Enable RoPE (rotary position embedding) probes?", default=False)
     except Exception:
-        return parse_experimental_flags()
-    if str(answer).strip().lower() in ("yes", "y", "true", "1", "ano", "a"):
-        return parse_experimental_flags(True, True, True)
-    return parse_experimental_flags()
+        rope = False
+    try:
+        cpu_moe = typer.confirm("Enable CPU-MoE (Mixture of Experts) probes?", default=False)
+    except Exception:
+        cpu_moe = False
+    try:
+        speculative = typer.confirm("Enable Speculative decoding probes?", default=False)
+    except Exception:
+        speculative = False
+    return parse_experimental_flags(rope, cpu_moe, speculative)
 
 
 def _resolve_experimental_flags(
@@ -467,6 +580,7 @@ def _save_preset_and_report(
     generation=None,
     model_info=None,
     note=None,
+    sort="run",
 ) -> bool:
     """Save preset + per-model .md report. Returns True if best existed."""
     best_config = run.get_best_config()
@@ -517,6 +631,7 @@ def _save_preset_and_report(
         host=_host_info_dict(hardware, note=note),
         extra=extra,
         generation=generation,
+        sort=sort,
     )
     if report_path:
         console.print(f"[green]Report saved: {report_path}[/green]")
@@ -556,8 +671,12 @@ def status(
     """Show LM Studio connection status and hardware info."""
     setup_logging()
 
-    # Resolve URL: CLI override > .env > default
-    effective_url = url or config.lm_studio.base_url
+    # Resolve URL: CLI override > backend default (.env) > hardcoded default.
+    # Ollama must never inherit the LM Studio URL (different port/server).
+    if (config.backend or "lm-studio") == "ollama":
+        effective_url = url or config.ollama_base_url
+    else:
+        effective_url = url or config.lm_studio.base_url
 
     async def _status():
         client = get_client(base_url=effective_url)
@@ -583,13 +702,13 @@ def status(
             else:
                 console.print("  GPU: Not detected")
 
-            console.print("\n[bold]LM Studio[/bold]")
+            console.print(f"\n[bold]{'Ollama' if (config.backend or 'lm-studio') == 'ollama' else 'LM Studio'}[/bold]")
             console.print(f"  URL: {client.base_url}")
             console.print("  Status: [green]Connected[/green]")
             console.print(f"  API Version: {client.capabilities.version}")
-            console.print(
-                f"  Supported Parameters: {', '.join(client.capabilities.get_supported_load_params())}"
-            )
+            supported = getattr(client.capabilities, "get_supported_load_params", None)
+            if callable(supported):
+                console.print(f"  Supported Parameters: {', '.join(supported())}")
             if url:
                 console.print("  [dim]Using CLI override (not persisted to .env)[/dim]")
 
@@ -750,8 +869,7 @@ def benchmark(
     async def _benchmark():
         client = get_client()
         try:
-            await client.connect()
-            snap = await prepare_host(client, purpose="benchmark")
+            snap = await _connect_guarded_or_abort(client, "benchmark")
             for line in format_snapshot(snap):
                 console.print(f"  {line}")
             if not snap.get("verified_empty") and snap.get("leftovers"):
@@ -836,8 +954,7 @@ def manual_memory_duel(
     async def _duel_run():
         client = get_client()
         try:
-            await client.connect()
-            snap = await prepare_host(client, purpose="manual-memory-duel")
+            snap = await _connect_guarded_or_abort(client, "manual-memory-duel")
             for line in format_snapshot(snap):
                 console.print(f"  {line}")
             if not snap.get("verified_empty") and snap.get("leftovers"):
@@ -968,10 +1085,31 @@ def optimize(
         "--max-tokens-scale",
         help="Scale case max-tokens 0.25-1.0 for slow models (may fail quality gates)",
     ),
+    min_speed: float = typer.Option(
+        0.0,
+        "--min-speed",
+        help="Minimum generation tok/s to accept a config; slower configs are skipped and marked as too slow",
+    ),
     optimize_context: bool = typer.Option(
         False,
         "--optimize-context",
         help="Phase B opt-in: max-context sweep on the frozen runtime winner",
+    ),
+    warmup_runs: int = typer.Option(
+        1, "--warmup-runs", help="Warmup suite passes per config 0-5 (0 = fastest, noisier)"
+    ),
+    report_sort: str = typer.Option(
+        "run", "--report-sort", help="Tested-configs table order: run, speed, quality"
+    ),
+    skip_phases: str | None = typer.Option(
+        None,
+        "--skip-phases",
+        help="Comma-separated phases to skip: speed,quality,recovery,validation,context",
+    ),
+    physical_batches: str | None = typer.Option(
+        None,
+        "--physical-batches",
+        help="Comma-separated physical batch sizes to test (e.g. 256,512,1024)",
     ),
     enable_rope: bool = typer.Option(
         False,
@@ -987,6 +1125,16 @@ def optimize(
         False,
         "--enable-speculative",
         help="Experimental tail opt-in: speculative probes after the FINAL winner",
+    ),
+    wait_interval: float = typer.Option(
+        60.0,
+        "--wait-interval",
+        help="Seconds between foreign-model eviction re-checks before start",
+    ),
+    max_waits: int = typer.Option(
+        30,
+        "--max-waits",
+        help="Max re-checks for a foreign model before pausing with a resume hint",
     ),
 ):
     """Optimize a model configuration."""
@@ -1007,8 +1155,19 @@ def optimize(
     async def _optimize():
         client = get_client()
         try:
-            await client.connect()
-            snap = await prepare_host(client, purpose="optimize")
+            try:
+                snap = await _connect_guarded(
+                    client,
+                    "optimize",
+                    wait_interval_s=wait_interval,
+                    max_waits=max_waits,
+                )
+            except HostBusyTimeout as e:
+                _print_host_busy_paused(model, e)
+                sys.exit(1)
+            except HostUnreachableError as e:
+                _handle_connection_error(_client_base_url(client), e.cause or e)
+                sys.exit(1)
             for line in format_snapshot(snap):
                 console.print(f"  {line}")
             if not snap.get("verified_empty") and snap.get("leftovers"):
@@ -1043,6 +1202,38 @@ def optimize(
             advanced.update(
                 _resolve_experimental_flags(enable_rope, enable_cpu_moe, enable_speculative)
             )
+            advanced["min_speed"] = min_speed
+            if not 0 <= warmup_runs <= 5:
+                console.print("[red]Invalid --warmup-runs (0-5)[/red]")
+                sys.exit(2)
+            advanced["warmup_runs"] = warmup_runs
+            if report_sort not in ("run", "speed", "quality"):
+                console.print("[red]Invalid --report-sort (run|speed|quality)[/red]")
+                sys.exit(2)
+            if skip_phases:
+                from lm_optimizer.services.optimizer import parse_phase_skips
+
+                try:
+                    advanced["skip_phases"] = sorted(parse_phase_skips(skip_phases))
+                except ValueError as e:
+                    console.print(f"[red]{e}[/red]")
+                    sys.exit(2)
+            if physical_batches:
+                try:
+                    batches = sorted(
+                        {int(x.strip()) for x in physical_batches.split(",") if x.strip()}
+                    )
+                except ValueError:
+                    console.print(
+                        "[red]Invalid --physical-batches (comma-separated integers)[/red]"
+                    )
+                    sys.exit(2)
+                if not batches or any(b <= 0 for b in batches):
+                    console.print(
+                        "[red]Invalid --physical-batches (positive integers required)[/red]"
+                    )
+                    sys.exit(2)
+                advanced["physical_batches"] = batches
 
             console.print(f"[bold]Starting optimization for {model}[/bold]")
             console.print(f"  Profile: {profile}")
@@ -1053,18 +1244,14 @@ def optimize(
             with Progress(
                 SpinnerColumn(),
                 TextColumn("[progress.description]{task.description}"),
-                BarColumn(),
-                TaskProgressColumn(),
                 console=console,
             ) as progress:
-                task = progress.add_task(f"Optimizing {model}...", total=100)
+                task = progress.add_task(f"Optimizing {model}...", total=None)
 
                 def _bar(stage: str, tested: int, total: int) -> None:
-                    pct = min(99, int(tested / max(total, 1) * 100)) if total else 0
                     progress.update(
                         task,
-                        completed=pct,
-                        description=f"Optimizing {model}... [{stage} {tested}/{total}]",
+                        description=f"Optimizing {model}... [{stage} {tested}/{total} configs]",
                     )
 
                 advanced["progress_cb"] = _bar
@@ -1080,10 +1267,6 @@ def optimize(
                     max_tokens_scale=max_tokens_scale,
                 )
 
-                progress.update(task, completed=100)
-
-            _display_optimization_result(result)
-
             _save_preset_and_report(
                 model,
                 profile,
@@ -1091,6 +1274,7 @@ def optimize(
                 hardware,
                 generation=_generation_for(model, model_info.architecture),
                 model_info=model_info,
+                sort=report_sort,
             )
 
             # Fail-closed post-hygiene: the host must be clean for whatever runs next.
@@ -1112,11 +1296,14 @@ def optimize(
         finally:
             await client.close()
 
+    _acquire_run_lock(f"optimize:{model}")
     try:
         asyncio.run(_optimize())
     except KeyboardInterrupt:
         console.print("\n[yellow]Interrupted — checkpoint saved.[/yellow]")
         sys.exit(130)
+    finally:
+        release_lock()
 
 
 @app.command()
@@ -1133,7 +1320,11 @@ def apply(
         preset = preset_repo.get_by_model_and_profile(model, profile)
         if not preset:
             console.print(f"[red]No preset found for {model} with profile {profile}[/red]")
-            console.print("Run 'lm-optimizer optimize' first to create a preset.")
+            console.print("What you can do:")
+            console.print("  - Run 'lm-optimizer optimize' first to create a preset.")
+            console.print(f"  - Check results/<model>-best.md for the measured winner and apply it manually.")
+            console.print(f"  - Run 'lm-optimizer judge <run-id>' to pick a config from an existing run.")
+            console.print(f"  - List presets with 'lm-optimizer presets'.")
             sys.exit(1)
 
         console.print(f"Preset for {model} ({profile}):")
@@ -1155,6 +1346,10 @@ def apply(
                 console.print(f"Identifier: {result.identifier}")
             else:
                 console.print(f"[red]Failed to load: {result.error}[/red]")
+                console.print("What you can do:")
+                console.print("  - The host may be busy: unload other models in LM Studio first.")
+                console.print("  - The config may exceed VRAM: try a preset with smaller context.")
+                console.print(f"  - Check run state with 'lm-optimizer run-status' and host with 'lm-optimizer status'.")
                 sys.exit(1)
 
         except Exception as e:
@@ -1165,6 +1360,150 @@ def apply(
             await client.close()
 
     asyncio.run(_apply())
+
+
+@dataclasses.dataclass
+class ApplyEntry:
+    """One applicable configuration in the apply-menu picker."""
+
+    backend: str  # "lmstudio" | "ollama"
+    label: str  # human-readable model/tag
+    detail: str  # one-line config summary
+    model: str = ""  # LM Studio model id (lmstudio backend)
+    profile: str = "balanced"  # preset profile (lmstudio backend)
+    path: str = ""  # modelfile path (ollama backend)
+
+
+def _collect_apply_entries(presets: list[dict], modelfiles: list[dict]) -> list[ApplyEntry]:
+    """Build picker entries from DB presets + local ollama modelfiles.
+
+    Pure function (no servers, no DB): callers pass
+    ``preset_repo.list_all()`` and parsed ``ollama-configs/*.modelfile.md``.
+    """
+    entries: list[ApplyEntry] = []
+    for p in presets or []:
+        model_id = str(p.get("model_id", "") or "")
+        profile = str(p.get("profile", "") or "balanced")
+        if not model_id:
+            continue
+        cfg = p.get("config") or {}
+        ctx = cfg.get("context_length", "?")
+        entries.append(
+            ApplyEntry(
+                backend="lmstudio",
+                label=f"{model_id} [{profile}]",
+                detail=f"ctx {ctx}",
+                model=model_id,
+                profile=profile,
+            )
+        )
+    for m in modelfiles or []:
+        path = str(m.get("path", "") or "")
+        base = str(m.get("from", "") or "?")
+        if not path:
+            continue
+        n_params = max(0, len(m) - 2)  # minus path/from keys
+        entries.append(
+            ApplyEntry(
+                backend="ollama",
+                label=f"{path} (from {base})",
+                detail=f"{n_params} option(s)",
+                path=path,
+            )
+        )
+    return entries
+
+
+def _resolve_apply_choice(entries: list[ApplyEntry], choice: int) -> ApplyEntry | None:
+    """1-based picker resolution (0/Enter/out-of-range → None = cancel)."""
+    if not entries or choice <= 0 or choice > len(entries):
+        return None
+    return entries[choice - 1]
+
+
+def _scan_ollama_config_dir() -> list[dict]:
+    """Parse local ollama-configs/*.modelfile.md (no server calls)."""
+    from lm_optimizer.backends.ollama.modelfile import OLLAMA_CONFIG_DIR, parse_modelfile
+
+    found: list[dict] = []
+    try:
+        files = sorted(OLLAMA_CONFIG_DIR.glob("*.modelfile.md"))
+    except Exception:
+        return found
+    for f in files:
+        try:
+            parsed = parse_modelfile(f.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        parsed["path"] = str(f)
+        found.append(parsed)
+    return found
+
+
+@app.command(name="apply-menu")
+def apply_menu(
+    backend: str = typer.Option(
+        "lmstudio", "--backend", "-b", help="Backend to list: lmstudio or ollama"
+    ),
+):
+    """Interactive picker for applying optimized configs (no benchmarks).
+
+    lmstudio: applies a saved DB preset (loads the model once).
+    ollama: applies a local ollama-configs/*.modelfile.md as a NEW tag.
+    """
+    setup_logging()
+    normalized = (backend or "").strip().lower()
+    if normalized not in ("lmstudio", "ollama"):
+        console.print(f"[red]Invalid --backend: {backend} (expected lmstudio|ollama)[/red]")
+        sys.exit(2)
+
+    if normalized == "lmstudio":
+        entries = _collect_apply_entries(preset_repo.list_all(), [])
+    else:
+        entries = _collect_apply_entries([], _scan_ollama_config_dir())
+    if not entries:
+        if normalized == "lmstudio":
+            console.print("[yellow]No saved presets. Run 'lm-optimizer optimize' first.[/yellow]")
+        else:
+            console.print(
+                "[yellow]No local modelfiles. Create one with 'lm-optimizer ollama-export -o name.modelfile.md'.[/yellow]"
+            )
+        return
+
+    table = Table(title=f"Apply configs ({normalized}, select by number)")
+    table.add_column("#", style="cyan", justify="right")
+    table.add_column("Config", style="green")
+    table.add_column("Detail", style="dim")
+    for idx, e in enumerate(entries, 1):
+        table.add_row(str(idx), e.label, e.detail)
+    console.print(table)
+    console.print()
+
+    try:
+        choice = typer.prompt(
+            "Select config number to apply (or Enter to cancel)",
+            type=int,
+            default=0,
+            show_default=False,
+        )
+    except (typer.Abort, ValueError):
+        console.print("[yellow]Cancelled[/yellow]")
+        return
+    selected = _resolve_apply_choice(entries, choice)
+    if selected is None:
+        console.print("[red]Invalid selection[/red]")
+        return
+
+    console.print(f"\nSelected: [bold]{selected.label}[/bold] ({selected.detail})")
+    if not typer.confirm("Apply this config? (loads the model)", default=True):
+        console.print("[yellow]Cancelled[/yellow]")
+        return
+    if selected.backend == "lmstudio":
+        apply(selected.model, selected.profile)
+    else:
+        from pathlib import Path as _Path
+
+        ollama_apply(file=_Path(selected.path), as_tag=None, yes=True, base_url=None)
 
 
 @app.command()
@@ -1496,6 +1835,27 @@ def auto(
         "--max-tokens-scale",
         help="Scale case max-tokens 0.25-1.0 for slow models (may fail quality gates)",
     ),
+    min_speed: float = typer.Option(
+        0.0,
+        "--min-speed",
+        help="Minimum generation tok/s to accept a config; slower configs are skipped and marked as too slow",
+    ),
+    warmup_runs: int = typer.Option(
+        1, "--warmup-runs", help="Warmup suite passes per config 0-5 (0 = fastest, noisier)"
+    ),
+    report_sort: str = typer.Option(
+        "run", "--report-sort", help="Tested-configs table order: run, speed, quality"
+    ),
+    skip_phases: str | None = typer.Option(
+        None,
+        "--skip-phases",
+        help="Comma-separated phases to skip: speed,quality,recovery,validation,context",
+    ),
+    physical_batches: str | None = typer.Option(
+        None,
+        "--physical-batches",
+        help="Comma-separated physical batch sizes to test (e.g. 256,512,1024)",
+    ),
     enable_rope: bool = typer.Option(
         False,
         "--enable-rope",
@@ -1510,6 +1870,16 @@ def auto(
         False,
         "--enable-speculative",
         help="Experimental tail opt-in: speculative probes after the FINAL winner",
+    ),
+    wait_interval: float = typer.Option(
+        60.0,
+        "--wait-interval",
+        help="Seconds between foreign-model eviction re-checks before start",
+    ),
+    max_waits: int = typer.Option(
+        30,
+        "--max-waits",
+        help="Max re-checks for a foreign model before aborting with a message",
     ),
 ):
     """Unattended pipeline: smoke -> precision -> ladder(ctx max) -> matrix -> optimize."""
@@ -1526,9 +1896,13 @@ def auto(
         summary = []
         pipeline_t0 = time.perf_counter()
         try:
-            await client.connect()
+            snap = await _connect_guarded_or_abort(
+                client,
+                "auto",
+                wait_interval_s=wait_interval,
+                max_waits=max_waits,
+            )
             remote_note = _warn_if_remote(client.base_url)
-            snap = await prepare_host(client, purpose="auto")
             for line in format_snapshot(snap):
                 console.print(f"  {line}")
             hardware = hardware_detector.detect()
@@ -1569,6 +1943,40 @@ def auto(
             experimental_flags = _resolve_experimental_flags(
                 enable_rope, enable_cpu_moe, enable_speculative
             )
+
+            from lm_optimizer.services.optimizer import parse_phase_skips
+
+            auto_skips: list[str] = []
+            if skip_phases:
+                try:
+                    auto_skips = sorted(parse_phase_skips(skip_phases))
+                except ValueError as e:
+                    console.print(f"[red]{e}[/red]")
+                    sys.exit(2)
+            auto_physical_batches: list[int] | None = None
+            if physical_batches:
+                try:
+                    auto_physical_batches = sorted(
+                        {int(x.strip()) for x in physical_batches.split(",") if x.strip()}
+                    )
+                except ValueError:
+                    console.print(
+                        "[red]Invalid --physical-batches (comma-separated integers)[/red]"
+                    )
+                    sys.exit(2)
+                if not auto_physical_batches or any(
+                    b <= 0 for b in auto_physical_batches
+                ):
+                    console.print(
+                        "[red]Invalid --physical-batches (positive integers required)[/red]"
+                    )
+                    sys.exit(2)
+            if not 0 <= warmup_runs <= 5:
+                console.print("[red]Invalid --warmup-runs (0-5)[/red]")
+                sys.exit(2)
+            if report_sort not in ("run", "speed", "quality"):
+                console.print("[red]Invalid --report-sort (run|speed|quality)[/red]")
+                sys.exit(2)
 
             smoke_service = BenchmarkService(client, style=style)
             quality_evaluator = QualityEvaluator(QualityConfig(minimum_score=quality_threshold))
@@ -1715,8 +2123,13 @@ def auto(
                             "workload_type": normalize_workload(workload),
                             "selection_threshold": 0.05,
                             "gpu_via_cli": gpu_via_cli,
+                            "min_speed": min_speed,
+                            "skip_phases": auto_skips,
                             **experimental_flags,
                         }
+                        if auto_physical_batches:
+                            advanced["physical_batches"] = auto_physical_batches
+                        advanced["warmup_runs"] = warmup_runs
                         run = await _run_optimization(
                             client,
                             m,
@@ -1791,6 +2204,7 @@ def auto(
                                 generation=_generation_for(m.id, m.architecture),
                                 model_info=m,
                                 note=remote_note,
+                                sort=report_sort,
                             )
                             row["detail"] += (
                                 f"; best ctx {best.context_length} "
@@ -1878,7 +2292,11 @@ def auto(
                 pass
             await client.close()
 
-    asyncio.run(_auto())
+    _acquire_run_lock("auto")
+    try:
+        asyncio.run(_auto())
+    finally:
+        release_lock()
 
 
 @app.command()
@@ -1894,6 +2312,16 @@ def fit(
     kv: str = typer.Option("both", "--kv", help="KV paths to probe (gpu/cpu/both)"),
     output: Path = typer.Option("results", "--output", help="Report output directory"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Show plan without running"),
+    wait_interval: float = typer.Option(
+        60.0,
+        "--wait-interval",
+        help="Seconds between foreign-model eviction re-checks before start",
+    ),
+    max_waits: int = typer.Option(
+        30,
+        "--max-waits",
+        help="Max re-checks for a foreign model before aborting with a message",
+    ),
 ):
     """Max-context ladder: escalate ctx until load refusal, per KV path (fit, no tuning)."""
     setup_logging()
@@ -1905,8 +2333,9 @@ def fit(
     async def _fit():
         client = get_client()
         try:
-            await client.connect()
-            snap = await prepare_host(client, purpose="fit")
+            snap = await _connect_guarded_or_abort(
+                client, "fit", wait_interval_s=wait_interval, max_waits=max_waits
+            )
             for line in format_snapshot(snap):
                 console.print(f"  {line}")
             hardware = hardware_detector.detect()
@@ -1989,7 +2418,94 @@ def fit(
                 pass
             await client.close()
 
-    asyncio.run(_fit())
+    _acquire_run_lock("fit")
+    try:
+        asyncio.run(_fit())
+    finally:
+        release_lock()
+
+
+async def _ctx_quality_suites(
+    client,
+    model: str,
+    report: dict,
+    top_n: int,
+    threshold: float,
+    repetitions: int,
+    gpu_ratio: float,
+    flash: bool,
+    kv_gpu: bool,
+    batch: int,
+    style: str = "balanced",
+    warmup_runs: int = 1,
+) -> list[dict]:
+    """Full quality suites on the top-N stable sweep rungs (ctx --quality).
+
+    Same runtime as the capacity probes, descending ctx. Returns per-rung
+    dicts (ctx, tok/s, quality, checks, VRAM, TTFT, pass). Never raises
+    for a single failed rung (records it, continues).
+    """
+    from lm_optimizer.services.benchmark import BenchmarkService
+    from lm_optimizer.services.context_sweep import pick_quality_rungs
+    from lm_optimizer.services.quality import QualityConfig, QualityEvaluator
+
+    rungs = pick_quality_rungs(report, top_n)
+    if not rungs:
+        console.print("[yellow]No stable rungs for quality suites[/yellow]")
+        return []
+    svc = BenchmarkService(
+        client, benchmark_config=_benchmark_config_obj(max(1, repetitions), 1.0, warmup_runs)
+    )
+    evaluator = QualityEvaluator(QualityConfig(minimum_score=threshold))
+    rows: list[dict] = []
+    table = Table(title=f"Quality suites (top-{len(rungs)} stable contexts): {model}")
+    table.add_column("Context", justify="right")
+    table.add_column("Gen tok/s", justify="right")
+    table.add_column("Quality", justify="right")
+    table.add_column("Checks", justify="right")
+    table.add_column("VRAM GB", justify="right")
+    table.add_column("TTFT ms", justify="right")
+    table.add_column("Verdict")
+    for ctx_len in rungs:
+        cfg = LoadConfiguration(
+            context_length=ctx_len,
+            gpu_ratio=gpu_ratio,
+            flash_attention=flash,
+            offload_kv_cache_to_gpu=kv_gpu,
+            eval_batch_size=batch,
+        )
+        try:
+            with console.status(f"Quality suite ctx={ctx_len}..."):
+                res = await svc.run_benchmark(model, cfg, ctx_len, style=style)
+            scores = evaluator.evaluate_all(model, res.metrics)
+            agg = evaluator.aggregate_quality(scores)
+            ok = agg.overall >= threshold
+            row = {
+                "ctx": ctx_len,
+                "tok_s": round(res.get_avg_generation_tok_s(), 1),
+                "quality": round(agg.overall, 3),
+                "checks": f"{agg.checks_passed}/{agg.checks_total}",
+                "vram_gb": round(res.peak_vram_gb, 1) if res.peak_vram_gb else None,
+                "ttft_ms": round(res.get_avg_estimated_ttft_ms(), 0),
+                "pass": bool(ok),
+            }
+        except Exception as e:
+            logger.exception("Quality rung failed", ctx=ctx_len)
+            row = {"ctx": ctx_len, "tok_s": 0.0, "quality": 0.0, "checks": "0/0",
+                   "vram_gb": None, "ttft_ms": 0, "pass": False,
+                   "error": f"{type(e).__name__}: {e}"[:160]}
+        rows.append(row)
+        table.add_row(
+            str(row["ctx"]),
+            f"{row['tok_s']:.1f}",
+            f"{row['quality']:.3f}",
+            str(row["checks"]),
+            f"{row['vram_gb']:.1f}" if row["vram_gb"] is not None else "—",
+            f"{row['ttft_ms']:.0f}",
+            "[green]PASS[/green]" if row["pass"] else "[red]FAIL[/red]",
+        )
+    console.print(table)
+    return rows
 
 
 @app.command()
@@ -2004,7 +2520,26 @@ def ctx(
     flash: bool = typer.Option(True, "--flash/--no-flash", help="Flash attention"),
     batch: int = typer.Option(256, "--batch", "-b", help="Eval batch size"),
     repetitions: int = typer.Option(1, "--repetitions", "-r", help="Smoke repetitions per point"),
+    warmup_runs: int = typer.Option(
+        1, "--warmup-runs", help="Warmup suite passes per quality rung 0-5 (0 = fastest)"
+    ),
+    quality_rungs: int = typer.Option(
+        0, "--quality-rungs", help="Full quality suites on top-N stable rungs (0 = off)"
+    ),
+    quality_threshold: float = typer.Option(
+        0.97, "--quality-threshold", help="Pass threshold for quality-rung verdicts"
+    ),
     dry_run: bool = typer.Option(False, "--dry-run", help="Show plan without running"),
+    wait_interval: float = typer.Option(
+        60.0,
+        "--wait-interval",
+        help="Seconds between foreign-model eviction re-checks before start",
+    ),
+    max_waits: int = typer.Option(
+        30,
+        "--max-waits",
+        help="Max re-checks for a foreign model before aborting with a message",
+    ),
 ):
     """Test context capacity for ONE model with a fixed runtime configuration."""
     setup_logging()
@@ -2025,8 +2560,9 @@ def ctx(
     async def _ctx():
         client = get_client()
         try:
-            await client.connect()
-            snap = await prepare_host(client, purpose="ctx")
+            snap = await _connect_guarded_or_abort(
+                client, "ctx", wait_interval_s=wait_interval, max_waits=max_waits
+            )
             for line in format_snapshot(snap):
                 console.print(f"  {line}")
             model_info = await client.get_model(model)
@@ -2101,6 +2637,15 @@ def ctx(
                 )
             if bal:
                 console.print(f"\nBalanced recommended:\n{bal['ctx']}")
+            if quality_rungs > 0:
+                if not 0 <= warmup_runs <= 5:
+                    console.print("[red]Invalid --warmup-runs (0-5)[/red]")
+                    sys.exit(2)
+                await _ctx_quality_suites(
+                    client, model, report, quality_rungs, quality_threshold,
+                    repetitions, gpu_ratio, flash, kv_gpu, batch, style="balanced",
+                    warmup_runs=warmup_runs,
+                )
         except KeyboardInterrupt:
             console.print(
                 "\n[yellow]Interrupted — partial sweep results above are preserved.[/yellow]"
@@ -2123,11 +2668,245 @@ def ctx(
                 sys.exit(1)
             await client.close()
 
+    _acquire_run_lock(f"ctx:{model}")
     try:
         asyncio.run(_ctx())
     except KeyboardInterrupt:
         console.print("\n[yellow]Interrupted.[/yellow]")
         sys.exit(130)
+    finally:
+        release_lock()
+
+
+@app.command(name="quality-ladder")
+def quality_ladder(
+    run: str = typer.Option(..., "--run", help="Source run ID (prefix accepted) with no quality winner"),
+    contexts: str | None = typer.Option(
+        None, "--contexts", help="Comma-separated context rungs (default: fine 2048-steps below max)"
+    ),
+    min_ctx: int = typer.Option(8192, "--min-ctx", help="Lowest context rung"),
+    step: int = typer.Option(2048, "--step", help="Rung granularity (fine steps, not power-of-2 only)"),
+    threshold: float = typer.Option(0.97, "--threshold", help="Standard quality threshold"),
+    fallback_threshold: float = typer.Option(
+        0.90, "--fallback-threshold", help="Single lowered-threshold attempt on max-ctx result"
+    ),
+    repetitions: int = typer.Option(3, "--repetitions", "-r", help="Benchmark repetitions per rung"),
+    profile: str = typer.Option("balanced", "--profile", "-p", help="Optimization profile"),
+    style: str = typer.Option("balanced", "--style", help="Benchmark style"),
+):
+    """Context fallback for a quality-failed run: lower ctx until quality passes.
+
+    Re-tests the source run's fastest runtime at progressively lower contexts
+    (fine steps, not power-of-2 only). Stops at the first rung passing the
+    standard threshold. Then makes exactly ONE lowered-threshold attempt on
+    the max-context result: pass or not, no further lowering afterwards.
+    Prints both options (max ctx + lower quality vs lower ctx + quality OK)
+    so the USER picks. Saves a JSON report next to the other results.
+    """
+    from lm_optimizer.services.quality_ladder import (
+        RungOutcome,
+        build_quality_ladder,
+        pick_options,
+    )
+
+    setup_logging()
+
+    resolved = _resolve_run_id(run)
+    if resolved is None:
+        # Fall back to DB prefix match.
+        candidates = [r for r in run_repo.list_all(200) if str(r.id).startswith(run)]
+        if len(candidates) != 1:
+            console.print(f"[red]No unique run for prefix {run!r}[/red]")
+            sys.exit(1)
+        resolved = str(candidates[0].id)
+    source = run_repo.get(resolved)
+    if not source:
+        console.print(f"[red]Run not found: {run}[/red]")
+        sys.exit(1)
+
+    passed_cfgs = [c for c in (source.configurations or []) if c.status == ConfigurationStatus.PASSED]
+    if not passed_cfgs:
+        console.print("[red]Source run has no passed configs to derive a runtime from[/red]")
+        sys.exit(1)
+    base = max(passed_cfgs, key=lambda c: c.get_avg_generation_tok_s())
+    max_ctx = max((c.context_length for c in source.configurations or []), default=0)
+    if not max_ctx:
+        console.print("[red]Source run has no measured contexts[/red]")
+        sys.exit(1)
+
+    explicit = None
+    if contexts:
+        try:
+            explicit = [int(x.strip()) for x in contexts.split(",") if x.strip()]
+        except ValueError:
+            console.print("[red]Invalid --contexts (comma-separated integers)[/red]")
+            sys.exit(2)
+    model_limit = None
+    try:
+        _mi = source.model
+        model_limit = getattr(_mi, "context_limit", None)
+    except Exception:
+        model_limit = None
+    ladder = build_quality_ladder(
+        max_ctx, min_ctx=min_ctx, step=step, model_limit=model_limit, explicit=explicit
+    )
+    if not ladder:
+        console.print("[red]Empty ladder: check --contexts/--min-ctx/--step[/red]")
+        sys.exit(2)
+
+    # Max-context source evidence (already measured, below standard threshold).
+    src_q = [c for c in (source.configurations or [])
+             if c.context_length == max_ctx and c.quality_score is not None]
+    src_best = max(src_q, key=lambda c: c.quality_score.overall) if src_q else None
+    source_outcome = RungOutcome(
+        context=max_ctx,
+        status="quality_failed",
+        quality_overall=src_best.quality_score.overall if src_best else None,
+        checks=(f"{src_best.quality_score.checks_passed}/{src_best.quality_score.checks_total}"
+                if src_best else ""),
+        gen_tok_s=src_best.get_avg_generation_tok_s() if src_best else None,
+        config_id=str(src_best.id) if src_best else "",
+    ) if src_best else None
+
+    console.print(f"[bold]Quality ladder for {source.model.id}[/bold]")
+    console.print(f"  Base runtime: fastest passed config {str(base.id)[:8]} "
+                  f"({base.get_avg_generation_tok_s():.1f} tok/s @ ctx {base.context_length})")
+    console.print(f"  Max ctx (known failed): {max_ctx}")
+    console.print(f"  Ladder: {ladder}")
+    console.print(f"  Standard threshold: {threshold} | single fallback attempt: {fallback_threshold}")
+
+    async def _ladder():
+        client = get_client()
+        try:
+            snap = await _connect_guarded_or_abort(client, "quality-ladder")
+            for line in format_snapshot(snap):
+                console.print(f"  {line}")
+            hardware = hardware_detector.detect()
+            benchmark_service = BenchmarkService(
+                client,
+                benchmark_config=_benchmark_config_obj(repetitions),
+                style=style,
+            )
+            quality_evaluator = QualityEvaluator(QualityConfig(minimum_score=threshold))
+            search_generator = SearchSpaceGenerator(client)
+            optimizer = AdaptiveOptimizer(
+                client, benchmark_service, quality_evaluator, search_generator
+            )
+            new_run, _, advanced = await optimizer.prepare_run(
+                source.model, hardware, OptimizationProfile(profile),
+                quality_threshold=threshold, advanced_settings={}, style=style,
+            )
+            new_run.stage = OptimizationStage.QUALITY_CHECK
+            run_repo.save(new_run)
+            console.print(f"  Ladder run: {new_run.id}")
+
+            outcomes: list[RungOutcome] = []
+            for ctx_len in ladder:
+                data = {k: v for k, v in base.config.to_dict().items()}
+                data["context_length"] = ctx_len
+                qcfg = LoadConfiguration(
+                    **{k: v for k, v in data.items() if hasattr(LoadConfiguration, k)}
+                )
+                qcfg.context_length = ctx_len
+                console.print(f"\n[bold]Rung ctx={ctx_len}[/bold]")
+                try:
+                    result = await optimizer._test_config(qcfg, ctx_len, score_context=True)
+                except KeyboardInterrupt:
+                    optimizer.checkpoint_now(reason="interrupted-ladder")
+                    console.print("\n[yellow]Interrupted — checkpoint saved.[/yellow]")
+                    sys.exit(130)
+                if result is None:
+                    outcomes.append(RungOutcome(context=ctx_len, status="failed"))
+                    continue
+                qs = result.quality_score
+                outcomes.append(RungOutcome(
+                    context=ctx_len,
+                    status=result.status.value if hasattr(result.status, "value") else str(result.status),
+                    quality_overall=qs.overall if qs else None,
+                    checks=(f"{qs.checks_passed}/{qs.checks_total}" if qs else ""),
+                    gen_tok_s=result.get_avg_generation_tok_s(),
+                    config_id=str(result.id),
+                ))
+                if result.status == ConfigurationStatus.PASSED:
+                    console.print(f"[green]PASS @ ctx={ctx_len} — stopping ladder[/green]")
+                    break
+            return new_run, outcomes
+        finally:
+            await client.close()
+
+    _acquire_run_lock(f"quality-ladder:{resolved[:8]}")
+    try:
+        try:
+            new_run, outcomes = asyncio.run(_ladder())
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Interrupted.[/yellow]")
+            sys.exit(130)
+    finally:
+        release_lock()
+
+    verdict = pick_options(outcomes, source_max_ctx=source_outcome,
+                           fallback_threshold=fallback_threshold)
+
+    table = Table(title=f"Quality ladder: {source.model.id}")
+    table.add_column("Option", style="cyan")
+    table.add_column("Context", justify="right")
+    table.add_column("Quality", justify="right")
+    table.add_column("Checks", justify="right")
+    table.add_column("Gen tok/s", justify="right")
+    if verdict.max_ctx_option:
+        m = verdict.max_ctx_option
+        table.add_row("A: max context", str(m.context),
+                      f"{m.quality_overall:.3f}" if m.quality_overall else "—",
+                      m.checks or "—",
+                      f"{m.gen_tok_s:.1f}" if m.gen_tok_s else "—")
+    if verdict.quality_ok_option:
+        q = verdict.quality_ok_option
+        table.add_row("B: quality OK", str(q.context),
+                      f"{q.quality_overall:.3f}" if q.quality_overall else "—",
+                      q.checks or "—",
+                      f"{q.gen_tok_s:.1f}" if q.gen_tok_s else "—")
+    else:
+        table.add_row("B: quality OK", "—", "no rung passed", "—", "—")
+    console.print(table)
+    console.print(f"\n[bold]Single fallback attempt (max ctx vs {fallback_threshold}):[/bold] "
+                  f"{verdict.fallback_message}")
+
+    from datetime import datetime as _dt
+
+    from lm_optimizer.domain.models import RunStatus as _RunStatus
+
+    new_run.status = (
+        _RunStatus.PARTIAL_SUCCESS if verdict.quality_ok_option else _RunStatus.FAILED
+    )
+    new_run.completed_at = _dt.now()
+    new_run.error = (
+        f"ladder done: {len(verdict.rungs)} rungs, "
+        + ("quality OK @ " + str(verdict.quality_ok_option.context)
+           if verdict.quality_ok_option else "no rung passed standard threshold")
+    )
+    run_repo.save(new_run)
+
+    report = {
+        "source_run_id": resolved,
+        "ladder_run_id": str(new_run.id),
+        "model": source.model.id,
+        "standard_threshold": threshold,
+        "fallback_threshold": fallback_threshold,
+        "rungs": [vars(o) for o in verdict.rungs],
+        "option_max_ctx": vars(verdict.max_ctx_option) if verdict.max_ctx_option else None,
+        "option_quality_ok": vars(verdict.quality_ok_option) if verdict.quality_ok_option else None,
+        "fallback_passed": verdict.fallback_passed,
+        "fallback_message": verdict.fallback_message,
+    }
+    out_path = Path("results") / f"{source.model.id.replace('/', '-')}-ladder.json"
+    try:
+        import orjson as _orjson
+
+        out_path.write_bytes(_orjson.dumps(report, option=_orjson.OPT_INDENT_2))
+        console.print(f"\nReport saved: {out_path}")
+    except OSError as e:
+        console.print(f"[red]Cannot write report: {e}[/red]")
+    console.print("\n[dim]YOU pick: A (max context, lower quality) or B (lower context, quality OK).[/dim]")
 
 
 @app.command()
@@ -2135,6 +2914,11 @@ def resume(
     run_id: str = typer.Argument(..., help="Run ID to resume from checkpoint"),
     revalidate: bool = typer.Option(False, "--revalidate", help="Re-run completed candidates"),
     style: str = typer.Option("balanced", "--style", help="Benchmark style"),
+    skip_phases: str | None = typer.Option(
+        None,
+        "--skip-phases",
+        help="Comma-separated phases to skip for the remainder: speed,quality,recovery,validation,context",
+    ),
 ):
     """Resume an interrupted run from its checkpoint without re-running completed work."""
     setup_logging()
@@ -2158,6 +2942,7 @@ def resume(
             if not run:
                 console.print(f"[red]Run not found: {run_id}[/red]")
                 sys.exit(1)
+            _apply_resume_skips(run, skip_phases)
             completed = ckpt.get("completed_candidate_ids", [])
             console.print("[bold]Resuming optimization[/bold]")
             console.print(f"Completed:\n{len(completed)} configurations")
@@ -2193,11 +2978,14 @@ def resume(
         finally:
             await client.close()
 
+    _acquire_run_lock(f"resume:{run_id}")
     try:
         asyncio.run(_resume())
     except KeyboardInterrupt:
         console.print("\n[yellow]Interrupted.[/yellow]")
         sys.exit(130)
+    finally:
+        release_lock()
 
 
 @app.command()
@@ -2235,6 +3023,33 @@ def pause(
     console.print(f"[yellow]Pause requested for run {resolved}[/yellow]")
     console.print("The running process pauses after its current operation finishes.")
     console.print(f"Check status with: run-status {resolved}")
+
+
+def _apply_resume_skips(run, skip_phases: str | None) -> None:
+    """Merge --skip-phases into a stored run before resume (CLI wins).
+
+    Exits 2 on unknown phase names. No-op when skip_phases is falsy.
+    """
+    if not skip_phases:
+        return
+    from lm_optimizer.services.optimizer import parse_phase_skips
+
+    try:
+        skips = sorted(parse_phase_skips(skip_phases))
+        merged = dict(run.advanced_settings or {})
+        merged["skip_phases"] = skips
+        run.advanced_settings = merged
+        params = dict(run.benchmark_params or {})
+        params["skip_phases"] = skips
+        run.benchmark_params = params
+        run_repo.save(run)
+        console.print(
+            f"[yellow]Skipping phases for the remainder: "
+            f"{', '.join(skips)}[/yellow]"
+        )
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        sys.exit(2)
 
 
 def _resolve_run_id(prefix: str) -> str | None:
@@ -2323,6 +3138,342 @@ def checkpoints():
     console.print(table)
 
 
+@app.command(name="resume-menu")
+def resume_menu(
+    status: list[str] | None = typer.Option(
+        None,
+        "--status",
+        "-s",
+        help="Filter by status (running, paused, resumed, partial_success). Can repeat.",
+    ),
+    limit: int = typer.Option(20, "--limit", "-l", help="Max runs to show"),
+    all: bool = typer.Option(
+        False, "--all", help="Resume every listed run sequentially (one confirmation)"
+    ),
+):
+    """Interactive menu to resume paused/incomplete runs.
+
+    Shows runs with checkpoints that can be resumed (not terminal states).
+    Select a run by number to resume from its checkpoint, or pass --all
+    to finish every listed run one after another.
+    """
+    setup_logging()
+
+    # Default to resumable states
+    target_statuses = set(status) if status else {"running", "paused", "resumed", "partial_success"}
+
+    runs = run_repo.list_all(limit=limit)
+    if not runs:
+        console.print("[yellow]No optimization runs found[/yellow]")
+        return
+
+    # Filter to resumable states
+    resumable_runs = [r for r in runs if r.status.value in target_statuses]
+    if not resumable_runs:
+        console.print(f"[yellow]No runs with status in {target_statuses}[/yellow]")
+        return
+
+    if all:
+        resume_all_runs(resumable_runs)
+        return
+
+    # Build display table
+    table = Table(title="Resumable Runs (select by number)")
+    table.add_column("#", style="cyan", justify="right")
+    table.add_column("Run ID", style="dim")
+    table.add_column("Model", style="green")
+    table.add_column("Status", style="yellow")
+    table.add_column("Profile", style="blue")
+    table.add_column("Stage", style="magenta")
+    table.add_column("Configs", justify="right")
+    table.add_column("Completed", justify="right")
+    table.add_column("Created", style="dim")
+
+    for idx, run in enumerate(resumable_runs, 1):
+        # Get checkpoint info
+        from lm_optimizer.storage.run_checkpoint import load_checkpoint
+        ckpt = load_checkpoint(str(run.id))
+        completed = len(ckpt.get("completed_candidate_ids", [])) if ckpt else 0
+        total = run.config_count or len(run.configurations) if run.configurations else 0
+
+        status_badge = _status_badge(run.status.value)
+        table.add_row(
+            str(idx),
+            str(run.id)[:8] + "...",
+            run.model.name or run.model.id,
+            status_badge,
+            run.profile.value,
+            run.stage.value if run.stage else "?",
+            str(total),
+            str(completed),
+            run.created_at.strftime("%Y-%m-%d %H:%M"),
+        )
+
+    console.print(table)
+    console.print()
+
+    # Prompt for selection
+    try:
+        choice = typer.prompt(
+            "Select run number to resume (or Enter to cancel)",
+            type=int,
+            default=0,
+            show_default=False,
+        )
+    except (typer.Abort, ValueError):
+        console.print("[yellow]Cancelled[/yellow]")
+        return
+
+    if choice <= 0 or choice > len(resumable_runs):
+        console.print("[red]Invalid selection[/red]")
+        return
+
+    selected = resumable_runs[choice - 1]
+
+    # Confirm
+    console.print(f"\nSelected: [bold]{selected.model.name}[/bold] (run {selected.id})")
+    console.print(f"Status: {_status_badge(selected.status.value)} | Stage: {selected.stage}")
+    if not typer.confirm("Resume this run?", default=True):
+        console.print("[yellow]Cancelled[/yellow]")
+        return
+
+    # Run resume (reuse existing logic)
+    _run_resume(str(selected.id), revalidate=False, style="balanced")
+
+
+def resume_all_runs(runs: list) -> dict:
+    """Resume every given run sequentially (bulk finish, --all path).
+
+    One confirmation up front; per-run failures are collected, never abort
+    the batch. Returns {"resumed": [...ids], "failed": {id: error}}.
+    """
+    result: dict = {"resumed": [], "failed": {}}
+    if not runs:
+        console.print("[yellow]Nothing to resume[/yellow]")
+        return result
+    console.print(f"[bold]About to resume {len(runs)} run(s), one after another.[/bold]")
+    try:
+        go = typer.confirm("Resume all?", default=True)
+    except (typer.Abort, ValueError):
+        console.print("[yellow]Cancelled[/yellow]")
+        return result
+    if not go:
+        console.print("[yellow]Cancelled[/yellow]")
+        return result
+    for run in runs:
+        rid = str(run.id)
+        try:
+            console.print(f"\n[bold]=== {run.model.name or run.model.id} ({rid[:8]}...) ===[/bold]")
+            _run_resume(rid, revalidate=False, style="balanced")
+            result["resumed"].append(rid)
+        except SystemExit as e:
+            # _run_resume exits nonzero on failure; keep going with the rest.
+            if getattr(e, "code", 1) in (0, None):
+                result["resumed"].append(rid)
+            else:
+                result["failed"][rid] = f"exit {e.code}"
+        except Exception as e:
+            result["failed"][rid] = f"{type(e).__name__}: {e}"[:200]
+    console.print(
+        f"\n[bold]Resume-all done: {len(result['resumed'])} resumed, "
+        f"{len(result['failed'])} failed[/bold]"
+    )
+    for rid, err in result["failed"].items():
+        console.print(f"  [red]{rid[:8]}...: {err}[/red]")
+    return result
+
+
+def _run_resume(run_id: str, revalidate: bool, style: str, skip_phases: str | None = None):
+    """Internal: run the resume logic."""
+    style = _require_style(style)
+
+    async def _resume():
+        client = get_client()
+        try:
+            await client.connect()
+            from lm_optimizer.storage.run_checkpoint import load_checkpoint
+
+            try:
+                ckpt = load_checkpoint(run_id)
+            except ValueError as e:
+                console.print(f"[red]Corrupted checkpoint: {e}[/red]")
+                sys.exit(1)
+            if not ckpt:
+                console.print(f"[red]No checkpoint for run {run_id}[/red]")
+                sys.exit(1)
+            run = run_repo.get(run_id)
+            if not run:
+                console.print(f"[red]Run not found: {run_id}[/red]")
+                sys.exit(1)
+            _apply_resume_skips(run, skip_phases)
+            completed = ckpt.get("completed_candidate_ids", [])
+            console.print("[bold]Resuming optimization[/bold]")
+            console.print(f"Completed:\n{len(completed)} configurations")
+            hardware = hardware_detector.detect()
+            benchmark_service = BenchmarkService(client, style=style)
+            quality_evaluator = QualityEvaluator(QualityConfig(minimum_score=run.quality_threshold))
+            search_generator = SearchSpaceGenerator(client)
+            optimizer = AdaptiveOptimizer(
+                client, benchmark_service, quality_evaluator, search_generator
+            )
+            try:
+                resumed = await optimizer.resume_from_checkpoint(
+                    run_id, revalidate=revalidate, style=style
+                )
+            except KeyboardInterrupt:
+                optimizer.checkpoint_now(reason="interrupted-resume")
+                console.print("\n[yellow]Interrupted — checkpoint saved.[/yellow]")
+                sys.exit(130)
+            remaining = [
+                c for c in resumed.configurations if c.status != ConfigurationStatus.PASSED
+            ]
+            console.print(
+                f"Remaining:\n{len(remaining)} non-passing / "
+                f"{len(resumed.configurations)} total tested"
+            )
+            _display_optimization_result(resumed)
+        except SystemExit:
+            raise
+        except Exception as e:
+            logger.exception("Resume failed")
+            console.print(f"[red]Error: {e}[/red]")
+            sys.exit(1)
+        finally:
+            await client.close()
+
+    _acquire_run_lock(f"resume:{run_id}")
+    try:
+        asyncio.run(_resume())
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Interrupted.[/yellow]")
+        sys.exit(130)
+    finally:
+        release_lock()
+
+
+def _status_badge(status: str) -> str:
+    """Return styled status badge."""
+    badges = {
+        "running": "[green]running[/green]",
+        "paused": "[yellow]paused[/yellow]",
+        "resumed": "[blue]resumed[/blue]",
+        "partial_success": "[magenta]partial_success[/magenta]",
+        "success": "[green]success[/green]",
+        "failed": "[red]failed[/red]",
+        "cancelled": "[dim]cancelled[/dim]",
+        "interrupted": "[dim]interrupted[/dim]",
+    }
+    return badges.get(status, status)
+
+
+@app.command(name="judge")
+def judge_models(
+    run_id: str = typer.Argument(..., help="Run ID to evaluate"),
+    priority: str = typer.Option("balanced", "--priority", "-p", help="Priority: speed, quality, balanced, context"),
+    use_case: str = typer.Option("general", "--use-case", "-u", help="Use case: coding, chat, reasoning, general"),
+    vram_limit: float | None = typer.Option(None, "--vram-limit", help="VRAM limit in GB (optional)"),
+    backend: str = typer.Option("heuristic", "--backend", "-b", help="Judge backend: heuristic, local, api"),
+    model: str | None = typer.Option(None, "--model", "-m", help="Judge model (for local/api backend)"),
+):
+    """AI-assisted model selection - get a second opinion on which config to keep.
+
+    The USER decides first. This provides analysis to help make informed decisions.
+    """
+    from lm_optimizer.services.model_judge import JudgeConfig, JudgeBackend, create_judge, ModelComparison
+
+    setup_logging()
+
+    run = run_repo.get(run_id)
+    if not run:
+        console.print(f"[red]Run not found: {run_id}[/red]")
+        sys.exit(1)
+
+    configs = run.configurations or []
+    passed = [c for c in configs if c.status == "passed"]
+    if not passed:
+        console.print("[red]No passing configurations to evaluate[/red]")
+        sys.exit(1)
+
+    # Hardware constraints
+    hw = hardware_detector.detect()
+    hardware_constraints = {
+        "vram_gb": vram_limit or (hw.gpu.vram_gb if hw.gpu else None),
+        "ram_gb": hw.total_ram_gb,
+    }
+
+    # Create judge
+    judge_config = JudgeConfig(
+        backend=JudgeBackend(backend),
+        model=model,
+    )
+    judge = create_judge(judge_config)
+
+    # Run evaluation
+    async def _evaluate():
+        comparison = ModelComparison(
+            run=run,
+            configs=configs,
+            use_case=use_case,
+            hardware_constraints=hardware_constraints,
+            priority=priority,
+        )
+        return await judge.evaluate(comparison)
+
+    try:
+        verdict = asyncio.run(_evaluate())
+    except Exception as e:
+        console.print(f"[red]Judge evaluation failed: {e}[/red]")
+        sys.exit(1)
+    finally:
+        asyncio.run(judge.close())
+
+    # Display results
+    console.print(Panel.fit(f"[bold]Model Judge Verdict[/bold] — Run: {run_id[:8]}..."))
+
+    # Find recommended config
+    rec_config = next((c for c in configs if c.id == verdict.recommended_config_id), None)
+    if rec_config:
+        avg_gen = rec_config.get_avg_generation_tok_s()
+        avg_prompt = rec_config.get_avg_prompt_tok_s()
+        table = Table(title="Recommended Configuration")
+        table.add_column("Parameter", style="cyan")
+        table.add_column("Value", style="green")
+        table.add_row("Config ID", str(rec_config.id)[:8] + "...")
+        table.add_row("Context", str(rec_config.context_length))
+        table.add_row("Speed", f"{avg_gen:.1f} tok/s" if avg_gen else "N/A")
+        table.add_row("Prompt Speed", f"{avg_prompt:.0f} tok/s" if avg_prompt else "N/A")
+        qual = rec_config.quality_score.overall if rec_config.quality_score else None
+        table.add_row("Quality", f"{qual:.3f}" if qual else "N/A")
+        table.add_row("VRAM", f"{rec_config.peak_vram_gb:.1f} GB" if rec_config.peak_vram_gb else "N/A")
+        table.add_row("Score", f"{rec_config.score:.3f}" if rec_config.score else "N/A")
+        console.print(table)
+
+    console.print(f"\n[bold]Reasoning:[/bold] {verdict.reasoning}")
+    console.print(f"[bold]Confidence:[/bold] {verdict.confidence:.0%}")
+
+    if verdict.pros:
+        console.print("\n[bold green]Pros:[/bold green]")
+        for pro in verdict.pros:
+            console.print(f"  ✓ {pro}")
+
+    if verdict.cons:
+        console.print("\n[bold red]Cons / Warnings:[/bold red]")
+        for con in verdict.cons:
+            console.print(f"  ✗ {con}")
+
+    if verdict.alternative_config_ids:
+        console.print("\n[bold]Alternatives:[/bold]")
+        for alt_id in verdict.alternative_config_ids:
+            alt = next((c for c in configs if c.id == alt_id), None)
+            if alt:
+                avg_gen = alt.get_avg_generation_tok_s()
+                qual = alt.quality_score.overall if alt.quality_score else None
+                aid = str(alt.id)[:8]
+                console.print(f"  • {aid}... — {alt.context_length} ctx, {avg_gen:.1f} tok/s, Q:{qual:.3f}" if avg_gen and qual else f"  • {aid}...")
+
+    console.print("\n[dim]Remember: YOU decide. This is just a second opinion.[/dim]")
+
+
 @app.command(name="param-matrix")
 def param_matrix(
     record: bool = typer.Option(False, "--record", help="Save capability snapshot to DB"),
@@ -2353,6 +3504,10 @@ def param_matrix(
     console.print(
         "[dim]Control: REST = native API verified live; CLI = lms flags verified; "
         "SDK/schema = known but programmatically unverified; none = not exposed.[/dim]"
+    )
+    console.print(
+        "[dim]What you get from this table: which knobs the optimizer can turn "
+        "itself during a run (and how), vs what stays fixed or needs manual/CLI steps.[/dim]"
     )
     if record:
         try:
@@ -2830,8 +3985,7 @@ def compare(
     async def _compare():
         client = get_client()
         try:
-            await client.connect()
-            snap = await prepare_host(client, purpose="compare")
+            snap = await _connect_guarded_or_abort(client, "compare")
             for line in format_snapshot(snap):
                 console.print(f"  {line}")
             if not snap.get("verified_empty") and snap.get("leftovers"):
@@ -2894,8 +4048,7 @@ def sample_sweep(
     async def _sweep():
         client = get_client()
         try:
-            await client.connect()
-            snap = await prepare_host(client, purpose="sample-sweep")
+            snap = await _connect_guarded_or_abort(client, "sample-sweep")
             for line in format_snapshot(snap):
                 console.print(f"  {line}")
             if not snap.get("verified_empty") and snap.get("leftovers"):
@@ -2964,14 +4117,34 @@ def sample_sweep(
 def ollama_export(
     model: str = typer.Option(..., "--model", help="Base Ollama model tag for the FROM line"),
     param: list[str] | None = typer.Option(
-        None, "--param", help="Option override KEY=VALUE (repeatable)"
+        None, "--param", help="Option override KEY=VALUE (repeatable, wins over --from-show)"
     ),
     output: Path | None = typer.Option(
-        None, "--output", "-o", help="Write the Modelfile here (default: print only)"
+        None, "--output", "-o", help="Write the Modelfile here (bare filename -> ollama-configs/)"
+    ),
+    from_show: bool = typer.Option(
+        False, "--from-show", help="Prefill with live /api/show parameters (needs server)"
+    ),
+    probe_max_ctx: bool = typer.Option(
+        False, "--probe-max-ctx", help="Measure largest working num_ctx (tiny probe per rung)"
+    ),
+    base_url: str | None = typer.Option(
+        None, "--base-url", help="Ollama URL (default http://127.0.0.1:11434)"
     ),
 ):
-    """Render an editable Ollama Modelfile from a base tag + options (no server calls)."""
-    from lm_optimizer.backends.ollama.modelfile import parse_param_assignment, render_modelfile
+    """Render an editable Ollama Modelfile: live defaults + optimal overrides.
+
+    Without flags: base tag + options only (no server calls). With
+    --from-show: prefill the server's effective parameters, then apply
+    --param overrides on top. With --probe-max-ctx: measure the largest
+    loadable num_ctx ladder rung (unless --param num_ctx is given).
+    """
+    from lm_optimizer.backends.ollama.modelfile import (
+        MAX_CTX_PROBE_LADDER,
+        parse_param_assignment,
+        parse_show_parameters,
+        render_modelfile,
+    )
 
     setup_logging()
     params: dict = {}
@@ -2982,6 +4155,34 @@ def ollama_export(
             console.print(f"[red]Invalid --param: {e}[/red]")
             sys.exit(2)
         params[key] = value
+
+    if from_show or probe_max_ctx:
+        from lm_optimizer.backends.ollama.client import OLLAMA_DEFAULT_URL, OllamaClient
+
+        async def _live():
+            client = OllamaClient(base_url=base_url or OLLAMA_DEFAULT_URL)
+            try:
+                await client.connect(echo_probe=False)
+                show = await client.show(model)
+                probed = None
+                if probe_max_ctx and "num_ctx" not in params:
+                    probed = await _probe_max_ctx(client, model)
+                return show, probed
+            finally:
+                await client.close()
+
+        try:
+            show, probed_ctx = asyncio.run(_live())
+        except Exception as e:
+            console.print(f"[red]Ollama query failed: {type(e).__name__} ({e})[/red]")
+            sys.exit(1)
+        if from_show:
+            live = parse_show_parameters(show)
+            params = {**live, **params}
+            console.print(f"[dim]Prefilled {len(live)} live parameter(s) from /api/show[/dim]")
+        if probed_ctx is not None:
+            params["num_ctx"] = probed_ctx
+            console.print(f"[green]Probed max working num_ctx: {probed_ctx}[/green]")
     try:
         text = render_modelfile(model, params)
     except ValueError as e:
@@ -2989,6 +4190,11 @@ def ollama_export(
         sys.exit(2)
     if output is not None:
         try:
+            from lm_optimizer.backends.ollama.modelfile import OLLAMA_CONFIG_DIR
+
+            if output.parent == Path("."):
+                OLLAMA_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+                output = OLLAMA_CONFIG_DIR / output.name
             output.write_text(text, encoding="utf-8")
         except OSError as e:
             console.print(f"[red]Cannot write {output}: {e}[/red]")
@@ -2997,11 +4203,42 @@ def ollama_export(
     console.print(text, highlight=False)
 
 
+async def _probe_max_ctx(client, model: str) -> int | None:
+    """Largest working num_ctx rung (tiny non-streaming probe each).
+
+    Rungs above the model's own context limit are skipped without probing.
+    """
+    from lm_optimizer.backends.ollama.modelfile import MAX_CTX_PROBE_LADDER
+
+    try:
+        info = await client.show(model)
+        details = info.get("details") if isinstance(info, dict) else None
+        model_max = None
+        if isinstance(details, dict):
+            raw_max = details.get("context_length")
+            model_max = int(raw_max) if raw_max else None
+    except Exception:
+        model_max = None
+    rungs = [c for c in MAX_CTX_PROBE_LADDER if model_max is None or c <= model_max]
+    for ctx_len in rungs:
+        try:
+            m = await client.generate(
+                model, "Reply with exactly: OK",
+                options={"num_ctx": ctx_len, "num_predict": 8, "temperature": 0.0},
+            )
+            if (m.text or "").strip():
+                return ctx_len
+        except Exception as e:
+            logger.debug("num_ctx probe failed", ctx=ctx_len, error=str(e)[:120])
+            continue
+    return None
+
+
 @app.command(name="ollama-apply")
 def ollama_apply(
     file: Path = typer.Option(..., "--file", help="Edited Modelfile (.md) to apply"),
     as_tag: str | None = typer.Option(
-        None, "--as", help="New model tag (default: <base>:opt, never overwrite)"
+        None, "--as", help="New model tag (default: <base>-best, never overwrite)"
     ),
     yes: bool = typer.Option(
         False, "--yes", help="Confirm without prompting (required when non-interactive)"
@@ -3090,6 +4327,155 @@ def ollama_apply(
             await client.close()
 
     asyncio.run(_apply())
+
+
+@app.command(name="ollama-probe")
+def ollama_probe(
+    model: str = typer.Argument(..., help="Ollama model tag to exercise"),
+    ctx: int = typer.Option(8192, "--ctx", help="Second num_ctx timing rung (first is 2048)"),
+    keep_loaded: bool = typer.Option(
+        False, "--keep-loaded", help="Skip the final unload verification step"
+    ),
+    base_url: str | None = typer.Option(
+        None, "--base-url", help="Ollama URL (default http://127.0.0.1:11434)"
+    ),
+):
+    """Endpoint control matrix for one Ollama model (no optimization).
+
+    Connect, list/show details, tiny generate (one automatic think-on
+    retry when the model spends tokens but answers empty), a num_ctx
+    timing pair, and unload verification. Prints a step table.
+    """
+    from lm_optimizer.backends.ollama.client import OLLAMA_DEFAULT_URL, OllamaClient
+    from lm_optimizer.backends.ollama.probe import probe_model
+
+    setup_logging()
+
+    async def _probe():
+        client = OllamaClient(base_url=base_url or OLLAMA_DEFAULT_URL)
+        try:
+            report = await probe_model(client, model, ctx_pair=(2048, ctx))
+            if keep_loaded:
+                report["steps"]["unload_verify"] = {"ok": True, "skipped": True}
+            return report
+        finally:
+            await client.close()
+
+    try:
+        report = asyncio.run(_probe())
+    except Exception as e:
+        logger.exception("Ollama probe failed")
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
+
+    table = Table(title=f"Ollama endpoint probe: {model}")
+    table.add_column("Step", style="cyan")
+    table.add_column("Result", style="green")
+
+    def _add_step(name: str, step) -> None:
+        if not isinstance(step, dict):
+            table.add_row(name, str(step))
+            return
+        if step.get("ok"):
+            detail = step.get("text") or step.get("version") or ""
+            if "gen_tok_s" in step:
+                detail = f"{step.get('text', '')!r} {step.get('gen_tok_s')} tok/s"
+            table.add_row(name, f"OK {detail}".strip())
+        elif step.get("skipped"):
+            table.add_row(name, "[dim]skipped[/dim]")
+        else:
+            table.add_row(name, f"[red]FAIL: {step.get('error', '?')}[/red]")
+
+    for name, step in report.get("steps", {}).items():
+        if name == "ctx_timings" and isinstance(step, dict):
+            for ctx_len, timing in step.items():
+                _add_step(f"ctx {ctx_len}", timing)
+        else:
+            _add_step(name, step)
+    console.print(table)
+
+
+@app.command(name="deepresearch-bench")
+def deepresearch_bench(
+    model: str = typer.Argument(..., help="Model name to evaluate (must be available in LM Studio)"),
+    dr_bench_dir: Path = typer.Option(
+        Path("deep_research_bench"), "--dr-bench-dir", help="Path to DeepResearch Bench repository"
+    ),
+    limit: int | None = typer.Option(None, "--limit", help="Limit number of queries to process (for testing)"),
+    skip_cleaning: bool = typer.Option(False, "--skip-cleaning", help="Skip article cleaning step"),
+    only_zh: bool = typer.Option(False, "--only-zh", help="Only process Chinese queries"),
+    only_en: bool = typer.Option(False, "--only-en", help="Only process English queries"),
+    force: bool = typer.Option(False, "--force", help="Force re-evaluation even if results exist"),
+    max_workers: int = typer.Option(5, "--max-workers", help="Maximum number of worker threads"),
+    openrouter_api_key: str | None = typer.Option(None, "--openrouter-api-key", help="OpenRouter API key"),
+    openai_api_key: str | None = typer.Option(None, "--openai-api-key", help="OpenAI API key"),
+    jina_api_key: str | None = typer.Option(None, "--jina-api-key", help="Jina API key for web scraping"),
+    llm_backend: str = typer.Option("openrouter", "--llm-backend", help="LLM backend: openrouter or openai"),
+    race_model: str = typer.Option("openai/gpt-5.5", "--race-model", help="Model for RACE evaluation"),
+    clean_model: str = typer.Option("openai/gpt-5.6-luna", "--clean-model", help="Model for article cleaning"),
+    fact_model: str = typer.Option("openai/gpt-5.4-mini", "--fact-model", help="Model for FACT evaluation"),
+    base_url: str | None = typer.Option(None, "--base-url", help="LM Studio base URL (default from config)"),
+) -> None:
+    """Run DeepResearch Bench evaluation on a local LM Studio model.
+
+    This command runs the complete DeepResearch Bench pipeline:
+    1. Clones/updates the DeepResearch Bench repository
+    2. Installs requirements
+    3. Runs the local model on 100 PhD-level research queries
+    4. Runs RACE evaluation (report quality)
+    5. Runs FACT evaluation (citation accuracy)
+
+    Results are saved to deep_research_bench/results/
+    """
+    from lm_optimizer.services.deepresearch import DeepResearchConfig, run_deepresearch_benchmark, print_results_summary
+    from lm_optimizer.config import config as global_config
+
+    setup_logging()
+
+    # Use provided base_url or fall back to config
+    lm_studio_url = base_url or global_config.lmstudio_base_url or "http://127.0.0.1:1234"
+
+    console.print("[cyan]DeepResearch Bench Evaluation[/cyan]")
+    console.print(f"  Model: {model}")
+    console.print(f"  LM Studio: {lm_studio_url}")
+    console.print(f"  DR Bench Dir: {dr_bench_dir}")
+
+    # API keys: explicit CLI flags win, env vars are the fallback
+    # (avoids leaking secrets via shell history when possible).
+    # Build config
+    dr_config = DeepResearchConfig(
+        model_name=model,
+        dr_bench_dir=dr_bench_dir,
+        limit=limit,
+        skip_cleaning=skip_cleaning,
+        only_zh=only_zh,
+        only_en=only_en,
+        force=force,
+        max_workers=max_workers,
+        openrouter_api_key=openrouter_api_key or os.environ.get("OPENROUTER_API_KEY"),
+        openai_api_key=openai_api_key or os.environ.get("OPENAI_API_KEY"),
+        jina_api_key=jina_api_key or os.environ.get("JINA_API_KEY"),
+        llm_backend=llm_backend,
+        race_model=race_model,
+        clean_model=clean_model,
+        fact_model=fact_model,
+    )
+
+    try:
+        success = asyncio.run(run_deepresearch_benchmark(dr_config, lm_studio_url))
+        if success:
+            print_results_summary(dr_config)
+            console.print("[green]DeepResearch Bench evaluation completed successfully![/green]")
+        else:
+            console.print("[red]DeepResearch Bench evaluation failed![/red]")
+            sys.exit(1)
+    except KeyboardInterrupt:
+        console.print("[yellow]Evaluation interrupted by user[/yellow]")
+        sys.exit(1)
+    except Exception as e:
+        logger.exception("DeepResearch Bench evaluation failed")
+        console.print(f"[red]Error: {e}[/red]")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

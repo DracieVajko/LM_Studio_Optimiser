@@ -5,10 +5,10 @@ Finds empirically validated inference configurations for your hardware, model an
 not theoretical optima. Includes a model-vs-model sandbox (text / HTML / 3D-scene duels),
 transparent results with per-test outputs, and a dark-mode web UI.
 
-**Status: v1.1.0 working.** Speed-first search (cheap probes → quality validation on
-finalists → bounded causal recovery → adaptive validation), sandbox duels with history,
-Prompt/Thinking/Output transparency, OS-following dark mode, resilient Web UI.
-408 automated tests green, E2E-validated on a live server + live LM Studio.
+**Status: v1.5.2.** Pause/resume for partial successes (Web UI + CLI), AI-assisted model selection,
+speed-first search (cheap probes → quality validation on finalists → bounded causal recovery → adaptive validation),
+sandbox duels with history, Prompt/Thinking/Output transparency, OS-following dark mode, resilient Web UI.
+543 automated tests green, E2E-validated on a live server + live LM Studio.
 
 | Platform | Status |
 |-|-|
@@ -124,14 +124,16 @@ python -m pytest -q
 |`compare <model> --config-a A --config-b B [--tests T]`|A/B configs on the same tests|yes|
 |`auto [models] [--skip X,Y]`|smoke → precision → ladder → matrix → optimize|yes|
 |`fit [models]`|max-context ladder per KV path|yes|
-|`ctx <model>`|geometric context sweep + bisect|yes|
-|`pause <id>` / `resume <id>` / `run-status`|graceful pause + resume under same ID|no|
+|`ctx <model> [--quality-rungs N]`|geometric context sweep + bisect (+ full quality suites)|yes|
+|`pause <id>` / `resume <id> [--skip-phases]` / `run-status`|graceful pause + resume under same ID|no|
 |`checkpoints`|list interrupt checkpoints|no|
 |`param-matrix [--record]`|parameter control matrix (+ DB snapshot)|no|
 |`apply / restore / presets / runs`|presets and history management|apply/restore yes|
 |`cleanup_test_runs`|remove test runs|no|
 |`python hw_monitor.py [--model M]`|VRAM/RAM/swap snapshot; optional tok/s probe|only with `--model`|
 |`python vram_matrix.py <model>`|12-config ctx×flash×KV fit/speed matrix|yes|
+|`resume-menu [--status] [--limit]`|interactive menu to resume paused/incomplete runs|no|
+|`judge <run_id> [--priority] [--vram-limit]`|AI-assisted model selection (second opinion)|no|
 
 Benchmark styles: `precise` (code/math temp 0.1), `balanced` (suite defaults),
 `creative` (summarization temp 0.9). Every command first unloads stale models and
@@ -149,6 +151,73 @@ charts, per-test Prompt/Thinking/Output, full JSON page), **Sandbox** (text/HTML
 duels with presets), **Settings**. API under single `/api` prefix + websocket progress.
 Dark mode follows the OS (toggle in nav). Read endpoints are load-free and degrade
 gracefully when LM Studio is down.
+
+**Pause/Resume (v1.5.2):** Running and paused runs show **Pause** / **Resume** buttons
+on the Results page. History page has **Resume All Pending** to bulk-resume paused runs.
+API: `POST /api/runs/{run_id}/pause` and `POST /api/runs/{run_id}/resume`.
+Resume from checkpoint skips already-completed candidates (no re-runs).
+
+## CLI Pause/Resume Menu (v1.5.2)
+
+```bash
+lm-optimizer resume-menu                    # interactive selection
+lm-optimizer resume-menu --status paused    # filter by status
+lm-optimizer checkpoints                    # list all checkpoints
+lm-optimizer resume <run-id>                # direct resume (existing)
+```
+
+The `resume-menu` shows runs in `running`, `paused`, `resumed`, `partial_success` states
+with progress info (completed configs, stage, VRAM). Select by number to resume.
+
+## AI Model Judge (v1.5.2) — Second Opinion
+
+```bash
+lm-optimizer judge <run_id> --priority balanced --vram-limit 6
+lm-optimizer judge <run_id> --priority speed --use-case coding
+lm-optimizer judge <run_id> --backend heuristic  # default, no AI needed
+```
+
+**User decides first.** The judge provides analysis to help you choose:
+- Heuristic backend (default): rule-based, fast, no external dependencies
+- Local backend: uses a local model via LM Studio/Ollama (planned)
+- API backend: uses external API like OpenRouter (planned)
+
+Outputs: recommended config, reasoning, confidence, pros/cons, alternatives, VRAM warnings.
+
+## Phase Skips, Fast Tests & Full Reports (v1.6.0)
+
+**Skip phases** (CLI, API i GUI Dashboard): `speed,quality,recovery,validation,context`.
+
+```bash
+lm-optimizer optimize <model> --skip-phases recovery,validation
+lm-optimizer auto --skip-phases context --skip a,b
+lm-optimizer resume <run-id> --skip-phases quality   # finish the rest faster
+lm-optimizer resume-menu --all                       # finish every pending run
+```
+
+Skips are stored on the run, so `resume` keeps them. Skipping `quality`
+means no winner path (run ends without best config); skipping `context`
+forces Phase B off. GUI: Dashboard → Advanced → Skip phases checkboxes
+(same names); History → Resume All Pending finishes `paused`,
+`partial_success` and `interrupted` runs.
+
+**Faster tests.** `--warmup-runs 0-5` (default 1) on `optimize` / `auto` /
+`ctx` — `0` skips the warmup suite pass per config (~15–20% faster quality
+suites, slightly noisier first measurements). GUI: Advanced → Warmup runs.
+
+**Full context + quality.** `ctx <model> --quality-rungs N
+--quality-threshold 0.97` runs full quality suites on the top-N stable
+ladder rungs (ctx, tok/s, quality, checks, VRAM, TTFT, PASS/FAIL table).
+
+**Richer best reports.** Tested-configs table now shows run order `#`,
+prompt tok/s, TTFT, VRAM per row; `--report-sort run|speed|quality`
+(`optimize` / `auto`) reorders it. Report layout: Results first, then
+best config, HW details, test details, tried configs, methodology last.
+
+**Wider grid.** `--physical-batches 256,512,1024` adds a real search
+dimension (`optimize` / `auto`). RoPE stays opt-in (`--enable-rope`);
+temperatures are covered by `--style` (precise/balanced/creative),
+`sample-sweep` and the auto precision probe.
 
 ## How it works (Phase-A strategy)
 
@@ -200,6 +269,21 @@ compared on every load (mismatches recorded, never silent).
 Details: `docs/PARAMETERS.md`, generated `docs/LM_STUDIO_PARAMETER_MATRIX.md`
 (`scripts/generate_parameter_matrix.py`), `lm_optimizer/services/parameter_registry.py`.
 
+## Backends (Ollama beta)
+
+Global switch (default unchanged, LM Studio path byte-identical):
+
+```bash
+python -m lm_optimizer --backend lm-studio status     # default
+python -m lm_optimizer --backend ollama models        # Ollama sweep client (beta)
+python -m lm_optimizer ollama-export --model <tag> --param num_ctx=4096 -o best.modelfile.md
+python -m lm_optimizer ollama-apply --file best.modelfile.md --as <tag>:opt --yes
+```
+
+Ollama is beta: mocked-test evidence only, no live-server verification yet;
+llama.cpp is an explicit phase-2 stub. Live checklist: `docs/OLLAMA_LIVE_CHECK.md`.
+Design: `docs/specs/2026-10-02-multi-backend-design.md`.
+
 ## Hardware notes
 
 * Designed hardware-agnostic (no hardcoded GPU): NVIDIA/CPU paths, ASCII output,
@@ -212,7 +296,7 @@ CPU-only paths are coded and unit-tested, not physically exercised.
 
 ```bash
 pip install -e ".[dev]"
-python -m pytest -q                       # 408 tests
+python -m pytest -q                       # 513 tests
 python scripts/generate_parameter_matrix.py
 ```
 
@@ -221,6 +305,7 @@ python scripts/generate_parameter_matrix.py
 ```
 lm_optimizer/
   api/          FastAPI app, routes (single /api prefix), schemas, websocket
+  backends/     BackendClient seam + ollama/ client, registry, modelfile (llama-cpp: phase-2 stub)
   benchmark/    suite (5 fixed tests) + runner (native chat)
   cli/          commands (status..param-matrix, incl. compare/pause/ctx/resume)
   database/     SQLite + migrations (runs, duels, capability snapshots)

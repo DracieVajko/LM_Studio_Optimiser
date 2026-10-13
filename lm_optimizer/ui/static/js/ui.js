@@ -332,6 +332,8 @@ export const UI = {
                         Quality: full 5-test suite on finalists only, then bounded recovery<br>
                         Validation: adaptive (2–5 reps by stability)<br>
                         Phase B max-context: ${advanced.optimize_context ? 'ON (opt-in)' : 'OFF'}<br>
+                        ${(advanced.skip_phases && advanced.skip_phases.length)
+                            ? `Skipped phases: ${advanced.skip_phases.join(', ')}<br>` : ''}
                     </div>
                     <div><span class="text-gray-500">Estimated probes</span><br><span class="font-mono font-medium">${est}</span></div>
                     <div><span class="text-gray-500">Speed repetitions</span> adaptive by model speed &nbsp; <span class="text-gray-500">Validation</span> 2–5</div>
@@ -407,9 +409,40 @@ export const UI = {
                     <label for="auto-batch">Auto optimize eval batch size (64-1024)</label>
                 </div>
 
+                <div>
+                    <label class="form-label">Warmup suite passes per config (0-5, 0 = fastest)</label>
+                    <input type="number" id="warmup-runs" value="1" class="form-input" min="0" max="5">
+                </div>
+
                 <div class="form-checkbox">
                     <input type="checkbox" id="optimize-context" class="form-checkbox-input advanced-toggle">
                     <label for="optimize-context">Optimize Maximum Context (Phase B, optional — runs after the runtime winner is final, runtime settings stay frozen)</label>
+                </div>
+
+                <div>
+                    <label class="form-label">Skip phases (unchecked phases run normally)</label>
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mt-2">
+                        <div class="form-checkbox">
+                            <input type="checkbox" id="skip-speed" class="form-checkbox-input">
+                            <label for="skip-speed">Skip SPEED discovery</label>
+                        </div>
+                        <div class="form-checkbox">
+                            <input type="checkbox" id="skip-quality" class="form-checkbox-input">
+                            <label for="skip-quality">Skip QUALITY suites (no winner path)</label>
+                        </div>
+                        <div class="form-checkbox">
+                            <input type="checkbox" id="skip-recovery" class="form-checkbox-input">
+                            <label for="skip-recovery">Skip RECOVERY rollback</label>
+                        </div>
+                        <div class="form-checkbox">
+                            <input type="checkbox" id="skip-validation" class="form-checkbox-input">
+                            <label for="skip-validation">Skip FINAL VALIDATION</label>
+                        </div>
+                        <div class="form-checkbox">
+                            <input type="checkbox" id="skip-context" class="form-checkbox-input">
+                            <label for="skip-context">Skip CONTEXT phase (Phase B off)</label>
+                        </div>
+                    </div>
                 </div>
             </div>
         `;

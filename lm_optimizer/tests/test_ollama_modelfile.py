@@ -46,9 +46,18 @@ def test_parse_ignores_blanks_and_comments():
     assert parse_modelfile(text) == {"from": "qwen3:8b", "num_ctx": 8192}
 
 
-def test_default_tag_appends_opt():
-    assert default_tag_for("qwen3:8b") == "qwen3:opt"
-    assert default_tag_for("qwen3") == "qwen3:opt"
+def test_default_tag_appends_best():
+    assert default_tag_for("qwen3:8b") == "qwen3:8b-best"
+    assert default_tag_for("qwen3") == "qwen3-best"
+
+
+def test_parse_show_parameters():
+    from lm_optimizer.backends.ollama.modelfile import parse_show_parameters
+
+    show = {"parameters": "num_ctx 8192\ntemperature 0.7\n# comment\nbadline\n"}
+    assert parse_show_parameters(show) == {"num_ctx": 8192, "temperature": 0.7}
+    assert parse_show_parameters({}) == {}
+    assert parse_show_parameters({"parameters": 123}) == {}
 
 
 TAGS_EMPTY = {"models": []}
@@ -169,3 +178,19 @@ def test_cli_export_writes_file(tmp_path):
         "num_ctx": 8192,
         "temperature": 0.7,
     }
+
+
+def test_cli_export_bare_filename_lands_in_ollama_configs(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+
+    from lm_optimizer.cli.main import app
+
+    monkeypatch.chdir(tmp_path)
+    result = CliRunner().invoke(
+        app,
+        ["ollama-export", "--model", "qwen3:8b", "--output", "qwen3-best.modelfile.md"],
+    )
+    assert result.exit_code == 0, result.output
+    out = tmp_path / "ollama-configs" / "qwen3-best.modelfile.md"
+    assert out.exists()
+    assert parse_modelfile(out.read_text(encoding="utf-8")) == {"from": "qwen3:8b"}

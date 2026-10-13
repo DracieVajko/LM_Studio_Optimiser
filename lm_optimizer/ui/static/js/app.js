@@ -394,6 +394,8 @@ const App = {
     },
 
     getAdvancedSettings() {
+        const skip_phases = ['speed', 'quality', 'recovery', 'validation', 'context']
+            .filter((phase) => document.getElementById(`skip-${phase}`)?.checked === true);
         return {
             min_context: parseInt(document.getElementById('min-context')?.value || '2048'),
             max_context: parseInt(document.getElementById('max-context')?.value || '32768'),
@@ -405,6 +407,9 @@ const App = {
             test_kv_cpu: document.getElementById('test-kv-cpu')?.checked !== false,
             auto_batch: document.getElementById('auto-batch')?.checked !== false,
             optimize_context: document.getElementById('optimize-context')?.checked === true,
+            skip_phases,
+            warmup_runs: Math.min(5, Math.max(0,
+                parseInt(document.getElementById('warmup-runs')?.value || '1', 10) || 0)),
         };
     },
 

@@ -5,6 +5,8 @@ stale loaded model, and the run records how much VRAM/RAM/swap is free.
 All explanations are predefined (no AI needed at runtime).
 """
 
+import asyncio
+import inspect
 import json
 import platform
 import subprocess
@@ -172,13 +174,177 @@ def _query_pagefile(_query: str) -> str:
     return ""
 
 
-async def prepare_host(client, purpose: str = "") -> dict[str, Any]:
-    """Preventive safety: unload everything, snapshot free resources, verify empty.
+class HostBusyTimeout(Exception):
+    """Raised when a foreign model never leaves the endpoint.
 
-    Returns {gpus, mem, unloaded, verified_empty}. Never raises for monitor
-    failures (records them); raises only if stale models cannot be evicted.
+    Carries .blocker: model ids still loaded when the wait budget ran out
+    (empty when the endpoint state itself was unverifiable).
+    """
+
+    def __init__(self, message: str = "", blocker=None):
+        super().__init__(message)
+        if blocker is None:
+            self.blocker = []
+        elif isinstance(blocker, str):
+            self.blocker = [blocker]
+        else:
+            self.blocker = list(blocker)
+
+
+class HostUnreachableError(Exception):
+    """Raised when the endpoint cannot be reached at all (LM Studio down).
+
+    Carries .cause: the underlying transport error. Callers must show the
+    friendly connection message for this, never the busy/timeout message.
+    """
+
+    def __init__(self, message: str = "", cause=None):
+        super().__init__(message)
+        self.cause = cause
+
+
+try:  # httpx is a hard dependency; fallback keeps guard importable regardless
+    import httpx as _httpx
+
+    _TRANSPORT_ERRORS: tuple = (_httpx.TransportError,)
+except Exception:
+    _TRANSPORT_ERRORS = ()
+
+_CONNECTION_ERRORS = _TRANSPORT_ERRORS + (ConnectionError, TimeoutError)
+
+
+def is_connection_error(exc: BaseException) -> bool:
+    """True when exc means unreachable backend (not a busy host).
+
+    Covers httpx transport failures (connect/read timeouts, refused
+    connections, remote protocol errors) and builtin socket errors. HTTP
+    error statuses are NOT connection errors: the server answered, so an
+    unverifiable state stays fail-closed busy, never a friendly retry hint.
+    """
+    return isinstance(exc, _CONNECTION_ERRORS)
+
+
+async def ensure_exclusive_access(client, purpose: str = "",
+                                  wait_interval_s: float = 60.0,
+                                  max_waits: int = 30) -> dict[str, Any]:
+    """Wait until the endpoint holds no loaded model; evict foreigners first.
+
+    Lists loaded instances; empty means immediate return. Otherwise each
+    blocker model is evicted via client.ensure_unloaded (unload_all
+    fallback) and the endpoint is re-checked right away -- a successful
+    unload never sleeps through wait_interval_s. Only a still-loaded
+    endpoint sleeps, at most max_waits times.
+
+    Returns {free: True, waited_s, attempts}. Raises HostBusyTimeout with
+    .blocker model ids after exhausting waits, or when the endpoint state
+    cannot be verified at all (fail-closed: never measure blind).
+
+    Test doubles with no loadable endpoint opt out explicitly via
+    client._skip_exclusive_check = True (checked with `is True` so plain
+    MagicMock auto-attributes never opt out by accident).
+    """
+    started = time.monotonic()
+    skip = getattr(client, "_skip_exclusive_check", False) is True
+    list_fn = getattr(client, "get_loaded_instances", None)
+    if list_fn is None or not inspect.iscoroutinefunction(list_fn):
+        if skip:
+            logger.debug("Exclusive-access guard skipped (explicit opt-out)",
+                         purpose=purpose)
+            return {"free": True, "waited_s": 0.0, "attempts": 0}
+        raise HostBusyTimeout(
+            f"Host busy check failed before {purpose or 'load'}: "
+            "unverifiable: no instance listing.",
+            blocker="unverifiable: no instance listing",
+        )
+
+    async def _loaded() -> list | None:
+        try:
+            instances = await client.get_loaded_instances()
+        except Exception as e:
+            if is_connection_error(e):
+                raise HostUnreachableError(
+                    f"Host unreachable before {purpose or 'load'}: "
+                    f"{type(e).__name__}: {str(e)[:160]}.",
+                    cause=e,
+                ) from e
+            raise HostBusyTimeout(
+                f"Host busy check failed before {purpose or 'load'}: "
+                f"endpoint state unverifiable ({str(e)[:160]}).",
+                blocker=[],
+            ) from e
+        if not isinstance(instances, list):
+            if skip:
+                logger.debug("Exclusive-access guard skipped (non-list state)",
+                             purpose=purpose)
+                return None
+            raise HostBusyTimeout(
+                f"Host busy check failed before {purpose or 'load'}: "
+                "unverifiable: non-list instance state.",
+                blocker="unverifiable: non-list instance state",
+            )
+        return [i for i in instances if isinstance(i, dict) and i.get("instance_id")]
+
+    async def _evict(blockers: list) -> None:
+        unload_fn = getattr(client, "ensure_unloaded", None)
+        if unload_fn is not None and inspect.iscoroutinefunction(unload_fn):
+            for inst in blockers:
+                try:
+                    await client.ensure_unloaded(inst.get("model"))
+                except Exception as e:
+                    logger.warning("Evict attempt failed", purpose=purpose,
+                                   model=inst.get("model"), error=str(e)[:160])
+        else:
+            try:
+                await client.unload_all()
+            except Exception as e:
+                logger.warning("Evict unload_all failed", purpose=purpose,
+                               error=str(e)[:160])
+
+    attempts = 0
+    waits_used = 0
+    while True:
+        blockers = await _loaded()
+        attempts += 1
+        if not blockers:
+            return {"free": True, "waited_s": time.monotonic() - started,
+                    "attempts": attempts}
+        await _evict(blockers)
+        # Re-check right after the unload; never sleep through a success.
+        blockers = await _loaded()
+        attempts += 1
+        if not blockers:
+            return {"free": True, "waited_s": time.monotonic() - started,
+                    "attempts": attempts}
+        if waits_used >= max_waits:
+            ids = [i.get("model") for i in blockers]
+            raise HostBusyTimeout(
+                f"Host busy before {purpose or 'load'}: still loaded after "
+                f"{waits_used} waits: {', '.join(str(m) for m in ids)}. "
+                "Unload the model in LM Studio and retry.",
+                blocker=ids,
+            )
+        await asyncio.sleep(wait_interval_s)
+        waits_used += 1
+
+
+async def prepare_host(
+    client, purpose: str = "",
+    wait_interval_s: float = 60.0, max_waits: int = 30,
+) -> dict[str, Any]:
+    """Preventive safety: exclusive access, unload, snapshot, verify empty.
+
+    The exclusive-access guard runs first (wait-loop evicting foreign
+    models): a persistently busy host raises HostBusyTimeout, an unreachable
+    endpoint raises HostUnreachableError (friendly message upstream, never
+    the busy text). On an empty host the snapshot/verify semantics are
+    unchanged. Never raises for monitor failures (records them).
     """
     tag = f" [{purpose}]" if purpose else ""
+    guard = await ensure_exclusive_access(
+        client, purpose or "prepare_host",
+        wait_interval_s=wait_interval_s, max_waits=max_waits,
+    )
+    logger.debug("Exclusive access granted" + tag, guard=guard)
     try:
         await client.unload_all()
     except Exception as e:

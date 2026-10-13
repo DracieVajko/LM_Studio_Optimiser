@@ -425,6 +425,74 @@ class TestPerTestSection:
         assert result.generation["quality_by_test"]["t"]["checks_total"] == 6
 
 
+class TestReportOrderAndSort:
+    def _report(self, tmp_path, configs, **kw):
+        from lm_optimizer.services.reporting import save_best_report
+
+        cfgs = []
+        for i, (ctx, gen, score, qual) in enumerate(configs):
+            c = _result(ctx=ctx, gen=gen, score=score)
+            c.quality_score = _qs(overall=qual)
+            cfgs.append(c)
+        run, _ = _run(cfgs)
+        return save_best_report(run, out_dir=tmp_path, **kw).read_text(encoding="utf-8")
+
+    def test_results_block_first(self, tmp_path):
+        text = self._report(tmp_path, [(16384, 30.0, 0.7, 1.0)])
+        assert text.index("## Results") < text.index("## Model identity")
+        assert text.index("## Results") < text.index("## Host")
+        first_block = text.split("## Results")[1].split("## ")[0]
+        assert "tok/s" in first_block
+        assert "16384" in first_block
+
+    def test_hw_before_test_details(self, tmp_path):
+        text = self._report(tmp_path, [(16384, 30.0, 0.7, 1.0)])
+        assert text.index("## Host") < text.index("## Winner: every test explicitly")
+        assert text.index("## Host") < text.index("## Tested configurations")
+
+    def test_tested_table_enriched_columns(self, tmp_path):
+        text = self._report(tmp_path, [(16384, 30.0, 0.7, 1.0)])
+        header = [l for l in text.splitlines() if l.startswith("| # |")][0]
+        for col in ("prompt tok/s", "TTFT", "VRAM", "gen tok/s", "quality", "score"):
+            assert col in header, header
+
+    def test_sort_run_order_default(self, tmp_path):
+        text = self._report(
+            tmp_path,
+            [(8192, 20.0, 0.5, 0.9), (16384, 30.0, 0.7, 1.0), (4096, 10.0, 0.4, 0.8)],
+        )
+        rows = [l for l in text.splitlines() if l.startswith("| 1 |") or l.startswith("| 2 |") or l.startswith("| 3 |")]
+        assert rows[0].startswith("| 1 | 8192")
+        assert rows[1].startswith("| 2 | 16384")
+        assert rows[2].startswith("| 3 | 4096")
+
+    def test_sort_speed_desc(self, tmp_path):
+        text = self._report(
+            tmp_path,
+            [(8192, 20.0, 0.5, 0.9), (16384, 30.0, 0.7, 1.0), (4096, 10.0, 0.4, 0.8)],
+            sort="speed",
+        )
+        rows = [l for l in text.splitlines() if l.startswith("| 1 |") or l.startswith("| 2 |") or l.startswith("| 3 |")]
+        assert "| 16384" in rows[0] and "30.0" in rows[0]
+        assert "| 8192" in rows[1]
+        assert "| 4096" in rows[2]
+
+    def test_sort_quality_desc(self, tmp_path):
+        text = self._report(
+            tmp_path,
+            [(8192, 20.0, 0.9, 0.8), (16384, 30.0, 0.5, 1.0), (4096, 10.0, 0.7, 0.9)],
+            sort="quality",
+        )
+        rows = [l for l in text.splitlines() if l.startswith("| 1 |") or l.startswith("| 2 |") or l.startswith("| 3 |")]
+        assert "| 16384" in rows[0]
+        assert "| 4096" in rows[1]
+        assert "| 8192" in rows[2]
+
+    def test_sort_invalid_falls_back_to_run_order(self, tmp_path):
+        text = self._report(tmp_path, [(8192, 20.0, 0.5, 0.9)], sort="bogus")
+        assert any(l.startswith("| 1 | 8192") for l in text.splitlines())
+
+
 class TestManualDuelNotes:
     def test_prune_notes_mention_manual_duel(self):
         from lm_optimizer.services.reporting import _prune_notes

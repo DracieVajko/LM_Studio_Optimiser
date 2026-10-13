@@ -249,6 +249,7 @@ const ResultsPage = {
                         </div>
                     </div>
                     <div class="flex gap-2">
+                        ${this.renderPauseResumeButtons(run.status)}
                         <button id="apply-best-btn" class="btn btn-success">
                             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path>
@@ -301,6 +302,33 @@ const ResultsPage = {
             <div class="text-sm"><span class="text-gray-500">Quality-safe winner:</span> <span class="font-mono">${bestConfig?.context_length} ctx, ${tok(bestConfig)}</span></div>
             ${pb ? `<div class="text-sm mt-1"><span class="text-gray-500">Phase B:</span> <span class="font-mono">GPU-only ${pb.gpu_only_max ?? '—'} / system ${pb.system_max ?? '—'} / final ${pb.final_capacity ?? '—'}</span></div>` : ''}
         </div>`;
+    },
+
+    renderPauseResumeButtons(status) {
+        const isRunning = ['running', 'resumed'].includes(status);
+        const isPaused = status === 'paused';
+        if (!isRunning && !isPaused) return '';
+        
+        if (isRunning) {
+            return `
+                <button id="pause-run-btn" class="btn btn-warning" title="Pause at next safe boundary">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 9v6m4-6v6m7-3a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                    </svg>
+                    Pause
+                </button>`;
+        }
+        if (isPaused) {
+            return `
+                <button id="resume-run-btn" class="btn btn-success" title="Resume from checkpoint">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"></path>
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                    </svg>
+                    Resume
+                </button>`;
+        }
+        return '';
     },
 
     renderAlternatives(best) {
@@ -606,6 +634,16 @@ const ResultsPage = {
             btn.addEventListener('click', () => this.switchChart(btn.dataset.chart));
         });
 
+        // Pause/Resume buttons
+        const pauseBtn = document.getElementById('pause-run-btn');
+        if (pauseBtn) {
+            pauseBtn.addEventListener('click', () => this.pauseRun());
+        }
+        const resumeBtn = document.getElementById('resume-run-btn');
+        if (resumeBtn) {
+            resumeBtn.addEventListener('click', () => this.resumeRun());
+        }
+
         // Apply best config
         const applyBtn = document.getElementById('apply-best-btn');
         if (applyBtn) {
@@ -899,6 +937,40 @@ const ResultsPage = {
             UI.showToast('Results exported', 'success');
         } catch (error) {
             UI.showToast('Export failed', 'error');
+        }
+    },
+
+    async pauseRun() {
+        const btn = document.getElementById('pause-run-btn');
+        if (btn) btn.disabled = true;
+        UI.showLoading('Requesting pause...');
+        try {
+            const result = await API.pauseRun(this.state.runId);
+            UI.hideLoading();
+            UI.showToast(result.message || 'Pause requested — will take effect at next safe boundary', 'success');
+            // Reload run to show updated status
+            setTimeout(() => window.location.reload(), 1000);
+        } catch (error) {
+            UI.hideLoading();
+            UI.showToast(error.message || 'Pause failed', 'error');
+            if (btn) btn.disabled = false;
+        }
+    },
+
+    async resumeRun() {
+        const btn = document.getElementById('resume-run-btn');
+        if (btn) btn.disabled = true;
+        UI.showLoading('Resuming from checkpoint...');
+        try {
+            const result = await API.resumeRunFromCheckpoint(this.state.runId);
+            UI.hideLoading();
+            UI.showToast(`Resumed — ${result.completed || 0} configurations already completed`, 'success');
+            // Reload to show live progress
+            setTimeout(() => window.location.reload(), 1500);
+        } catch (error) {
+            UI.hideLoading();
+            UI.showToast(error.message || 'Resume failed', 'error');
+            if (btn) btn.disabled = false;
         }
     },
 
