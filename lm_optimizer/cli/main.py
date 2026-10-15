@@ -421,44 +421,73 @@ def _optimize_advanced(
 EXPERIMENTAL_PROMPT = "Test experimental features? (RoPE / CPU-MoE / Speculative)"
 
 
+def _ask_experimental(question: str) -> bool:
+    """Single experimental opt-in question; never raises, never blocks CI.
+
+    EOF / closed stdin / non-TTY exceptions resolve to OFF (False).
+    """
+    try:
+        return bool(typer.confirm(question, default=False))
+    except Exception:
+        return False
+
+
 def _prompt_experimental_optins() -> dict:
     """Interactive experimental opt-in (default: all off). Never raises."""
-    from lm_optimizer.services.optimizer import parse_experimental_flags
+    from lm_optimizer.services.optimizer import resolve_experimental_optins
 
-    try:
-        rope = typer.confirm("Enable RoPE (rotary position embedding) probes?", default=False)
-    except Exception:
-        rope = False
-    try:
-        cpu_moe = typer.confirm("Enable CPU-MoE (Mixture of Experts) probes?", default=False)
-    except Exception:
-        cpu_moe = False
-    try:
-        speculative = typer.confirm("Enable Speculative decoding probes?", default=False)
-    except Exception:
-        speculative = False
-    return parse_experimental_flags(rope, cpu_moe, speculative)
+    return resolve_experimental_optins(
+        {"enable_rope": None, "enable_cpu_moe": None, "enable_speculative": None},
+        ask=_ask_experimental,
+    )
+
+
+def _reject_bool_like_model_args(models: list[str] | None) -> None:
+    """Fail fast when a boolean literal leaked into model selection.
+
+    `bool` Typer flags never consume a value, so `--enable-rope False`
+    parses as flag ON plus a positional model literally named "False".
+    That must be a usage error (exit 2), never a model lookup.
+    """
+    for mid in models or []:
+        if str(mid).strip().lower() in ("true", "false"):
+            console.print(
+                f"[red]Invalid model {mid!r}: boolean flags do not take values. "
+                "Use --enable-rope/--no-enable-rope (and equivalents) instead of "
+                "'True'/'False' arguments.[/red]"
+            )
+            sys.exit(2)
 
 
 def _resolve_experimental_flags(
-    enable_rope: bool, enable_cpu_moe: bool, enable_speculative: bool
+    enable_rope: bool | None,
+    enable_cpu_moe: bool | None,
+    enable_speculative: bool | None,
+    non_interactive: bool = False,
 ) -> dict:
     """Merge CLI flags with the interactive opt-in prompt.
 
-    Explicit CLI flags win; the prompt appears only when no flag was given
-    and stdin is interactive. Defaults stay OFF everywhere.
+    Explicit CLI flags (True or False) always win and are never re-prompted.
+    Unspecified (None) flags are asked one by one only on an interactive
+    terminal; everywhere else (`--yes`, `--non-interactive`, pipes, EOF)
+    they resolve to OFF. Defaults stay OFF everywhere.
     """
-    from lm_optimizer.services.optimizer import parse_experimental_flags
+    from lm_optimizer.services.optimizer import resolve_experimental_optins
 
-    flags = parse_experimental_flags(enable_rope, enable_cpu_moe, enable_speculative)
-    if not any(flags.values()):
-        try:
-            interactive = sys.stdin.isatty()
-        except Exception:
-            interactive = False
-        if interactive:
-            flags = _prompt_experimental_optins()
-    return flags
+    requested = {
+        "enable_rope": enable_rope,
+        "enable_cpu_moe": enable_cpu_moe,
+        "enable_speculative": enable_speculative,
+    }
+    if non_interactive or all(v is not None for v in requested.values()):
+        return resolve_experimental_optins(requested, ask=None)
+    try:
+        interactive = sys.stdin.isatty()
+    except Exception:
+        interactive = False
+    if not interactive:
+        return resolve_experimental_optins(requested, ask=None)
+    return resolve_experimental_optins(requested, ask=_ask_experimental)
 
 
 def _phase_transparency_table(run, best):
@@ -598,25 +627,33 @@ def _save_preset_and_report(
         if moe:
             extra = dict(extra or {})
             extra.setdefault("MoE experts (num_experts)", "\n".join(moe))
-    preset_data = {
-        "model_id": model,
-        "profile": profile,
-        "config": best_config.config.to_dict(),
-        "metrics": {
-            "generation_tok_s": best_config.get_avg_generation_tok_s(),
-            "prompt_tok_s": best_config.get_avg_prompt_tok_s(),
-            "ttft_ms": best_config.get_avg_estimated_ttft_ms(),
-            "quality_score": best_config.quality_score.overall if best_config.quality_score else 0,
-        },
-        "quality": {
-            "overall": best_config.quality_score.overall if best_config.quality_score else 0,
-        },
-        "run_id": str(run.id),
-        "optimizer_version": "1.0.0-beta",
-    }
+    from lm_optimizer.services.reporting import is_exploratory_run
 
-    preset_repo.save(preset_data)
-    console.print("\n[green]Preset saved[/green]")
+    if is_exploratory_run(run):
+        # Exploratory (quality-skipped) runs never overwrite validated presets.
+        console.print("[yellow]Exploratory run: preset not saved (no validated winner)[/yellow]")
+    else:
+        preset_data = {
+            "model_id": model,
+            "profile": profile,
+            "config": best_config.config.to_dict(),
+            "context_length": best_config.context_length,
+            "best_config_id": str(best_config.id),
+            "metrics": {
+                "generation_tok_s": best_config.get_avg_generation_tok_s(),
+                "prompt_tok_s": best_config.get_avg_prompt_tok_s(),
+                "ttft_ms": best_config.get_avg_estimated_ttft_ms(),
+                "quality_score": best_config.quality_score.overall if best_config.quality_score else 0,
+            },
+            "quality": {
+                "overall": best_config.quality_score.overall if best_config.quality_score else 0,
+            },
+            "run_id": str(run.id),
+            "optimizer_version": "1.0.0-beta",
+        }
+
+        preset_repo.save(preset_data)
+        console.print("\n[green]Preset saved[/green]")
 
     try:
         ver = _version_info()
@@ -1043,6 +1080,76 @@ def manual_memory_duel(
     asyncio.run(_duel_run())
 
 
+def _preflight_optimize(
+    model: str,
+    profile: str,
+    style: str,
+    quality_threshold: float,
+    repetitions: int,
+    min_context: int,
+    max_context: int,
+    warmup_runs: int,
+    report_sort: str,
+    skip_phases: str | None,
+    physical_batches: str | None,
+    enable_rope: bool | None,
+    enable_cpu_moe: bool | None,
+    enable_speculative: bool | None,
+    yes: bool,
+    non_interactive: bool,
+    dry_run: bool,
+) -> dict:
+    """Pure local validation + resolution for optimize. No server calls."""
+    if not 0 <= warmup_runs <= 5:
+        console.print("[red]Invalid --warmup-runs (0-5)[/red]")
+        sys.exit(2)
+    if report_sort not in ("run", "speed", "quality"):
+        console.print("[red]Invalid --report-sort (run|speed|quality)[/red]")
+        sys.exit(2)
+    skips: list[str] = []
+    if skip_phases:
+        from lm_optimizer.services.optimizer import parse_phase_skips
+
+        try:
+            skips = sorted(parse_phase_skips(skip_phases))
+        except ValueError as e:
+            console.print(f"[red]{e}[/red]")
+            sys.exit(2)
+    batches: list[int] | None = None
+    if physical_batches:
+        try:
+            batches = sorted(
+                {int(x.strip()) for x in physical_batches.split(",") if x.strip()}
+            )
+        except ValueError:
+            console.print("[red]Invalid --physical-batches (comma-separated integers)[/red]")
+            sys.exit(2)
+        if not batches or any(b <= 0 for b in batches):
+            console.print("[red]Invalid --physical-batches (positive integers required)[/red]")
+            sys.exit(2)
+    experimental_flags = _resolve_experimental_flags(
+        enable_rope,
+        enable_cpu_moe,
+        enable_speculative,
+        non_interactive=(non_interactive or yes),
+    )
+    return {
+        "model": model,
+        "profile": profile,
+        "style": style,
+        "quality_threshold": quality_threshold,
+        "repetitions": repetitions,
+        "min_context": min_context,
+        "max_context": max_context,
+        "warmup_runs": warmup_runs,
+        "report_sort": report_sort,
+        "skip_phases": skips,
+        "physical_batches": batches,
+        "experimental": experimental_flags,
+        "dry_run": dry_run,
+    }
+
+
 @app.command()
 def optimize(
     model: str = typer.Argument(..., help="Model ID to optimize"),
@@ -1111,20 +1218,26 @@ def optimize(
         "--physical-batches",
         help="Comma-separated physical batch sizes to test (e.g. 256,512,1024)",
     ),
-    enable_rope: bool = typer.Option(
-        False,
-        "--enable-rope",
-        help="Experimental tail opt-in: RoPE probes after the FINAL winner",
+    enable_rope: bool | None = typer.Option(
+        None,
+        "--enable-rope/--no-enable-rope",
+        help="Experimental tail opt-in: RoPE probes after the FINAL winner (default OFF)",
     ),
-    enable_cpu_moe: bool = typer.Option(
-        False,
-        "--enable-cpu-moe",
-        help="Experimental tail opt-in: CPU-MoE probes after the FINAL winner",
+    enable_cpu_moe: bool | None = typer.Option(
+        None,
+        "--enable-cpu-moe/--no-enable-cpu-moe",
+        help="Experimental tail opt-in: CPU-MoE probes after the FINAL winner (default OFF)",
     ),
-    enable_speculative: bool = typer.Option(
-        False,
-        "--enable-speculative",
-        help="Experimental tail opt-in: speculative probes after the FINAL winner",
+    enable_speculative: bool | None = typer.Option(
+        None,
+        "--enable-speculative/--no-enable-speculative",
+        help="Experimental tail opt-in: speculative probes after the FINAL winner (default OFF)",
+    ),
+    yes: bool = typer.Option(
+        False, "--yes", help="Accept the pre-flight summary without prompting (never enables experiments)"
+    ),
+    non_interactive: bool = typer.Option(
+        False, "--non-interactive", help="Never prompt; unspecified experiments stay OFF"
     ),
     wait_interval: float = typer.Option(
         60.0,
@@ -1150,6 +1263,19 @@ def optimize(
     if resume_id:
         # Delegate to resume flow (model arg is ignored except for display).
         resume(run_id=resume_id, revalidate=revalidate, style=style)
+        return
+
+    _reject_bool_like_model_args([model])
+
+    effective = _preflight_optimize(
+        model, profile, style, quality_threshold, repetitions,
+        min_context, max_context, warmup_runs, report_sort,
+        skip_phases, physical_batches,
+        enable_rope, enable_cpu_moe, enable_speculative,
+        yes, non_interactive, dry_run,
+    )
+
+    if not _preflight_confirm(effective, dry_run, yes, non_interactive):
         return
 
     async def _optimize():
@@ -1199,41 +1325,14 @@ def optimize(
                 )
                 return
 
-            advanced.update(
-                _resolve_experimental_flags(enable_rope, enable_cpu_moe, enable_speculative)
-            )
+            advanced.update(effective["experimental"])
             advanced["min_speed"] = min_speed
-            if not 0 <= warmup_runs <= 5:
-                console.print("[red]Invalid --warmup-runs (0-5)[/red]")
-                sys.exit(2)
-            advanced["warmup_runs"] = warmup_runs
-            if report_sort not in ("run", "speed", "quality"):
-                console.print("[red]Invalid --report-sort (run|speed|quality)[/red]")
-                sys.exit(2)
-            if skip_phases:
-                from lm_optimizer.services.optimizer import parse_phase_skips
-
-                try:
-                    advanced["skip_phases"] = sorted(parse_phase_skips(skip_phases))
-                except ValueError as e:
-                    console.print(f"[red]{e}[/red]")
-                    sys.exit(2)
-            if physical_batches:
-                try:
-                    batches = sorted(
-                        {int(x.strip()) for x in physical_batches.split(",") if x.strip()}
-                    )
-                except ValueError:
-                    console.print(
-                        "[red]Invalid --physical-batches (comma-separated integers)[/red]"
-                    )
-                    sys.exit(2)
-                if not batches or any(b <= 0 for b in batches):
-                    console.print(
-                        "[red]Invalid --physical-batches (positive integers required)[/red]"
-                    )
-                    sys.exit(2)
-                advanced["physical_batches"] = batches
+            advanced["warmup_runs"] = effective["warmup_runs"]
+            advanced["report_sort"] = effective["report_sort"]
+            if effective["skip_phases"]:
+                advanced["skip_phases"] = effective["skip_phases"]
+            if effective["physical_batches"]:
+                advanced["physical_batches"] = effective["physical_batches"]
 
             console.print(f"[bold]Starting optimization for {model}[/bold]")
             console.print(f"  Profile: {profile}")
@@ -1666,6 +1765,67 @@ def presets(
     console.print(table)
 
 
+@app.command(name="preset-export")
+def preset_export(
+    model: str = typer.Argument(..., help="Model ID with a saved winning preset"),
+    profile: str = typer.Option("balanced", "--profile", "-p", help="Preset profile to export"),
+    output: Path | None = typer.Option(
+        None, "--output", "-o", help="Output file (default: lmstudio-presets/<model>_<profile>.preset.json)"
+    ),
+):
+    """Export the winning preset as an importable LM Studio JSON file.
+
+    LM Studio has no direct preset API; this writes a validated JSON preset
+    (applied_params + recorded-only params + source run/candidate) that you can
+    apply with `lm-optimizer apply` or copy into LM Studio's GUI preset editor.
+    """
+    setup_logging()
+    from lm_optimizer.services.preset_export import (
+        LMSTUDIO_PRESET_DIR,
+        build_lmstudio_preset,
+        default_preset_filename,
+        write_lmstudio_preset,
+    )
+
+    preset = preset_repo.get_by_model_and_profile(model, profile)
+    if not preset:
+        console.print(f"[red]No saved preset for {model} (profile {profile})[/red]")
+        console.print("Run 'lm-optimizer optimize' first, or list with 'lm-optimizer presets'.")
+        sys.exit(1)
+    cfg = preset.get("config") or {}
+    ctx = preset.get("context_length")
+    if ctx is None:
+        ctx = cfg.get("context_length")
+    try:
+        export = build_lmstudio_preset(
+            model_id=preset.get("model_id", model),
+            profile=preset.get("profile", profile),
+            config=cfg,
+            context_length=ctx,
+            run_id=preset.get("run_id"),
+            best_config_id=preset.get("best_config_id"),
+            metrics=preset.get("metrics"),
+            quality=preset.get("quality"),
+            optimizer_version=preset.get("optimizer_version"),
+        )
+        if output is not None:
+            out_dir = output.parent if str(output.parent) not in ("", ".") else LMSTUDIO_PRESET_DIR
+            path = write_lmstudio_preset(export, out_dir=out_dir, filename=output.name)
+        else:
+            path = write_lmstudio_preset(export)
+    except (ValueError, OSError) as e:
+        console.print(f"[red]Preset export failed: {e}[/red]")
+        sys.exit(1)
+    console.print(f"[green]Exported LM Studio preset:[/green] {path}")
+    console.print(f"  Context: {export['context_length']}")
+    if export["unsupported_params"]:
+        console.print(
+            f"  [yellow]Recorded-only (REST cannot set): "
+            f"{', '.join(export['unsupported_params'])}[/yellow]"
+        )
+    console.print("  Apply with 'lm-optimizer apply' or copy applied_params into the GUI.")
+
+
 @app.command()
 def restore(model: str = typer.Argument(..., help="Model ID to restore")):
     """Restore previous model configuration."""
@@ -1783,6 +1943,164 @@ def _apply_skip_models(targets: list, skip_terms: list[str]) -> tuple[list, list
     return kept, skipped
 
 
+def _preflight_auto(
+    models: list[str] | None,
+    profile: str,
+    style: str,
+    quality_threshold: float,
+    repetitions: int,
+    skip_matrix: bool,
+    skip_optimize: bool,
+    skip: str | None,
+    max_size_gb: float | None,
+    speculative_draft: str | None,
+    kv: str,
+    precision: bool,
+    output: Path,
+    dry_run: bool,
+    workload: str,
+    gpu_via_cli: bool,
+    max_tokens_scale: float,
+    min_speed: float,
+    warmup_runs: int,
+    report_sort: str,
+    skip_phases: str | None,
+    physical_batches: str | None,
+    enable_rope: bool | None,
+    enable_cpu_moe: bool | None,
+    enable_speculative: bool | None,
+    yes: bool,
+    non_interactive: bool,
+    wait_interval: float,
+    max_waits: int,
+) -> tuple[dict, list | None]:
+    """Validate all local options, resolve experimental flags, determine targets if explicit models given.
+
+    Returns (effective_settings, targets_if_known).
+    If no explicit models given, targets is None (need to connect to list).
+    """
+    _reject_bool_like_model_args(models)
+    # Local validation
+    if kv not in ("gpu", "cpu", "both"):
+        console.print("[red]Invalid --kv (gpu/cpu/both)[/red]")
+        sys.exit(2)
+
+    if not 0 <= warmup_runs <= 5:
+        console.print("[red]Invalid --warmup-runs (0-5)[/red]")
+        sys.exit(2)
+    if report_sort not in ("run", "speed", "quality"):
+        console.print("[red]Invalid --report-sort (run|speed|quality)[/red]")
+        sys.exit(2)
+
+    # Parse skip-phases
+    auto_skips: list[str] = []
+    if skip_phases:
+        from lm_optimizer.services.optimizer import parse_phase_skips
+        try:
+            auto_skips = sorted(parse_phase_skips(skip_phases))
+        except ValueError as e:
+            console.print(f"[red]{e}[/red]")
+            sys.exit(2)
+
+    # Parse physical-batches
+    auto_physical_batches: list[int] | None = None
+    if physical_batches:
+        try:
+            auto_physical_batches = sorted(
+                {int(x.strip()) for x in physical_batches.split(",") if x.strip()}
+            )
+        except ValueError:
+            console.print("[red]Invalid --physical-batches (comma-separated integers)[/red]")
+            sys.exit(2)
+        if not auto_physical_batches or any(b <= 0 for b in auto_physical_batches):
+            console.print("[red]Invalid --physical-batches (positive integers required)[/red]")
+            sys.exit(2)
+
+    # Resolve experimental flags
+    experimental_flags = _resolve_experimental_flags(
+        enable_rope,
+        enable_cpu_moe,
+        enable_speculative,
+        non_interactive=(non_interactive or yes),
+    )
+
+    # Determine explicit targets
+    explicit_targets: list | None = None
+    if models:
+        explicit_targets = models  # model IDs, will be resolved after connect
+
+    # Build effective settings for summary
+    effective = {
+        "models": explicit_targets or "all (small first)",
+        "profile": profile,
+        "style": style,
+        "quality_threshold": quality_threshold,
+        "repetitions": repetitions,
+        "skip_matrix": skip_matrix,
+        "skip_optimize": skip_optimize,
+        "skip": skip,
+        "max_size_gb": max_size_gb,
+        "speculative_draft": speculative_draft,
+        "kv": kv,
+        "precision": precision,
+        "output": str(output),
+        "dry_run": dry_run,
+        "workload": workload,
+        "gpu_via_cli": gpu_via_cli,
+        "max_tokens_scale": max_tokens_scale,
+        "min_speed": min_speed,
+        "warmup_runs": warmup_runs,
+        "report_sort": report_sort,
+        "skip_phases": auto_skips,
+        "physical_batches": auto_physical_batches,
+        "experimental": experimental_flags,
+        "wait_interval": wait_interval,
+        "max_waits": max_waits,
+    }
+
+    return effective, explicit_targets
+
+
+def _show_preflight_summary(effective: dict) -> None:
+    """Display consolidated pre-flight summary."""
+    from rich.table import Table
+    table = Table(title="Pre-flight Summary", show_header=True, header_style="bold cyan")
+    table.add_column("Setting", style="yellow")
+    table.add_column("Value", style="white")
+
+    for key, value in effective.items():
+        if key == "models" and isinstance(value, list):
+            table.add_row(key, ", ".join(value) if value else "(none)")
+        elif key == "experimental":
+            exp_active = [k for k, v in value.items() if v]
+            table.add_row(key, ", ".join(exp_active) if exp_active else "all OFF")
+        elif isinstance(value, (list, dict)):
+            table.add_row(key, str(value))
+        else:
+            table.add_row(key, str(value))
+
+    console.print(table)
+
+
+def _preflight_confirm(effective: dict, dry_run: bool, yes: bool, non_interactive: bool) -> bool:
+    """Show summary and get confirmation. Returns True to proceed, False to abort."""
+    _show_preflight_summary(effective)
+
+    if dry_run:
+        console.print("[yellow]Dry run — showing plan only, not executing.[/yellow]")
+        return False
+
+    if non_interactive or yes:
+        console.print("[green]Proceeding (non-interactive / --yes).[/green]")
+        return True
+
+    try:
+        return typer.confirm("Start optimization?", default=True)
+    except Exception:
+        console.print("[red]Confirmation aborted; nothing was started.[/red]")
+        return False
+
+
 @app.command()
 def auto(
     models: list[str] | None = typer.Argument(None, help="Model keys (default: all, small first)"),
@@ -1856,20 +2174,26 @@ def auto(
         "--physical-batches",
         help="Comma-separated physical batch sizes to test (e.g. 256,512,1024)",
     ),
-    enable_rope: bool = typer.Option(
-        False,
-        "--enable-rope",
-        help="Experimental tail opt-in: RoPE probes after the FINAL winner",
+    enable_rope: bool | None = typer.Option(
+        None,
+        "--enable-rope/--no-enable-rope",
+        help="Experimental tail opt-in: RoPE probes after the FINAL winner (default OFF)",
     ),
-    enable_cpu_moe: bool = typer.Option(
-        False,
-        "--enable-cpu-moe",
-        help="Experimental tail opt-in: CPU-MoE probes after the FINAL winner",
+    enable_cpu_moe: bool | None = typer.Option(
+        None,
+        "--enable-cpu-moe/--no-enable-cpu-moe",
+        help="Experimental tail opt-in: CPU-MoE probes after the FINAL winner (default OFF)",
     ),
-    enable_speculative: bool = typer.Option(
-        False,
-        "--enable-speculative",
-        help="Experimental tail opt-in: speculative probes after the FINAL winner",
+    enable_speculative: bool | None = typer.Option(
+        None,
+        "--enable-speculative/--no-enable-speculative",
+        help="Experimental tail opt-in: speculative probes after the FINAL winner (default OFF)",
+    ),
+    yes: bool = typer.Option(
+        False, "--yes", help="Accept the pre-flight summary without prompting (never enables experiments)"
+    ),
+    non_interactive: bool = typer.Option(
+        False, "--non-interactive", help="Never prompt; unspecified experiments stay OFF"
     ),
     wait_interval: float = typer.Option(
         60.0,
@@ -1885,12 +2209,53 @@ def auto(
     """Unattended pipeline: smoke -> precision -> ladder(ctx max) -> matrix -> optimize."""
     setup_logging()
     style = _require_style(style)
-    if kv not in ("gpu", "cpu", "both"):
-        console.print("[red]Invalid --kv (gpu/cpu/both)[/red]")
-        sys.exit(2)
+
+    _reject_bool_like_model_args(models)
+
+    # ========== PRE-FLIGHT: all local validation, resolution, summary, confirmation ========
+    effective, explicit_targets = _preflight_auto(
+        models,
+        profile,
+        style,
+        quality_threshold,
+        repetitions,
+        skip_matrix,
+        skip_optimize,
+        skip,
+        max_size_gb,
+        speculative_draft,
+        kv,
+        precision,
+        output,
+        dry_run,
+        workload,
+        gpu_via_cli,
+        max_tokens_scale,
+        min_speed,
+        warmup_runs,
+        report_sort,
+        skip_phases,
+        physical_batches,
+        enable_rope,
+        enable_cpu_moe,
+        enable_speculative,
+        yes,
+        non_interactive,
+        wait_interval,
+        max_waits,
+    )
+
+    if not _preflight_confirm(effective, dry_run, yes, non_interactive):
+        return
+
+    # Resolve experimental flags now (already computed in preflight, but need them for execution)
+    experimental_flags = effective["experimental"]
+    auto_skips = effective["skip_phases"]
+    auto_physical_batches = effective["physical_batches"]
     test_kv_gpu = kv in ("gpu", "both")
     test_kv_cpu = kv in ("cpu", "both")
 
+    # ========== EXECUTION: connect and run ========
     async def _auto():
         client = get_client()
         summary = []
@@ -1909,9 +2274,10 @@ def auto(
             has_gpu = bool(hardware.gpus)
             all_models = await client.list_models()
 
-            if models:
+            # Resolve targets: explicit IDs or all (small first)
+            if explicit_targets:
                 targets = []
-                for mid in models:
+                for mid in explicit_targets:
                     info = await client.get_model(mid)
                     if not info:
                         console.print(f"[yellow]Model not found, skipping: {mid}[/yellow]")
@@ -1939,44 +2305,6 @@ def auto(
                         f"profile={profile} style={style}"
                     )
                 return
-
-            experimental_flags = _resolve_experimental_flags(
-                enable_rope, enable_cpu_moe, enable_speculative
-            )
-
-            from lm_optimizer.services.optimizer import parse_phase_skips
-
-            auto_skips: list[str] = []
-            if skip_phases:
-                try:
-                    auto_skips = sorted(parse_phase_skips(skip_phases))
-                except ValueError as e:
-                    console.print(f"[red]{e}[/red]")
-                    sys.exit(2)
-            auto_physical_batches: list[int] | None = None
-            if physical_batches:
-                try:
-                    auto_physical_batches = sorted(
-                        {int(x.strip()) for x in physical_batches.split(",") if x.strip()}
-                    )
-                except ValueError:
-                    console.print(
-                        "[red]Invalid --physical-batches (comma-separated integers)[/red]"
-                    )
-                    sys.exit(2)
-                if not auto_physical_batches or any(
-                    b <= 0 for b in auto_physical_batches
-                ):
-                    console.print(
-                        "[red]Invalid --physical-batches (positive integers required)[/red]"
-                    )
-                    sys.exit(2)
-            if not 0 <= warmup_runs <= 5:
-                console.print("[red]Invalid --warmup-runs (0-5)[/red]")
-                sys.exit(2)
-            if report_sort not in ("run", "speed", "quality"):
-                console.print("[red]Invalid --report-sort (run|speed|quality)[/red]")
-                sys.exit(2)
 
             smoke_service = BenchmarkService(client, style=style)
             quality_evaluator = QualityEvaluator(QualityConfig(minimum_score=quality_threshold))
@@ -3138,6 +3466,38 @@ def checkpoints():
     console.print(table)
 
 
+@app.command(name="reconcile-runs")
+def reconcile_runs(
+    apply: bool = typer.Option(
+        False, "--apply", help="Actually mark stale runs interrupted (default: preview only)"
+    ),
+):
+    """Preview/apply reconciliation of stale `running` runs (keeps history)."""
+    setup_logging()
+    from lm_optimizer.services.run_reconcile import reconcile_stale_runs
+
+    result = reconcile_stale_runs(dry_run=not apply)
+    changes = result["changes"]
+    if not changes:
+        console.print("[green]No stale running runs found.[/green]")
+        return
+    table = Table(title=("Stale runs to interrupt" if not apply else "Stale runs interrupted"))
+    table.add_column("Run ID", style="cyan")
+    table.add_column("Model", style="green")
+    table.add_column("From", style="yellow")
+    table.add_column("To", style="magenta")
+    for c in changes:
+        table.add_row(str(c["id"]), str(c.get("model_id") or "-"), c["from"], c["to"])
+    console.print(table)
+    if not apply:
+        console.print(
+            f"[yellow]Dry run: {len(changes)} stale run(s). "
+            "Re-run with --apply to mark them interrupted (history preserved).[/yellow]"
+        )
+    else:
+        console.print(f"[green]Reconciled {result['changed']} stale run(s).[/green]")
+
+
 @app.command(name="resume-menu")
 def resume_menu(
     status: list[str] | None = typer.Option(
@@ -3187,14 +3547,41 @@ def resume_menu(
     table.add_column("Stage", style="magenta")
     table.add_column("Configs", justify="right")
     table.add_column("Completed", justify="right")
+    table.add_column("Checkpoint", style="dim")
+    table.add_column("Phase/Cursor", style="cyan")
+    table.add_column("Last progress", style="white")
+    table.add_column("Resume hint", style="green")
     table.add_column("Created", style="dim")
 
     for idx, run in enumerate(resumable_runs, 1):
         # Get checkpoint info
         from lm_optimizer.storage.run_checkpoint import load_checkpoint
-        ckpt = load_checkpoint(str(run.id))
+        try:
+            ckpt = load_checkpoint(str(run.id))
+        except ValueError:
+            ckpt = {"corrupted": True}
         completed = len(ckpt.get("completed_candidate_ids", [])) if ckpt else 0
         total = run.config_count or len(run.configurations) if run.configurations else 0
+
+        pab = ((ckpt or {}).get("phase_ab") or {})
+        _ph = getattr(run, "phase", "?")
+        _ph = _ph.value if hasattr(_ph, "value") else _ph
+        phase = pab.get("phase") or _ph or "?"
+        step = (pab.get("recovery_cursor") or {}).get("step", 0) or 0
+        events = (ckpt or {}).get("event_log") or []
+        last_progress = ""
+        if events:
+            last = events[-1] or {}
+            last_progress = f"{last.get('message', '')} {last.get('detail', '')}".strip()[:60]
+        if not ckpt:
+            ckpt_cell = "no"
+            hint = "no checkpoint"
+        elif ckpt.get("corrupted"):
+            ckpt_cell = "corrupt"
+            hint = "checkpoint unreadable"
+        else:
+            ckpt_cell = f"yes {str(ckpt.get('saved_at', ''))[:16]}"
+            hint = "safe to resume"
 
         status_badge = _status_badge(run.status.value)
         table.add_row(
@@ -3206,6 +3593,10 @@ def resume_menu(
             run.stage.value if run.stage else "?",
             str(total),
             str(completed),
+            ckpt_cell,
+            f"{phase}@{step}",
+            last_progress or "-",
+            hint,
             run.created_at.strftime("%Y-%m-%d %H:%M"),
         )
 
@@ -3622,7 +4013,7 @@ def _display_optimization_result(run):
         why_text,
     )
 
-    state, info = classify_run(list(run.configurations))
+    state, info = classify_run(list(run.configurations), run)
     if state == "FAILED":
         console.print(Panel.fit("[bold red]Optimization unsuccessful[/bold red]"))
         console.print("No valid configurations were successfully benchmarked.")
@@ -3651,9 +4042,16 @@ def _display_optimization_result(run):
         console.print("[yellow]No successful configuration found[/yellow]")
         return
     bc = best.config
-    if state == "PARTIAL_SUCCESS":
-        console.print(Panel.fit("[bold yellow]Optimization partially completed[/bold yellow]"))
-        console.print(f"Successful:\n{info['successful']}\n\nFailed:\n{info['failed']}")
+    if state == "NO_WINNER":
+        console.print(
+            Panel.fit(
+                "[bold yellow]Optimization completed — no quality-validated winner[/bold yellow]"
+            )
+        )
+        console.print(
+            "The model generated usable output, but no configuration met the "
+            f"quality threshold ({run.quality_threshold}). Best diagnostic candidate below."
+        )
     else:
         console.print(Panel.fit(f"[bold green]Optimization Complete: {run.model.id}[/bold green]"))
     console.print(f"[dim]Run state: {state} (status={run.status.value})[/dim]")
@@ -4477,6 +4875,9 @@ def deepresearch_bench(
         console.print(f"[red]Error: {e}[/red]")
         sys.exit(1)
 
+
+from lm_optimizer.cli.auto_run import auto_run
+app.command()(auto_run)
 
 if __name__ == "__main__":
     app()
