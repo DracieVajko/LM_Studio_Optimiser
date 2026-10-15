@@ -90,3 +90,52 @@ def fingerprint_diff(old: dict[str, Any], new: dict[str, Any]) -> list[str]:
         if old_val != new_val:
             changed.append(key)
     return changed
+
+
+def should_revalidate_config(changed_field: str, phase: str) -> bool:
+    """Determine if a config in the given phase should be revalidated based on changed field.
+
+    Args:
+        changed_field: Name of the field that changed
+        phase: Phase the config was tested in (speed, quality, recovery, final_validation)
+
+    Returns:
+        True if the config should be revalidated
+    """
+    if changed_field in ("quantization", "architecture"):
+        return True  # Full re-run
+    if changed_field == "hardware_fingerprint":
+        return True  # All phases affected
+    if changed_field == "lm_studio_version":
+        return True  # All phases affected
+    if changed_field == "benchmark_suite_version":
+        return phase in ("quality", "recovery", "final_validation")  # New test cases
+    return False
+
+
+def filter_configs_for_revalidation(
+    configs: list, fingerprint_diff: list[str], phase_field: str = "phase"
+) -> tuple[list, list]:
+    """Split configs into keep and revalidate based on fingerprint diff.
+
+    Args:
+        configs: List of ConfigurationResult objects
+        fingerprint_diff: List of changed field names
+        phase_field: Attribute name for phase (default "phase" from generation dict)
+
+    Returns:
+        Tuple of (keep_configs, revalidate_configs)
+    """
+    keep = []
+    revalidate = []
+    for cfg in configs:
+        gen = getattr(cfg, "generation", {}) or {}
+        phase = gen.get(phase_field, "unknown")
+        should_reval = any(
+            should_revalidate_config(field, phase) for field in fingerprint_diff
+        )
+        if should_reval:
+            revalidate.append(cfg)
+        else:
+            keep.append(cfg)
+    return keep, revalidate

@@ -1,6 +1,8 @@
 """Adaptive optimization engine - hardware-agnostic scoring."""
 
 import asyncio
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -35,6 +37,13 @@ from lm_optimizer.scoring.normalization import (
     weighted_score,
 )
 from lm_optimizer.services.benchmark import BenchmarkService
+from lm_optimizer.services.fingerprint import (
+    compute_fingerprint,
+    fingerprint_diff,
+    hardware_fingerprint,
+    should_revalidate_config,
+    filter_configs_for_revalidation,
+)
 from lm_optimizer.services.lm_studio import LMStudioClient
 from lm_optimizer.services.quality import QualityEvaluator
 from lm_optimizer.services.search_space import SearchSpace, SearchSpaceGenerator
@@ -54,14 +63,16 @@ EXPERIMENTAL_REASONS = {
 
 
 def parse_experimental_flags(
-    enable_rope: bool = False,
-    enable_cpu_moe: bool = False,
-    enable_speculative: bool = False,
+    enable_rope: bool | None = False,
+    enable_cpu_moe: bool | None = False,
+    enable_speculative: bool | None = False,
 ) -> dict:
     """Experimental tail opt-ins. All default OFF.
 
     RoPE / CPU-MoE / speculative probes run only as a tail after the FINAL
-    winner, never inside the main sweep.
+    winner, never inside the main sweep. `None` means "not specified" and
+    resolves to OFF (use `resolve_experimental_optins` when the distinction
+    between unspecified and explicit OFF matters for prompting).
     """
     return {
         "enable_rope": bool(enable_rope),
@@ -70,8 +81,41 @@ def parse_experimental_flags(
     }
 
 
+EXPERIMENTAL_QUESTIONS = {
+    "enable_rope": "Enable RoPE (rotary position embedding) probes?",
+    "enable_cpu_moe": "Enable CPU-MoE (Mixture of Experts) probes?",
+    "enable_speculative": "Enable Speculative decoding probes?",
+}
+
+
+def resolve_experimental_optins(
+    requested: dict,
+    ask: Callable[[str], bool] | None = None,
+) -> dict:
+    """Resolve experimental opt-ins distinguishing unspecified from explicit OFF.
+
+    - Explicit True/False values always win (explicit False counts as a user
+      decision and is never re-prompted).
+    - `None` (unspecified) values are asked via `ask(question)` when an
+      asker is provided, otherwise resolve to OFF.
+    - `ask` must never be called for explicitly decided flags.
+    """
+    resolved: dict = {}
+    for key in ("enable_rope", "enable_cpu_moe", "enable_speculative"):
+        value = (requested or {}).get(key)
+        if value is None:
+            resolved[key] = bool(ask(EXPERIMENTAL_QUESTIONS[key])) if ask is not None else False
+        else:
+            resolved[key] = bool(value)
+    return resolved
+
+
 def apply_experimental_mark(run: OptimizationRun, flags: dict | None) -> OptimizationRun:
     """Mark a run experimental when any opt-in flag is set.
+
+    `is_experimental` means "any experiment resolved ON at request time"
+    (requested→resolved mapping in `build_experimental_detail`). It does NOT
+    mean the tail probe actually ran — see `exercised` in the detail dict.
 
     Any True flag sets `run.is_experimental = True` with a reason string;
     all-False (or missing) flags leave the run clean.
@@ -85,6 +129,47 @@ def apply_experimental_mark(run: OptimizationRun, flags: dict | None) -> Optimiz
         run.is_experimental = False
         run.experimental_reason = None
     return run
+
+
+EXPERIMENTAL_FLAGS = ("enable_rope", "enable_cpu_moe", "enable_speculative")
+
+
+def build_experimental_detail(
+    requested_raw: dict | None,
+    resolved: dict | None,
+    advanced_settings: dict | None = None,
+) -> dict:
+    """Requested vs resolved vs applied vs exercised experimental metadata.
+
+    - `requested`: raw CLI/API values (True/False/None; None = unspecified).
+    - `resolved`: bool dict after prompting/default-OFF (what `is_experimental` uses).
+    - `applied`: resolved minus capability blocks (speculative without a usable
+      draft model is never applied).
+    - `exercised`: all False until a tail probe actually runs (no tail runner
+      exists yet; the runner flips its flag to True when it runs).
+    - `skipped`: {flag: reason} for capability blocks.
+    """
+    requested_raw = requested_raw or {}
+    resolved = resolved or {}
+    advanced_settings = advanced_settings or {}
+    requested = {k: requested_raw.get(k) for k in EXPERIMENTAL_FLAGS}
+    resolved_b = {k: bool(resolved.get(k, False)) for k in EXPERIMENTAL_FLAGS}
+    applied = dict(resolved_b)
+    skipped: dict[str, str] = {}
+    draft = advanced_settings.get("speculative_draft_model") or advanced_settings.get(
+        "speculative_draft"
+    )
+    if resolved_b.get("enable_speculative") and not draft:
+        applied["enable_speculative"] = False
+        skipped["enable_speculative"] = "no usable draft model"
+    exercised = {k: False for k in EXPERIMENTAL_FLAGS}
+    return {
+        "requested": requested,
+        "resolved": resolved_b,
+        "applied": applied,
+        "exercised": exercised,
+        "skipped": skipped,
+    }
 
 
 def format_diagnostic(exc: BaseException) -> dict:
@@ -290,6 +375,7 @@ class AdaptiveOptimizer:
         # Experimental tail opt-ins - ALL DISABLED by default.
         # RoPE / CPU-MoE / speculative probes run only as a tail after the
         # FINAL winner, never inside the main sweep.
+        requested_raw = {k: advanced_settings.get(k) for k in EXPERIMENTAL_FLAGS}
         exp_flags = parse_experimental_flags(
             enable_rope=advanced_settings.get("enable_rope", False),
             enable_cpu_moe=advanced_settings.get("enable_cpu_moe", False),
@@ -355,6 +441,38 @@ class AdaptiveOptimizer:
         )
         # Any experimental opt-in marks the run (single marking path).
         apply_experimental_mark(run, exp_flags)
+        run.benchmark_params["experimental_detail"] = build_experimental_detail(
+            requested_raw, exp_flags, advanced_settings
+        )
+
+        # Compute and store fingerprint for this run
+        from lm_optimizer.services import lms_cli as _lms_cli
+        from lm_optimizer.benchmark.suite_version import BENCHMARK_SUITE_VERSION
+
+        lms_version = "unknown"
+        try:
+            lms_version = _lms_cli.lms_version()
+        except Exception:
+            pass
+
+        hw_fp = hardware_fingerprint(hardware)
+        fp_components = {
+            "model_id": model.id,
+            "quantization": model.quantization,
+            "architecture": model.architecture,
+            "lm_studio_version": lms_version,
+            "hardware_fingerprint": hw_fp,
+            "benchmark_suite_version": BENCHMARK_SUITE_VERSION,
+        }
+        run.benchmark_params["fingerprint"] = compute_fingerprint(
+            fp_components["model_id"],
+            fp_components["quantization"],
+            fp_components["architecture"],
+            fp_components["lm_studio_version"],
+            fp_components["hardware_fingerprint"],
+            fp_components["benchmark_suite_version"],
+        )
+        run.benchmark_params["fingerprint_components"] = fp_components
 
         # Generate search space
         search_space = self.search_generator.generate(model, hardware, profile, advanced_settings)
@@ -1312,6 +1430,12 @@ class AdaptiveOptimizer:
 
         `score_context=False` zeroes the context score component (Phase A:
         context is frozen, §22). Defaults to the state's flow flag.
+
+        Duration convention: every returned (persisted) result from a started
+        attempt carries `duration_ms > 0` (wall time around the attempt).
+        Flash-skipped attempts return None (never started, nothing persisted).
+        Unexpected exceptions return a stamped failed result (score None,
+        never a winner) instead of None so the attempt is recorded.
         """
         from lm_optimizer.services.failure_states import classify_error, is_soft
 
@@ -1322,6 +1446,15 @@ class AdaptiveOptimizer:
         ):
             logger.info("Skipping flash-off config (server requires flash)")
             return None
+        t0 = time.perf_counter()
+
+        def _stamp(res: ConfigurationResult) -> ConfigurationResult:
+            try:
+                res.duration_ms = (time.perf_counter() - t0) * 1000.0
+            except Exception:
+                pass
+            return res
+
         try:
             self._log_event("LOAD_REQUESTED", f"ctx={context_length}")
             result = await self.benchmark.run_benchmark(
@@ -1363,7 +1496,7 @@ class AdaptiveOptimizer:
                 # Learn server-mandated flash here (failures return early and
                 # never reach the passed-path note below).
                 self._note_flash_requirement(result)
-                return result
+                return _stamp(result)
 
             # LOADED + VERIFIED (benchmark success implies the load served).
             result.status = ConfigurationStatus.PASSED
@@ -1407,7 +1540,7 @@ class AdaptiveOptimizer:
                         speed=gen_tok_s,
                         min_speed=min_speed,
                     )
-                    return result
+                    return _stamp(result)
 
             # Server demands flash attention (non-F16 KV quant): prune flash=False (R28)
             self._note_flash_requirement(result)
@@ -1455,7 +1588,7 @@ class AdaptiveOptimizer:
                     checks=f"{agg_quality.checks_passed}/{agg_quality.checks_total}",
                     threshold=self.quality.config.minimum_score,
                 )
-                return result
+                return _stamp(result)
             self._log_event(
                 "QUALITY_EVALUATED",
                 f"{agg_quality.checks_passed}/{agg_quality.checks_total}",
@@ -1483,14 +1616,35 @@ class AdaptiveOptimizer:
             )
             self._log_event("CONFIG_ELIGIBLE", f"score={result.score:.3f}")
 
-            return result
+            return _stamp(result)
 
         except Exception as e:
             logger.error("Config error", error=str(e))
             self.state.errors.append(f"{load_config}: {e!s}")
             self._log_event("Candidate failed", str(e)[:120])
-            await self.client.ensure_unloaded(self.state.run.model.id)
-            return None
+            try:
+                await self.client.ensure_unloaded(self.state.run.model.id)
+            except Exception:
+                pass
+            failed = ConfigurationResult(
+                config=load_config,
+                context_length=context_length,
+                status=classify_error(str(e)),
+                error=f"{type(e).__name__}: {e}"[:500],
+                tested_at=datetime.now(),
+                generation={"stage": self.state.run.stage.value},
+            )
+            failed.score = None
+            try:
+                failed.run_id = self.state.run.id
+            except Exception:
+                pass
+            _stamp(failed)
+            try:
+                config_repo.save(failed)
+            except Exception as se:
+                logger.error("Failure record save failed", error=str(se))
+            return failed
 
     def _update_best(self, result: ConfigurationResult) -> None:
         """Update best configuration using hardware-agnostic scores.
@@ -2037,6 +2191,8 @@ class AdaptiveOptimizer:
         plan, notes = build_speed_plan(anchor, speed_ctx, caps)
         self.state.excluded_notes = notes
         self.state.planned_total = len(plan) + 2
+        # Checkpoint BEFORE DB save so checkpoint phase >= DB stage on crash
+        self._checkpoint("phase:speed:start")
         run_repo.save(self.state.run)
         self._log_event("SPEED discovery started", f"ctx={speed_ctx} probes~{len(plan)}")
         await self._pause_point()
@@ -2108,7 +2264,7 @@ class AdaptiveOptimizer:
             self.state.speed_finalists.append(str(frontier["contrarian"].id))
         self._sync_phase_params()
         run_repo.save(self.state.run)
-        self._checkpoint("phase:speed")
+        self._checkpoint("phase:speed:complete")
         await self._broadcast({"stage": "speed_discovery", "event": "speed_complete"})
         return frontier
 
@@ -2233,6 +2389,8 @@ class AdaptiveOptimizer:
         self.state.run.phase = OptimizationPhase.QUALITY.value
         self.state.run.stage = OptimizationStage.QUALITY_CHECK
         quality_ctx = self.state.quality_context or 8192
+        # Checkpoint BEFORE DB save so checkpoint phase >= DB stage on crash
+        self._checkpoint("phase:quality:start")
         run_repo.save(self.state.run)
         ordered = list(frontier.get("finalists") or [])
         contrarian = frontier.get("contrarian")
@@ -2272,7 +2430,7 @@ class AdaptiveOptimizer:
             )
         self._sync_phase_params()
         run_repo.save(self.state.run)
-        self._checkpoint("phase:quality")
+        self._checkpoint("phase:quality:complete")
         await self._broadcast({"stage": "quality_check", "event": "quality_complete"})
         return safe, failed
 
@@ -2313,6 +2471,8 @@ class AdaptiveOptimizer:
         self.state.phase = OptimizationPhase.RECOVERY.value
         self.state.run.phase = OptimizationPhase.RECOVERY.value
         self.state.run.stage = OptimizationStage.RECOVERY
+        # Checkpoint BEFORE DB save so checkpoint phase >= DB stage on crash
+        self._checkpoint("phase:recovery:start")
         run_repo.save(self.state.run)
         from lm_optimizer.services.recovery import rank_failed_tests
 
@@ -2494,6 +2654,8 @@ class AdaptiveOptimizer:
         self.state.phase = OptimizationPhase.FINAL_VALIDATION.value
         self.state.run.phase = OptimizationPhase.FINAL_VALIDATION.value
         self.state.run.stage = OptimizationStage.FINAL_VALIDATION
+        # Checkpoint BEFORE DB save so checkpoint phase >= DB stage on crash
+        self._checkpoint("phase:final_validation:start")
         run_repo.save(self.state.run)
         best = self.state.best_config
         if best is None:
@@ -2532,6 +2694,10 @@ class AdaptiveOptimizer:
             vcfg = LoadConfiguration(
                 **{k: v for k, v in data.items() if hasattr(LoadConfiguration, k)}
             )
+            # Winner invariant: validation must run at the OUTER context
+            # (best.context_length). The nested config copy can lag behind
+            # (e.g. speed 4096 vs quality 32768 winner) — never validate stale ctx.
+            vcfg.context_length = best.context_length
             result = await self._test_config(vcfg, best.context_length, score_context=False, min_speed=self.state.run.advanced_settings.get("min_speed", 0.0))
             if result is not None and result.status == ConfigurationStatus.PASSED:
                 self._tag_phase(result, OptimizationPhase.FINAL_VALIDATION.value)
@@ -2544,7 +2710,7 @@ class AdaptiveOptimizer:
         self.state.pareto_frontier = self._compute_pareto_frontier(self.state.tested_configs)
         self.state.run.pareto_config_ids = [c.id for c in self.state.pareto_frontier]
         run_repo.save(self.state.run)
-        self._checkpoint("phase:final_validation")
+        self._checkpoint("phase:final_validation:complete")
 
     def _phase_b_failed(self, error: str) -> dict:
         """Contained Phase B failure (optional phase never fails the run)."""
@@ -2568,6 +2734,8 @@ class AdaptiveOptimizer:
         self.state.phase = OptimizationPhase.CONTEXT_OPTIONAL.value
         self.state.run.phase = OptimizationPhase.CONTEXT_OPTIONAL.value
         self.state.run.stage = OptimizationStage.CONTEXT_OPTIONAL
+        # Checkpoint BEFORE DB save so checkpoint phase >= DB stage on crash
+        self._checkpoint("phase:context_optional:start")
         run_repo.save(self.state.run)
         model = self.state.run.model
         model_limit = model.context_limit or 131072
@@ -2637,7 +2805,7 @@ class AdaptiveOptimizer:
         self.state.run.phase_b_result = result
         self._sync_phase_params()
         run_repo.save(self.state.run)
-        self._checkpoint("phase:context_optional")
+        self._checkpoint("phase:context_optional:complete")
         await self._broadcast({"stage": "context_optional", "event": "context_complete"})
         return result
 
@@ -2826,10 +2994,11 @@ class AdaptiveOptimizer:
         self.state.run.status = final_status
         # Keep COMPLETED readable in legacy UIs: stage is always COMPLETE here.
         self.state.run.stage = OptimizationStage.COMPLETE
-        state_name, info = classify_run(list(self.state.tested_configs))
+        state_name, info = classify_run(list(self.state.tested_configs), self.state.run)
         self._log_event(
             f"Run {state_name}",
-            f"successful={info['successful']} failed={info['failed']}",
+            f"successful={info['successful']} failed={info['failed']} "
+            f"validated_winner={info['validated_winner']}",
         )
         run_repo.save(self.state.run)
         self._checkpoint(f"final:{state_name}")
@@ -3000,13 +3169,19 @@ class AdaptiveOptimizer:
         self,
         run_id: Any,
         revalidate: bool = False,
+        revalidate_fingerprint: bool = False,
+        fingerprint_diff_fields: list[str] | None = None,
+        fingerprint_components: dict | None = None,
         style: str = "balanced",
     ) -> OptimizationRun:
         """Resume a run from its interrupt checkpoint + DB state.
 
-        Completed candidates are NOT re-run unless revalidate=True, their DB
-        record is missing/corrupted, the model identity changed, or the LM
-        Studio config changed incompatibly (capability mismatch -> revalidate).
+        Completed candidates are NOT re-run unless:
+        - revalidate=True (explicit re-run of all completed)
+        - revalidate_fingerprint=True and fingerprint_diff indicates affected configs
+        - their DB record is missing/corrupted
+        - the model identity changed
+        - the LM Studio config changed incompatibly (capability mismatch -> revalidate)
         """
         from lm_optimizer.storage.run_checkpoint import load_checkpoint
 
@@ -3038,6 +3213,45 @@ class AdaptiveOptimizer:
 
         self.state = OptimizationState(run=full, search_space=space)
         self._restore_tested_state(full, ckpt)
+
+        # Fingerprint-based revalidation: if fingerprint changed, revalidate affected configs
+        if revalidate_fingerprint:
+            from lm_optimizer.services import lms_cli as _lms_cli
+            from lm_optimizer.benchmark.suite_version import BENCHMARK_SUITE_VERSION
+
+            lms_version = "unknown"
+            try:
+                lms_version = _lms_cli.lms_version()
+            except Exception:
+                pass
+
+            hw_fp = hardware_fingerprint(hw) if hw else "unknown"
+            current_fp = fingerprint_components or {
+                "model_id": full.model.id,
+                "quantization": full.model.quantization,
+                "architecture": full.model.architecture,
+                "lm_studio_version": lms_version,
+                "hardware_fingerprint": hw_fp,
+                "benchmark_suite_version": BENCHMARK_SUITE_VERSION,
+            }
+            old_fp = full.benchmark_params.get("fingerprint_components", {})
+            actual_diff = fingerprint_diff_fields or fingerprint_diff(old_fp, current_fp)
+            if actual_diff:
+                self._log_event(
+                    "FINGERPRINT_REVALIDATE",
+                    f"diff={actual_diff} revalidating affected configs",
+                )
+                keep, reval = filter_configs_for_revalidation(
+                    self.state.tested_configs, actual_diff
+                )
+                self.state.tested_configs = keep
+                self._log_event(
+                    "FINGERPRINT_REVALIDATE",
+                    f"kept={len(keep)} revalidate={len(reval)}",
+                )
+
+        # Reconcile phase/winner state if DB and checkpoint disagree
+        self._reconcile_phase_and_winner(full, ckpt)
         # Resumed runs always continue under Phase A/B scoring rules.
         self.state.score_context = False
         # A resumed run is running again: drop any stale pause marker so
@@ -3275,6 +3489,94 @@ class AdaptiveOptimizer:
         except Exception:
             pass
         return {"recovery_log": merged_log, "recovery_cursor": merged_cursor}
+
+    def _reconcile_phase_and_winner(self, full: Any, ckpt: dict) -> None:
+        """Reconcile phase progression and winner state between DB and checkpoint.
+
+        Authority rules:
+        - Completed candidate results: DB is authoritative (source of truth)
+        - Current phase/search state: checkpoint is authoritative for in-progress work
+        - Winner selection: if DB has eligible quality-passed configs but no best_config_id,
+          reconstruct winner from DB completed work.
+        - If checkpoint phase is ahead of DB stage, trust checkpoint (in-progress phase started).
+        - If DB stage is ahead of checkpoint phase, trust DB completed work and reconstruct.
+        """
+        try:
+            db_pab = ((full.benchmark_params or {}).get("phase_ab") or {})
+            ckpt_pab = ((ckpt or {}).get("phase_ab") or {})
+
+            db_phase = db_pab.get("phase", "speed")
+            ckpt_phase = ckpt_pab.get("phase", "speed")
+            db_stage = getattr(full.stage, "value", str(full.stage))
+            ckpt_stage = ckpt.get("stage", "speed_discovery")
+
+            # Phase order for comparison
+            phase_order = {
+                "speed": 0,
+                "quality": 1,
+                "recovery": 2,
+                "final_validation": 3,
+                "context_optional": 4,
+            }
+            db_phase_ord = phase_order.get(db_phase, 0)
+            ckpt_phase_ord = phase_order.get(ckpt_phase, 0)
+
+            # Log reconciliation
+            self._log_event(
+                "PHASE_RECONCILE",
+                f"db_phase={db_phase} ckpt_phase={ckpt_phase} db_stage={db_stage} ckpt_stage={ckpt_stage}",
+            )
+
+            # If DB has completed quality work but no winner, reconstruct from DB
+            if (full.best_config_id is None
+                and db_phase_ord >= phase_order["quality"]
+                and self.state.tested_configs):
+
+                # Find quality-passed configs at quality_context
+                quality_ctx = self.state.quality_context or 8192
+                safe_candidates = []
+                for c in self.state.tested_configs:
+                    if c.context_length != quality_ctx:
+                        continue
+                    if c.status != ConfigurationStatus.PASSED:
+                        continue
+                    gen = c.generation or {}
+                    # Quality completed marker or backfill
+                    if gen.get("quality_completed") is True:
+                        safe_candidates.append(c)
+                    elif gen.get("quality_by_test") and c.quality_score:
+                        # Backfill for older records
+                        safe_candidates.append(c)
+
+                if safe_candidates:
+                    # Select fastest quality-passing config (Phase A rule R14)
+                    fastest = max(safe_candidates, key=lambda r: r.get_avg_generation_tok_s())
+                    self.state.best_config = fastest
+                    self.state.run.best_config_id = fastest.id
+                    self._log_event(
+                        "WINNER_RECONSTRUCTED",
+                        f"config={str(fastest.id)[:8]} speed={fastest.get_avg_generation_tok_s():.1f} tok/s",
+                    )
+                    try:
+                        run_repo.save(self.state.run)
+                    except Exception as e:
+                        logger.error("Winner reconstruction save failed", error=str(e))
+
+            # Sync phase from the more advanced source
+            if ckpt_phase_ord > db_phase_ord:
+                # Checkpoint has started a newer phase; adopt it
+                self.state.phase = ckpt_phase
+                self.state.run.phase = ckpt_phase
+                self._log_event("PHASE_ADOPTED_FROM_CKPT", f"phase={ckpt_phase}")
+            elif db_phase_ord > ckpt_phase_ord:
+                # DB has advanced further (completed work); keep DB phase but note mismatch
+                self.state.phase = db_phase
+                self.state.run.phase = db_phase
+                self._log_event("PHASE_ADOPTED_FROM_DB", f"phase={db_phase}")
+
+        except Exception as e:
+            logger.error("Phase/winner reconciliation failed", error=str(e))
+            # Non-fatal: resume will proceed with restored state
 
     async def _resume_legacy_pipeline(self) -> None:
         """Legacy stage sequence for pre-Phase-A/B runs."""
