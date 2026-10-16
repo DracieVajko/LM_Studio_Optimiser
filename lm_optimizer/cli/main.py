@@ -4877,7 +4877,10 @@ def deepresearch_bench(
 
 
 from lm_optimizer.cli.auto_run import auto_run
+from lm_optimizer.cli.sandbox_duel import sandbox_duel
+
 app.command()(auto_run)
+app.command(name="sandbox-duel")(sandbox_duel)
 
 if __name__ == "__main__":
     app()
