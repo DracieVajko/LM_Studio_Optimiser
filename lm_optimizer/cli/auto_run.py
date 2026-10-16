@@ -98,6 +98,13 @@ def _compute_current_fingerprint(model: ModelIdentity, hardware: HardwareInfo) -
     return fp, components
 
 
+# Identity fields describe WHICH model a run belongs to. A run was looked up
+# by model id, so these can never legitimately differ for the same model; a
+# mismatch means the stored metadata is absent/stale, not that measurements
+# are invalid. They are excluded from revalidation scope.
+IDENTITY_FIELDS = ("model_id", "quantization", "architecture")
+
+
 def _decide_action(
     run: OptimizationRun | None,
     current_fp: str,
@@ -105,8 +112,10 @@ def _decide_action(
 ) -> tuple[Action, list[str] | None]:
     """Decide what action to take for a model based on run state and fingerprint.
 
-    Returns:
-        (action, fingerprint_diff_fields)
+    A run with NO stored fingerprint is UNKNOWN, not mismatched: we have no
+    evidence conditions changed, so already-tested work is preserved and the
+    fingerprint is backfilled on the next resume. Treating absent as mismatch
+    would re-run every completed model on the first auto-run.
     """
     if run is None:
         return "FULL", None
@@ -115,27 +124,30 @@ def _decide_action(
     if run.status in (RunStatus.FAILED, RunStatus.CANCELLED):
         return "FULL", None
 
-    # Check if run is complete (has a final status)
-    is_complete = run.status in (RunStatus.SUCCESS, RunStatus.COMPLETED, RunStatus.COMPLETED_NO_WINNER)
+    is_complete = run.status in (
+        RunStatus.SUCCESS,
+        RunStatus.COMPLETED,
+        RunStatus.COMPLETED_NO_WINNER,
+    )
 
     old_fp = run.benchmark_params.get("fingerprint") if run.benchmark_params else None
-    old_components = run.benchmark_params.get("fingerprint_components", {}) if run.benchmark_params else {}
+    old_components = (
+        run.benchmark_params.get("fingerprint_components", {}) if run.benchmark_params else {}
+    )
 
-    fingerprint_match = (old_fp == current_fp)
+    # Unknown fingerprint: preserve completed work, resume incomplete work.
+    if not old_fp:
+        return ("SKIP", None) if is_complete else ("RESUME", None)
 
-    if is_complete and fingerprint_match:
-        return "SKIP", None
-
-    if is_complete and not fingerprint_match:
-        diff = fingerprint_diff(old_components, current_components)
-        return "RE_RUN", diff
-
-    # Incomplete run (RUNNING, PAUSED, RESUMED, INTERRUPTED) - resumable
+    fingerprint_match = old_fp == current_fp
     if fingerprint_match:
-        return "RESUME", None
-    else:
-        diff = fingerprint_diff(old_components, current_components)
-        return "RESUME_REVALIDATE", diff
+        return ("SKIP", None) if is_complete else ("RESUME", None)
+
+    diff = fingerprint_diff(old_components, current_components)
+    scope = [f for f in diff if f not in IDENTITY_FIELDS]
+    if is_complete:
+        return "RE_RUN", scope
+    return ("RESUME_REVALIDATE", scope) if scope else ("RESUME", None)
 
 
 async def _execute_auto_run_for_model(

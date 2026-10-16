@@ -22,65 +22,132 @@ from lm_optimizer.services.fingerprint import (
 )
 
 
+def _seed_run(status, fp=None, comps=None):
+    run = OptimizationRun(
+        model=ModelIdentity(id="m1", name="m1"),
+        hardware=HardwareInfo(
+            os="T", cpu_name="C", cpu_cores_physical=1,
+            cpu_cores_logical=2, total_ram_gb=8, gpu_count=0,
+        ),
+        profile=OptimizationProfile.BALANCED,
+    )
+    run.status = status
+    run.benchmark_params = {"fingerprint": fp, "fingerprint_components": comps or {}}
+    return run
+
+
+_OLD = {
+    "model_id": "m1",
+    "quantization": "q4",
+    "architecture": "qwen",
+    "lm_studio_version": "0.3.10",
+    "hardware_fingerprint": "hw1",
+    "benchmark_suite_version": "2026-10-10",
+}
+
+
 def test_decide_action():
     """Test action decision logic."""
     from lm_optimizer.cli.auto_run import _decide_action
 
+    new = {**_OLD, "lm_studio_version": "0.3.12"}
+
     # No run -> FULL
     assert _decide_action(None, "fp1", {}) == ("FULL", None)
 
-    # Failed run -> FULL
-    run = OptimizationRun(
-        model=ModelIdentity(id="m1", name="m1"),
-        hardware=HardwareInfo(os="T", cpu_name="C", cpu_cores_physical=1, cpu_cores_logical=2, total_ram_gb=8, gpu_count=0),
-        profile=OptimizationProfile.BALANCED,
-    )
-    run.status = RunStatus.FAILED
-    assert _decide_action(run, "fp1", {}) == ("FULL", None)
+    # Failed/cancelled (not resumable) -> FULL
+    assert _decide_action(_seed_run(RunStatus.FAILED, "fp1", _OLD), "fp1", _OLD) == ("FULL", None)
+    assert _decide_action(_seed_run(RunStatus.CANCELLED, "fp1", _OLD), "fp1", _OLD) == ("FULL", None)
 
-    # Complete + fingerprint match -> SKIP
-    run = OptimizationRun(
-        model=ModelIdentity(id="m1", name="m1"),
-        hardware=HardwareInfo(os="T", cpu_name="C", cpu_cores_physical=1, cpu_cores_logical=2, total_ram_gb=8, gpu_count=0),
-        profile=OptimizationProfile.BALANCED,
-    )
-    run.status = RunStatus.SUCCESS
-    run.benchmark_params = {"fingerprint": "fp1", "fingerprint_components": {}}
-    assert _decide_action(run, "fp1", {}) == ("SKIP", None)
+    # COMPLETE + fingerprint match -> SKIP
+    assert _decide_action(_seed_run(RunStatus.SUCCESS, "fp1", _OLD), "fp1", _OLD) == ("SKIP", None)
 
-    # Complete + fingerprint mismatch -> RE_RUN
-    run = OptimizationRun(
-        model=ModelIdentity(id="m1", name="m1"),
-        hardware=HardwareInfo(os="T", cpu_name="C", cpu_cores_physical=1, cpu_cores_logical=2, total_ram_gb=8, gpu_count=0),
-        profile=OptimizationProfile.BALANCED,
-    )
-    run.status = RunStatus.SUCCESS
-    run.benchmark_params = {"fingerprint": "old_fp", "fingerprint_components": {"lm_studio_version": "0.3.10"}}
-    action, diff = _decide_action(run, "new_fp", {"lm_studio_version": "0.3.12"})
+    # COMPLETE + fingerprint mismatch -> RE_RUN with changed scope
+    action, diff = _decide_action(_seed_run(RunStatus.SUCCESS, "old_fp", _OLD), "new_fp", new)
     assert action == "RE_RUN"
-    assert "lm_studio_version" in diff
+    assert diff == ["lm_studio_version"]
 
-    # Incomplete + fingerprint match -> RESUME
-    run = OptimizationRun(
-        model=ModelIdentity(id="m1", name="m1"),
-        hardware=HardwareInfo(os="T", cpu_name="C", cpu_cores_physical=1, cpu_cores_logical=2, total_ram_gb=8, gpu_count=0),
-        profile=OptimizationProfile.BALANCED,
-    )
-    run.status = RunStatus.INTERRUPTED
-    run.benchmark_params = {"fingerprint": "fp1", "fingerprint_components": {}}
-    assert _decide_action(run, "fp1", {}) == ("RESUME", None)
+    # INCOMPLETE + fingerprint match -> RESUME
+    assert _decide_action(_seed_run(RunStatus.INTERRUPTED, "fp1", _OLD), "fp1", _OLD) == ("RESUME", None)
+    assert _decide_action(_seed_run(RunStatus.RUNNING, "fp1", _OLD), "fp1", _OLD) == ("RESUME", None)
 
-    # Incomplete + fingerprint mismatch -> RESUME_REVALIDATE
-    run = OptimizationRun(
-        model=ModelIdentity(id="m1", name="m1"),
-        hardware=HardwareInfo(os="T", cpu_name="C", cpu_cores_physical=1, cpu_cores_logical=2, total_ram_gb=8, gpu_count=0),
-        profile=OptimizationProfile.BALANCED,
-    )
-    run.status = RunStatus.INTERRUPTED
-    run.benchmark_params = {"fingerprint": "old_fp", "fingerprint_components": {"hardware_fingerprint": "old_hw"}}
-    action, diff = _decide_action(run, "new_fp", {"hardware_fingerprint": "new_hw"})
+    # INCOMPLETE + fingerprint mismatch -> RESUME_REVALIDATE
+    action, diff = _decide_action(_seed_run(RunStatus.INTERRUPTED, "old_fp", _OLD), "new_fp", new)
     assert action == "RESUME_REVALIDATE"
-    assert "hardware_fingerprint" in diff
+    assert diff == ["lm_studio_version"]
+
+
+def test_absent_fingerprint_is_unknown_not_mismatch():
+    """A run predating fingerprinting must NOT be treated as changed.
+
+    Absent fingerprint carries no evidence of a change; re-running every
+    completed model on the first auto-run would discard measured work for no
+    reason, and the fingerprint is backfilled on the next resume.
+    """
+    from lm_optimizer.cli.auto_run import _decide_action
+
+    current = {**_OLD, "lm_studio_version": "0.3.12", "benchmark_suite_version": "2026-10-15"}
+    no_fp_complete = _seed_run(RunStatus.SUCCESS)
+    no_fp_complete.benchmark_params = {}
+    no_fp_incomplete = _seed_run(RunStatus.INTERRUPTED)
+    no_fp_incomplete.benchmark_params = {}
+
+    assert _decide_action(no_fp_complete, "fp_new", current) == ("SKIP", None)
+    assert _decide_action(no_fp_incomplete, "fp_new", current) == ("RESUME", None)
+
+
+def test_identity_fields_excluded_from_revalidation_scope():
+    """model_id/quantization/architecture cannot differ for a looked-up run.
+
+    They identify WHICH model the run belongs to. A stale stored value must not
+    scope a revalidation when every environment field still matches, because
+    the measurements are still valid for this model on this host.
+    """
+    from lm_optimizer.cli.auto_run import _decide_action
+
+    # Environment fields all match; only the identity fields are stale.
+    run = _seed_run(RunStatus.INTERRUPTED, "old_fp", {
+        "model_id": "", "quantization": None, "architecture": None,
+        "lm_studio_version": "0.3.12",
+        "hardware_fingerprint": "hw1",
+        "benchmark_suite_version": "2026-10-15",
+    })
+    current = {
+        "model_id": "m1",
+        "quantization": "q4",
+        "architecture": "qwen",
+        "lm_studio_version": "0.3.12",
+        "hardware_fingerprint": "hw1",
+        "benchmark_suite_version": "2026-10-15",
+    }
+
+    action, diff = _decide_action(run, "new_fp", current)
+    assert action == "RESUME", "identity-only diff must not force revalidation"
+    assert diff is None
+
+
+def test_environment_change_does_scope_revalidation():
+    """A hardware/version change alongside identity noise still revalidates."""
+    from lm_optimizer.cli.auto_run import _decide_action
+
+    run = _seed_run(RunStatus.INTERRUPTED, "old_fp", {
+        "model_id": "", "quantization": None, "architecture": None,
+        "lm_studio_version": "0.3.10",
+        "hardware_fingerprint": "hw1",
+        "benchmark_suite_version": "2026-10-15",
+    })
+    current = {
+        "model_id": "m1",
+        "quantization": "q4",
+        "architecture": "qwen",
+        "lm_studio_version": "0.3.12",
+        "hardware_fingerprint": "hw1",
+        "benchmark_suite_version": "2026-10-15",
+    }
+
+    action, diff = _decide_action(run, "new_fp", current)
+    assert action == "RESUME_REVALIDATE"
+    assert diff == ["lm_studio_version"], "identity noise must not widen the scope"
 
 
 def test_compute_current_fingerprint():

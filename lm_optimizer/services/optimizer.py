@@ -3249,6 +3249,33 @@ class AdaptiveOptimizer:
                     "FINGERPRINT_REVALIDATE",
                     f"kept={len(keep)} revalidate={len(reval)}",
                 )
+        else:
+            # Backfill: a run created before fingerprinting has no stored
+            # fingerprint. Adopt the current one so the NEXT auto-run can
+            # compare honestly instead of treating absence as a mismatch.
+            try:
+                from lm_optimizer.benchmark.suite_version import BENCHMARK_SUITE_VERSION
+                from lm_optimizer.services import lms_cli as _lms_cli
+
+                try:
+                    lms_version = _lms_cli.lms_version()
+                except Exception:
+                    lms_version = "unknown"
+                comps = {
+                    "model_id": full.model.id,
+                    "quantization": full.model.quantization,
+                    "architecture": full.model.architecture,
+                    "lm_studio_version": lms_version,
+                    "hardware_fingerprint": hardware_fingerprint(hw) if hw else "unknown",
+                    "benchmark_suite_version": BENCHMARK_SUITE_VERSION,
+                }
+                if not (full.benchmark_params or {}).get("fingerprint"):
+                    full.benchmark_params = dict(full.benchmark_params or {})
+                    full.benchmark_params["fingerprint"] = compute_fingerprint(**comps)
+                    full.benchmark_params["fingerprint_components"] = comps
+                    self._log_event("FINGERPRINT_BACKFILL", f"fp={full.benchmark_params['fingerprint'][:16]}")
+            except Exception as e:
+                logger.debug("Fingerprint backfill skipped", error=str(e))
 
         # Reconcile phase/winner state if DB and checkpoint disagree
         self._reconcile_phase_and_winner(full, ckpt)
