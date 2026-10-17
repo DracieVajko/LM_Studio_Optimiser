@@ -49,8 +49,29 @@ def _lock_path(lock_dir: str | Path | None = None) -> Path:
     return _default_lock_path()
 
 
+def _self_create_time() -> float | None:
+    """This process's creation time, when psutil can supply it."""
+    try:
+        import psutil  # noqa: PLC0415 - lazy import mirrors hostguard guard style
+    except ImportError:
+        return None
+    try:
+        return float(psutil.Process(os.getpid()).create_time())
+    except Exception:
+        return None
+
+
 def _holder_alive(holder: Any) -> bool:
-    """True when the lock holder PID is (or may be) a live process."""
+    """True when the lock holder PID is (or may be) a live process.
+
+    PID alone is not enough: after a crash the PID may be reused by an
+    unrelated process, which would make a stale lock look live forever. When
+    the lock records the holder's creation time we compare it, so a reused PID
+    is correctly reported as dead and the stale lock is reclaimed.
+
+    Without liveness information we fail closed (the lock blocks) rather than
+    risking two concurrent optimizer jobs on one host.
+    """
     pid = holder.get("pid") if isinstance(holder, dict) else None
     if not isinstance(pid, int) or pid <= 0:
         return False
@@ -59,7 +80,13 @@ def _holder_alive(holder: Any) -> bool:
     except ImportError:
         return True  # fail-closed: without liveness info a lock blocks
     try:
-        return psutil.pid_exists(pid)
+        if not psutil.pid_exists(pid):
+            return False
+        recorded = holder.get("create_time")
+        if isinstance(recorded, (int, float)):
+            # Same PID, different process -> the original holder is gone.
+            return abs(float(psutil.Process(pid).create_time()) - float(recorded)) < 2.0
+        return True
     except Exception:
         return True
 
@@ -87,7 +114,14 @@ def acquire_lock(purpose: str = "", lock_dir: str | Path | None = None) -> dict:
     """
     path = _lock_path(lock_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
-    record = {"pid": os.getpid(), "started": time.time(), "purpose": purpose}
+    record = {
+        "pid": os.getpid(),
+        "started": time.time(),
+        "purpose": purpose,
+        # Lets a later reader tell "this PID is still my process" from
+        # "this PID now belongs to someone else" (PID reuse).
+        "create_time": _self_create_time(),
+    }
     payload = json.dumps(record).encode("utf-8")
     for _ in range(2):
         try:

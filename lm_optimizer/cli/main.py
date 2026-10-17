@@ -1262,7 +1262,7 @@ def optimize(
         sys.exit(2)
     if resume_id:
         # Delegate to resume flow (model arg is ignored except for display).
-        resume(run_id=resume_id, revalidate=revalidate, style=style)
+        resume(run_id=resume_id, revalidate=revalidate, style=style, skip_phases=None)
         return
 
     _reject_bool_like_model_args([model])
@@ -1294,6 +1294,26 @@ def optimize(
             except HostUnreachableError as e:
                 _handle_connection_error(_client_base_url(client), e.cause or e)
                 sys.exit(1)
+            # Auto-reconcile stale runs for this model: a previous process that
+            # died (crash, kill, reboot) leaves a "running" row behind. Mark
+            # such rows interrupted so they stop accumulating and the user can
+            # resume explicitly with --resume <id> if they want to continue.
+            try:
+                from lm_optimizer.services.run_reconcile import reconcile_stale_runs
+
+                recon = reconcile_stale_runs(dry_run=False, model_id=model)
+                if recon.get("changed"):
+                    console.print(
+                        f"[yellow]Reconciled {recon['changed']} stale run(s) for "
+                        f"{model} (marked interrupted).[/yellow]"
+                    )
+                    for ch in recon.get("changes", []):
+                        console.print(
+                            f"  [dim]{ch['id'][:8]}  {ch['from']} -> {ch['to']} "
+                            f"(resume with --resume {ch['id']})[/dim]"
+                        )
+            except Exception as e:
+                logger.debug("Auto-reconcile failed", error=str(e))
             for line in format_snapshot(snap):
                 console.print(f"  {line}")
             if not snap.get("verified_empty") and snap.get("leftovers"):
@@ -3358,7 +3378,11 @@ def _apply_resume_skips(run, skip_phases: str | None) -> None:
 
     Exits 2 on unknown phase names. No-op when skip_phases is falsy.
     """
-    if not skip_phases:
+    # Guard against typer OptionInfo leaking in when resume() is called
+    # directly (e.g. from optimize --resume) instead of via the CLI.
+    if isinstance(skip_phases, typer.models.OptionInfo):
+        skip_phases = getattr(skip_phases, "default", None)
+    if not skip_phases or not isinstance(skip_phases, str):
         return
     from lm_optimizer.services.optimizer import parse_phase_skips
 
@@ -4877,10 +4901,12 @@ def deepresearch_bench(
 
 
 from lm_optimizer.cli.auto_run import auto_run
+from lm_optimizer.cli.host_watch import host_watch
 from lm_optimizer.cli.sandbox_duel import sandbox_duel
 
 app.command()(auto_run)
 app.command(name="sandbox-duel")(sandbox_duel)
+app.command(name="host-watch")(host_watch)
 
 if __name__ == "__main__":
     app()

@@ -37,6 +37,7 @@ from lm_optimizer.scoring.normalization import (
     weighted_score,
 )
 from lm_optimizer.services.benchmark import BenchmarkService
+from lm_optimizer.services.foreign_watchdog import BACKEND_LMSTUDIO, ForeignModelWatchdog
 from lm_optimizer.services.fingerprint import (
     compute_fingerprint,
     fingerprint_diff,
@@ -198,15 +199,23 @@ def parse_phase_skips(value) -> set[str]:
     Accepts a comma string or a list/tuple/set. Raises ValueError naming
     the first unknown phase (callers fail fast: CLI exit 2).
     """
+    # Typer may hand us an OptionInfo object when a CLI default is not
+    # resolved (e.g. resume() called directly from optimize()). Unwrap it.
+    try:
+        import typer.models as _tm
+        if isinstance(value, _tm.OptionInfo):
+            value = getattr(value, "default", None)
+    except Exception:
+        pass
     if value is None:
         return set()
     if isinstance(value, str):
         items = [p.strip() for p in value.split(",")]
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        items = [str(p).strip() for p in value]
     else:
-        try:
-            items = [str(p).strip() for p in value]
-        except TypeError:
-            raise ValueError(f"Invalid skip_phases: {value!r}")
+        # Unknown scalar -> skip nothing (never crash on a default value).
+        return set()
     names = {p.lower() for p in items if p}
     unknown = sorted(names - set(PHASE_SKIP_NAMES))
     if unknown:
@@ -401,6 +410,16 @@ class AdaptiveOptimizer:
                 quality_threshold = prof.minimum_quality
             except Exception:
                 quality_threshold = 0.97
+
+        # Keep the quality evaluator in sync with the (possibly RoPE-raised)
+        # threshold. Otherwise the run stores 0.98 while evaluation uses 0.97.
+        try:
+            if getattr(self, "quality", None) is not None and getattr(
+                self.quality, "config", None
+            ) is not None:
+                self.quality.config.minimum_score = quality_threshold
+        except Exception:
+            pass
 
         # Resolve profile weights
         resolved_weights = profile_weights or DEFAULT_PROFILE_WEIGHTS.get(profile)
@@ -668,6 +687,87 @@ class AdaptiveOptimizer:
                 _save_ckpt(self.state, reason=reason)
         except Exception:
             pass
+
+    # ---------- host guard: foreign model loads ----------
+
+    def _host_guard(self) -> "ForeignModelWatchdog | None":
+        """Watchdog protecting the model under test, or None when unavailable."""
+        w = getattr(self, "_watchdog", None)
+        if w is None:
+            try:
+                from lm_optimizer.services.foreign_watchdog import build_watchdog
+
+                self._watchdog = w = build_watchdog(
+                    self.client,
+                    BACKEND_LMSTUDIO,
+                    model_under_test=self.state.run.model.id,
+                    echo_probe_model=self._echo_probe_model(),
+                    allow_unload=bool(
+                        (self.state.run.benchmark_params or {}).get(
+                            "auto_unload_foreign", True
+                        )
+                    ),
+                )
+            except Exception as e:
+                logger.debug("Foreign watchdog unavailable", error=str(e))
+                return None
+        return w
+
+    def _echo_probe_model(self) -> str | None:
+        """Smallest non-embedding model: the one ``connect()`` legitimately loads."""
+        try:
+            models = list(getattr(self.client, "_models_cache", []) or [])
+            cands = [
+                m for m in models if "embed" not in (getattr(m, "id", "") or "").lower()
+            ]
+            if not cands:
+                return None
+            return min(cands, key=lambda m: getattr(m, "size_bytes", 0) or 0).id
+        except Exception:
+            return None
+
+    async def guard_host(self) -> dict:
+        """Clear foreign loads before a measurement; never touches our own models.
+
+        Returns a small record so the caller can mark a measurement as
+        contested when a foreign model was present during the attempt.
+        """
+        out = {"foreign": [], "unloaded": [], "failed": [], "inspected": False}
+        if self.state is None:
+            return out
+        wd = self._host_guard()
+        if wd is None:
+            return out
+        try:
+            report = await wd.check()
+        except Exception as e:
+            logger.warning("Host guard failed", error=f"{type(e).__name__}: {e}"[:160])
+            return out
+
+        out["inspected"] = report.inspected
+        out["foreign"] = [f.model.model_id for f in report.foreign]
+        out["unloaded"] = list(report.unloaded)
+        out["failed"] = list(report.unload_failed)
+
+        if report.foreign:
+            self._log_event(
+                "FOREIGN_MODEL_DETECTED",
+                f"backend={report.backend} models={out['foreign']} "
+                f"unloaded={out['unloaded']} failed={out['failed']}",
+            )
+            for f in report.foreign:
+                self.state.errors.append(
+                    f"foreign_model_loaded: {f.model.model_id}"
+                    + (f" instance={f.model.instance_id}" if f.model.instance_id else "")
+                )
+            try:
+                if self.state.event_log is not None:
+                    self.state.event_log = self.state.event_log[-200:]
+                if self.state.errors is not None:
+                    self.state.errors = self.state.errors[-50:]
+            except Exception:
+                pass
+        return out
 
     def checkpoint_now(self, reason: str = "manual") -> None:
         """Synchronous checkpoint for Cancel/shutdown paths (before ack)."""
@@ -1456,6 +1556,10 @@ class AdaptiveOptimizer:
             return res
 
         try:
+            # Clear any foreign model load BEFORE measuring: a stray local
+            # client competes for VRAM and can abort this generation, which
+            # turns a real measurement into noise.
+            guard = await self.guard_host()
             self._log_event("LOAD_REQUESTED", f"ctx={context_length}")
             result = await self.benchmark.run_benchmark(
                 self.state.run.model.id, load_config, context_length
@@ -2095,6 +2199,9 @@ class AdaptiveOptimizer:
                 "RESUME_SKIP probe_completed", f"key attempts exhausted for {item.stage}"
             )
             return None
+        # Same host guard as the full-suite path: a foreign load poisons a
+        # speed probe just as badly as a quality run.
+        await self.guard_host()
         res = await self.benchmark.run_speed_probe(
             self.state.run.model.id,
             item.config,
@@ -2437,13 +2544,26 @@ class AdaptiveOptimizer:
     async def _recheck_quality(
         self, cfg: LoadConfiguration, ctx: int, test_names: list[str]
     ) -> tuple[bool, object, ConfigurationResult | None]:
-        """Rerun ONLY named quality tests (recovery subset, never full suite)."""
+        """Rerun ONLY named quality tests (recovery subset, never full suite).
+
+        The measurement context comes from `cfg`, not from `ctx`. A rollback
+        changes cfg (e.g. context_length 32768 -> 4096) while `ctx` still holds
+        the FAILED result's context; measuring at `ctx` would silently re-run
+        the exact configuration recovery just decided to abandon, at 8x the
+        cost, and record a quality_after that describes a run that never
+        happened. `ctx` is only the fallback when cfg carries no context.
+        """
+        effective_ctx = int(getattr(cfg, "context_length", None) or ctx)
         cases = [
-            c for c in self.benchmark.create_cases_for_context(ctx) if c.name in set(test_names)
+            c
+            for c in self.benchmark.create_cases_for_context(effective_ctx)
+            if c.name in set(test_names)
         ]
         if not cases:
             return False, None, None
-        res = await self.benchmark.run_cases(self.state.run.model.id, cfg, ctx, cases)
+        res = await self.benchmark.run_cases(
+            self.state.run.model.id, cfg, effective_ctx, cases
+        )
         try:
             scores = self.quality.evaluate_all(self.state.run.model.id, res.metrics)
             agg = self.quality.aggregate_quality(scores)
@@ -2587,8 +2707,14 @@ class AdaptiveOptimizer:
     async def _admit_recovered(
         self, rolled: LoadConfiguration, ctx: int
     ) -> ConfigurationResult | None:
-        """Full-suite admission of a subset-passing rollback (PASSED + scored)."""
-        admitted = await self._test_config(rolled, ctx, score_context=False, min_speed=self.state.run.advanced_settings.get("min_speed", 0.0))
+        """Full-suite admission of a subset-passing rollback (PASSED + scored).
+
+        Admission must measure `rolled`, not the failed result's context, for
+        the same reason `_recheck_quality` does - otherwise a recovered config
+        is validated under settings it will never run with.
+        """
+        effective_ctx = int(getattr(rolled, "context_length", None) or ctx)
+        admitted = await self._test_config(rolled, effective_ctx, score_context=False, min_speed=self.state.run.advanced_settings.get("min_speed", 0.0))
         if admitted is not None and admitted.status == ConfigurationStatus.PASSED:
             self._tag_phase(admitted, OptimizationPhase.RECOVERY.value)
             if admitted.id not in [c.id for c in self.state.tested_configs]:

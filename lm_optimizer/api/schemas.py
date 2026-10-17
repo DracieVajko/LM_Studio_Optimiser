@@ -151,6 +151,37 @@ class OptimizationRunResponse(BaseModel):
     pause: dict | None = None
     config_count: int = 0
     stale: bool = False
+    # Winner metrics for history lists (server-computed from the actual
+    # validated winner; None when no validated winner exists — never a fake 0).
+    best_gen_tok_s: float | None = None
+    best_quality: float | None = None
+    best_context_length: int | None = None
+    has_validated_winner: bool = False
+
+
+class StatsResponse(BaseModel):
+    """Dashboard quick-stats (documented, tested meanings).
+
+    - models_available: currently installed models eligible for text
+      optimization (embedding-only models excluded).
+    - models_total: all currently installed models (incl. embeddings).
+    - models_embedding_only: installed models that cannot be optimized.
+    - inventory_ok: False when the provider inventory could not be read
+      (distinguishes "empty" from "error"; never a silent 0).
+    - optimized_models: distinct models with a validated best configuration.
+    - runs_today: runs created today (machine local day boundary).
+    - total_runs: all runs ever recorded.
+    """
+
+    models_available: int = 0
+    models_total: int = 0
+    models_embedding_only: int = 0
+    inventory_ok: bool = True
+    inventory_error: str | None = None
+    optimized_models: int = 0
+    runs_today: int = 0
+    total_runs: int = 0
+    as_of: str
 
 
 class ConfigurationResultResponse(BaseModel):

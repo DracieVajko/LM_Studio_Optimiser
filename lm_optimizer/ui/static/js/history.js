@@ -1,7 +1,7 @@
 // LM Studio Auto Optimizer - History Page
 
-import { API } from './api.js?v=6';
-import { UI } from './ui.js?v=6';
+import { API } from './api.js?v=8';
+import { UI } from './ui.js?v=8';
 
 const HistoryPage = {
     state: {
@@ -16,6 +16,11 @@ const HistoryPage = {
         await this.loadDuels();
         this.render();
         this.attachEvents();
+        // Deep link from the Sandbox page to its history section.
+        if (window.location.hash === '#sandbox-history') {
+            const el = document.getElementById('sandbox-history');
+            if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
     },
 
     async loadDuels() {
@@ -74,6 +79,9 @@ const HistoryPage = {
                             </svg>
                             Refresh
                         </button>
+                        <button id="reconcile-runs" class="btn btn-outline" title="Mark dead 'running' runs interrupted (keeps history + checkpoints)">
+                            Reconcile Stale
+                        </button>
                     </div>
                 </div>
 
@@ -102,8 +110,12 @@ const HistoryPage = {
                                 <label class="form-label">Filter by Status</label>
                                 <select id="filter-status" class="form-input form-select">
                                     <option value="">All Statuses</option>
-                                    <option value="completed">Completed</option>
+                                    <option value="success">Success (validated winner)</option>
+                                    <option value="completed_no_validated_winner">Completed, no validated winner</option>
+                                    <option value="partial_success">Partial success</option>
                                     <option value="running">Running</option>
+                                    <option value="paused">Paused</option>
+                                    <option value="interrupted">Interrupted</option>
                                     <option value="failed">Failed</option>
                                     <option value="cancelled">Cancelled</option>
                                 </select>
@@ -121,7 +133,7 @@ const HistoryPage = {
                 </div>
 
                 <!-- Sandbox Duels -->
-                <div class="flex items-center justify-between mt-8 mb-2">
+                <div class="flex items-center justify-between mt-8 mb-2" id="sandbox-history">
                     <h2 class="text-xl font-bold text-gray-900">Sandbox Duels</h2>
                     <button id="delete-duels" class="btn btn-outline btn-sm" disabled>Delete selected</button>
                 </div>
@@ -248,7 +260,7 @@ const HistoryPage = {
         return `
             <div class="card-body p-0">
                 <div class="table-container">
-                    <table class="table">
+                    <table class="table history-table">
                         <thead>
                             <tr>
                                 <th>Date</th>
@@ -266,7 +278,7 @@ const HistoryPage = {
                             ${this.state.filteredRuns.map(r => `
                                 <tr class="run-row hover:bg-gray-50 cursor-pointer" data-run-id="${r.id}">
                                     <td class="font-mono text-sm">${new Date(r.created_at).toLocaleString()}</td>
-                                    <td>
+                                    <td class="model-cell">
                                         <div class="font-medium">${r.model.name}</div>
                                         <div class="text-xs text-gray-500 font-mono">${r.model.id}</div>
                                     </td>
@@ -291,20 +303,34 @@ const HistoryPage = {
     },
 
     getBestGenSpeed(run) {
-        if (!run.best_config_id || !run.configurations) return '—';
-        const best = run.configurations.find(c => c.id === run.best_config_id);
-        return best?.avg_generation_tok_s ? best.avg_generation_tok_s.toFixed(1) : '—';
+        // Server-computed winner metrics (list rows carry no full configs).
+        if (run.best_gen_tok_s !== undefined && run.best_gen_tok_s !== null) {
+            return Number(run.best_gen_tok_s).toFixed(1);
+        }
+        if (run.configurations && run.best_config_id) {
+            const best = run.configurations.find(c => c.id === run.best_config_id);
+            if (best?.avg_generation_tok_s) return best.avg_generation_tok_s.toFixed(1);
+        }
+        return '—';
     },
 
     getBestQuality(run) {
-        if (!run.best_config_id || !run.configurations) return '—';
-        const best = run.configurations.find(c => c.id === run.best_config_id);
-        return best?.quality?.overall ? best.quality.overall.toFixed(3) : '—';
+        if (run.best_quality !== undefined && run.best_quality !== null) {
+            return Number(run.best_quality).toFixed(3);
+        }
+        if (run.configurations && run.best_config_id) {
+            const best = run.configurations.find(c => c.id === run.best_config_id);
+            if (best?.quality?.overall) return best.quality.overall.toFixed(3);
+        }
+        return '—';
     },
 
     attachEvents() {
         // Resume All Pending
         document.getElementById('resume-all-pending')?.addEventListener('click', () => this.resumeAllPending());
+
+        // Reconcile stale running runs (preview → confirm → apply).
+        document.getElementById('reconcile-runs')?.addEventListener('click', () => this.reconcileStaleRuns());
 
         // Refresh
         document.getElementById('refresh-history')?.addEventListener('click', () => this.loadRuns());
@@ -456,6 +482,29 @@ const HistoryPage = {
         await this.loadDuels();
         this.state.filteredRuns = this.state.runs;
         this.render(); // full re-render: fresh nodes, single attachEvents
+    },
+
+    async reconcileStaleRuns() {
+        const btn = document.getElementById('reconcile-runs');
+        if (btn) btn.disabled = true;
+        try {
+            const preview = await API.reconcileRuns(false);
+            const changed = (preview && preview.changed) || 0;
+            if (!changed) {
+                UI.showToast('No stale running runs found', 'info');
+                return;
+            }
+            if (!window.confirm(`Mark ${changed} dead 'running' run(s) as interrupted? History and checkpoints are preserved.`)) {
+                return;
+            }
+            const applied = await API.reconcileRuns(true);
+            UI.showToast(`Reconciled ${(applied && applied.changed) || 0} stale run(s)`, 'success');
+            await this.refresh();
+        } catch (err) {
+            UI.showToast((err && err.message) || 'Reconcile failed', 'error');
+        } finally {
+            if (btn) btn.disabled = false;
+        }
     },
 
     async resumeAllPending() {

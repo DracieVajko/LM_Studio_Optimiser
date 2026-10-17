@@ -41,7 +41,7 @@ export const UI = {
     },
 
     // Dashboard Rendering
-    renderDashboard(status, modelsResponse) {
+    renderDashboard(status, modelsResponse, stats) {
         const models = modelsResponse.models || [];
         const hardware = status.hardware || {};
         const connected = !!(status.lm_studio && status.lm_studio.connected);
@@ -78,7 +78,7 @@ export const UI = {
 
                 <!-- Quick Stats -->
                 <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
-                    ${this.renderQuickStats(models)}
+                    ${this.renderQuickStats(stats, models)}
                 </div>
             </div>
         `;
@@ -448,18 +448,43 @@ export const UI = {
         `;
     },
 
-    renderQuickStats(models) {
-        const stats = [
-            { label: 'Models Available', value: models.length, icon: '📦' },
-            { label: 'Optimized', value: 0, icon: '⚡' }, // Would come from presets
-            { label: 'Runs Today', value: 0, icon: '📊' },
+    renderQuickStats(stats, models) {
+        const s = stats || {};
+        // Fall back to the models list only if the stats endpoint failed.
+        const modelsAvailable = (s.models_available !== undefined && s.models_available !== null)
+            ? s.models_available
+            : (models ? models.length : 0);
+        const inventoryError = s.inventory_ok === false;
+        const stats2 = [
+            {
+                label: 'Models Available',
+                value: inventoryError ? '!' : modelsAvailable,
+                icon: '📦',
+                hint: inventoryError
+                    ? `Inventory error: ${s.inventory_error || 'provider unreachable'}`
+                    : `${s.models_embedding_only || 0} embedding-only excluded`,
+                warn: inventoryError,
+            },
+            {
+                label: 'Optimized',
+                value: s.optimized_models ?? 0,
+                icon: '⚡',
+                hint: 'Distinct models with a validated best configuration',
+            },
+            {
+                label: 'Runs Today',
+                value: s.runs_today ?? 0,
+                icon: '📊',
+                hint: `${s.total_runs ?? 0} runs total (local day boundary)`,
+            },
         ];
 
-        return stats.map(s => `
-            <div class="card p-6 text-center">
+        return stats2.map(s => `
+            <div class="card p-6 text-center" title="${s.hint}">
                 <div class="text-4xl mb-2">${s.icon}</div>
-                <div class="text-3xl font-bold text-gray-900">${s.value}</div>
+                <div class="text-3xl font-bold ${s.warn ? 'text-red-600' : 'text-gray-900'}">${s.value}</div>
                 <div class="text-sm text-gray-500">${s.label}</div>
+                <div class="text-xs text-gray-400 mt-1">${s.hint}</div>
             </div>
         `).join('');
     },
@@ -532,6 +557,7 @@ export const UI = {
             'success': 'badge-success',
             'passed': 'badge-success',
             'partial_success': 'badge-warning',
+            'completed_no_validated_winner': 'badge-warning',
             'running': 'badge-warning',
             'resumed': 'badge-warning',
             'paused': 'badge-info',

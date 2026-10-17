@@ -397,6 +397,7 @@ class LMStudioClient:
                 is_moe=self._detect_moe(item),
                 num_experts=item.get("num_experts"),
                 size_bytes=item.get("size_bytes"),
+                model_type=item.get("type"),
             )
             models.append(model)
 

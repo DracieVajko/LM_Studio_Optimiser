@@ -65,6 +65,15 @@ def setup_logging() -> None:
     file_handler.setFormatter(logging.Formatter("%(message)s"))
 
     root_logger = logging.getLogger()
+    # Idempotence: setup_logging() is called from every CLI entrypoint and
+    # from tests that re-run it. Without this guard each call appended another
+    # handler and every record was written N times - a 10x call count produced
+    # a 10x log file. Replacing our own handler keeps exactly one.
+    for existing in list(root_logger.handlers):
+        if getattr(existing, "_optimizer_managed", False):
+            root_logger.removeHandler(existing)
+            existing.close()
+    file_handler._optimizer_managed = True  # type: ignore[attr-defined]
     root_logger.addHandler(file_handler)
     root_logger.setLevel(getattr(logging, config.logging.level))
 

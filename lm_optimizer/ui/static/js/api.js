@@ -77,6 +77,16 @@ export const API = {
         return this.request('/models');
     },
 
+    // Dashboard quick-stats (documented meanings, server-computed).
+    async getStats() {
+        return this.request('/stats');
+    },
+
+    // Preview/apply stale-running reconciliation.
+    async reconcileRuns(apply = false) {
+        return this.request(`/runs/reconcile${apply ? '?apply=true' : ''}`, { method: 'POST' });
+    },
+
     async getModel(modelId) {
         return this.request(`/models/${modelId}`);
     },

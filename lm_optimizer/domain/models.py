@@ -60,7 +60,15 @@ class OptimizationPhase(str, Enum):
 class RunStatus(str, Enum):
     """Optimization run status.
 
-    SUCCESS/PARTIAL_SUCCESS/FAILED are terminal success-class states.
+    SUCCESS: a validated winning configuration was found; individual other
+    candidate failures never downgrade the run.
+    COMPLETED_NO_WINNER: the campaign completed and the model generated usable
+    output, but no configuration passed the configured quality threshold. It is
+    an honest terminal state (not a failure, not a validated winner).
+    PARTIAL_SUCCESS: legacy/transitional — an incomplete campaign that kept
+    useful validated results. New completed runs no longer use it for mere
+    candidate failures (that is SUCCESS).
+    FAILED: genuine run-level failure (model never loaded, no usable output).
     CANCELLED/INTERRUPTED are terminal interruption states.
     RESUMED marks a run that was restored from a checkpoint and is running.
     COMPLETED is kept as a legacy alias of SUCCESS.
@@ -72,6 +80,7 @@ class RunStatus(str, Enum):
     COMPLETED = "completed"
     SUCCESS = "success"
     PARTIAL_SUCCESS = "partial_success"
+    COMPLETED_NO_WINNER = "completed_no_validated_winner"
     FAILED = "failed"
     CANCELLED = "cancelled"
     INTERRUPTED = "interrupted"
@@ -80,7 +89,25 @@ class RunStatus(str, Enum):
 
 # Terminal success-class states (winner may exist).
 SUCCESS_STATES: frozenset = frozenset(
-    {RunStatus.COMPLETED, RunStatus.SUCCESS, RunStatus.PARTIAL_SUCCESS}
+    {
+        RunStatus.COMPLETED,
+        RunStatus.SUCCESS,
+        RunStatus.PARTIAL_SUCCESS,
+        RunStatus.COMPLETED_NO_WINNER,
+    }
+)
+
+# Terminal states that mark a finished campaign (nothing left to run).
+TERMINAL_STATES: frozenset = frozenset(
+    {
+        RunStatus.COMPLETED,
+        RunStatus.SUCCESS,
+        RunStatus.PARTIAL_SUCCESS,
+        RunStatus.COMPLETED_NO_WINNER,
+        RunStatus.FAILED,
+        RunStatus.CANCELLED,
+        RunStatus.INTERRUPTED,
+    }
 )
 
 
@@ -167,6 +194,10 @@ class ModelIdentity:
     is_moe: bool = False
     num_experts: int | None = None
     size_bytes: int | None = None
+    # Provider-declared model type ("llm", "embedding", "reranker", ...).
+    # None when the backend does not report it; eligibility then falls back to
+    # architecture/name signals and stays conservative.
+    model_type: str | None = None
 
     def __hash__(self):
         return hash(self.id)

@@ -505,11 +505,19 @@ class TestPhaseTransitionCrashRecovery:
             },
         }
 
-        # Write checkpoint to temp dir
+        # Write checkpoint to temp dir. Use monkeypatch (not a bare attribute
+        # assignment) so the stub is undone at teardown - otherwise it leaks
+        # into later tests in the same worker and makes save_checkpoint return
+        # an int (write_text's return value), breaking unrelated assertions.
         monkeypatch.setattr(_rc, "checkpoint_dir", lambda: tmp_path)
-        _rc.save_checkpoint = lambda state, reason="x": _rc.checkpoint_path(state.run.id).write_text(
-            __import__("orjson").dumps(ckpt_data).decode()
-        )
+
+        def _fake_save_checkpoint(state, reason="x"):
+            _rc.checkpoint_path(state.run.id).write_text(
+                __import__("orjson").dumps(ckpt_data).decode()
+            )
+            return _rc.checkpoint_path(state.run.id)
+
+        monkeypatch.setattr(_rc, "save_checkpoint", _fake_save_checkpoint)
 
         # Mock DB repos
         from lm_optimizer.database import repositories as _repo

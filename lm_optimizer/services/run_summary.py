@@ -1,7 +1,9 @@
 """Final run classification + recommendation helpers (P1 UX).
 
-Single place deciding SUCCESS / PARTIAL_SUCCESS / FAILED from tested configs,
-so CLI, API and Web UI agree. Only PASSED configs may enter the winner set.
+Single place deciding SUCCESS / COMPLETED_NO_WINNER / FAILED from tested
+configs, so CLI, API and Web UI agree. Run-level outcome is never the worst
+candidate: a validated winner makes the run SUCCESS regardless of other
+candidate failures. Only PASSED+scored configs may enter the winner set.
 """
 
 from __future__ import annotations
@@ -62,42 +64,57 @@ def failure_breakdown(configs: list) -> dict:
     return out
 
 
-def classify_run(configs: list) -> tuple[str, dict]:
-    """Return (state, info) where state in SUCCESS/PARTIAL_SUCCESS/FAILED.
+def classify_run(configs: list, run: Any | None = None) -> tuple[str, dict]:
+    """Return (state, info) where state in SUCCESS / NO_WINNER / FAILED.
 
-    - SUCCESS: at least one PASSED and zero non-passed.
-    - PARTIAL_SUCCESS: at least one PASSED and at least one failed.
-    - FAILED: zero PASSED.
+    Run-level outcome is NOT the worst candidate:
+
+    - SUCCESS: a validated winning configuration exists (a PASSED, scored
+      candidate with quality evidence — see ``final_recommendation``).
+      Individual other candidates failing to load or failing quality never
+      downgrade the run.
+    - NO_WINNER: the campaign completed and the model produced usable output
+      (some candidate benchmarked/quality-evaluated) but no configuration
+      passed the configured quality threshold. Honest terminal state, not a
+      failure and not a validated winner.
+    - FAILED: genuine run-level failure — nothing produced usable output
+      (no passed candidate and no quality-evaluated evidence), e.g. the model
+      never loaded or every candidate errored.
+
+    ``run`` is optional; when given, the run's architectural winner
+    (``best_config`` / ``final_recommendation``) is authoritative.
     """
     passed = [c for c in configs if _status_of(c) == "passed"]
     failed = [c for c in configs if _status_of(c) != "passed"]
     fb = failure_breakdown(configs)
-    if not passed:
-        return "FAILED", {
-            "successful": 0,
-            "failed": len(failed),
-            "failure_classes": fb,
-        }
-    if failed:
-        return "PARTIAL_SUCCESS", {
-            "successful": len(passed),
-            "failed": len(failed),
-            "failure_classes": fb,
-        }
-    return "SUCCESS", {
+    winner = final_recommendation(configs, run)
+    # "Operational" = the model actually produced usable generation evidence.
+    operational = bool(passed) or any(_status_of(c) == "quality_failed" for c in configs)
+    info = {
         "successful": len(passed),
-        "failed": 0,
+        "failed": len(failed),
+        "validated_winner": winner is not None,
+        "operational": operational,
         "failure_classes": fb,
     }
+    if winner is not None:
+        return "SUCCESS", info
+    if operational:
+        return "NO_WINNER", info
+    return "FAILED", info
 
 
 def final_status_for_run(run: OptimizationRun) -> RunStatus:
-    """Map classification to persisted RunStatus."""
-    state, _ = classify_run(list(run.configurations))
+    """Map classification to persisted RunStatus (completion path only).
+
+    Interruption/abandon paths set INTERRUPTED/CANCELLED directly and never
+    reach here.
+    """
+    state, _ = classify_run(list(run.configurations), run)
     if state == "SUCCESS":
         return RunStatus.SUCCESS
-    if state == "PARTIAL_SUCCESS":
-        return RunStatus.PARTIAL_SUCCESS
+    if state == "NO_WINNER":
+        return RunStatus.COMPLETED_NO_WINNER
     return RunStatus.FAILED
 
 
@@ -208,7 +225,7 @@ def why_text(best: Any, baseline_metrics: dict | None, profile: str) -> str:
 
 def failure_reason_text(run: OptimizationRun) -> str:
     """Human-readable reason for FAILED runs."""
-    _, info = classify_run(list(run.configurations))
+    _, info = classify_run(list(run.configurations), run)
     fb = info.get("failure_classes", {})
     bits = [f"{k}={v}" for k, v in fb.items() if v]
     base = "; ".join(bits) if bits else "no configurations completed"

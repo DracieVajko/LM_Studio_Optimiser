@@ -540,3 +540,29 @@ class TestTypical:
         path = save_best_report(run, out_dir=tmp_path)
         text = path.read_text(encoding="utf-8")
         assert "representative" in text
+
+
+class TestExperimentalDetailReport:
+    def test_report_shows_requested_vs_applied(self, tmp_path):
+        from lm_optimizer.services.reporting import save_best_report
+
+        run, _ = _run([_result()])
+        run.benchmark_params["experimental_detail"] = {
+            "requested": {"enable_rope": True, "enable_cpu_moe": None, "enable_speculative": True},
+            "resolved": {"enable_rope": True, "enable_cpu_moe": False, "enable_speculative": True},
+            "applied": {"enable_rope": True, "enable_cpu_moe": False, "enable_speculative": False},
+            "exercised": {"enable_rope": False, "enable_cpu_moe": False, "enable_speculative": False},
+            "skipped": {"enable_speculative": "no usable draft model"},
+        }
+        text = save_best_report(run, out_dir=tmp_path).read_text(encoding="utf-8")
+        assert "Experimental detail" in text
+        assert "requested" in text.lower()
+        assert "no usable draft model" in text
+
+    def test_legacy_report_without_detail_no_crash(self, tmp_path):
+        from lm_optimizer.services.reporting import save_best_report
+
+        run, _ = _run([_result()])
+        run.benchmark_params.pop("experimental_detail", None)
+        text = save_best_report(run, out_dir=tmp_path).read_text(encoding="utf-8")
+        assert "Experimental detail" in text

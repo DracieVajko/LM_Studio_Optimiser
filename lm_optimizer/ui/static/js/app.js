@@ -1,9 +1,9 @@
 // LM Studio Auto Optimizer - Main Application
 
-import { API } from './api.js?v=6';
-import { UI } from './ui.js?v=6';
-import { Charts } from './charts.js?v=6';
-import { WebSocketManager } from './websocket.js?v=6';
+import { API } from './api.js?v=8';
+import { UI } from './ui.js?v=8';
+import { Charts } from './charts.js?v=8';
+import { WebSocketManager } from './websocket.js?v=8';
 
 // Application State
 const App = {
@@ -97,9 +97,10 @@ const App = {
         const main = document.getElementById('main-content');
         let lastError = '';
         try {
-            const [status, models] = await Promise.all([
+            const [status, models, stats] = await Promise.all([
                 API.getStatus(),
-                API.getModels().catch(() => ({ models: [] }))
+                API.getModels().catch(() => ({ models: [] })),
+                API.getStats().catch(() => ({}))
             ]);
 
             // Keep for later use (model meta, etc.)
@@ -109,7 +110,7 @@ const App = {
             // Update the header badge immediately (not only on interval).
             UI.updateStatusIndicator(status);
 
-            const html = UI.renderDashboard(status, models);
+            const html = UI.renderDashboard(status, models, stats);
             main.innerHTML = html;
 
             // Attach event listeners

@@ -24,6 +24,7 @@ from lm_optimizer.api.schemas import (
     PresetSchema,
     ProfileWeightsSchema,
     SettingsSchema,
+    StatsResponse,
 )
 from lm_optimizer.database.repositories import (
     config_repo,
@@ -183,6 +184,54 @@ def _is_stale_run(run_id, status_value: str) -> bool:
         return False
 
 
+def _winner_metrics(r) -> dict:
+    """Best-candidate metrics for a run (history lists must not load configs).
+
+    Uses the run's architectural winner (final_recommendation) when configs are
+    loaded, else the persisted ``best_config_id``, else the highest-score passed
+    config. Missing => None (never a fake 0 that looks measured).
+    """
+    best = None
+    configs = list(getattr(r, "configurations", []) or [])
+    if configs:
+        try:
+            from lm_optimizer.services.run_summary import final_recommendation
+
+            best = final_recommendation(configs, r)
+        except Exception:
+            best = None
+    if best is None and getattr(r, "best_config_id", None):
+        try:
+            best = config_repo.get(str(r.best_config_id))
+        except Exception:
+            best = None
+    if best is None:
+        try:
+            best = config_repo.get_best_for_run(str(r.id))
+        except Exception:
+            best = None
+    if best is None:
+        return {
+            "best_gen_tok_s": None,
+            "best_quality": None,
+            "best_context_length": None,
+            "has_validated_winner": False,
+        }
+    q = getattr(best, "quality_score", None)
+    gen = None
+    try:
+        g = best.get_avg_generation_tok_s()
+        gen = round(float(g), 3) if g else None
+    except Exception:
+        gen = None
+    return {
+        "best_gen_tok_s": gen,
+        "best_quality": float(q.overall) if q is not None else None,
+        "best_context_length": getattr(best, "context_length", None),
+        "has_validated_winner": True,
+    }
+
+
 def _convert_run(r, config_count: int = 0, stale: bool = False) -> OptimizationRunResponse:
     pab = (r.benchmark_params or {}).get("phase_ab") or {}
     raw_id = pab.get("raw_fastest_id")
@@ -190,6 +239,7 @@ def _convert_run(r, config_count: int = 0, stale: bool = False) -> OptimizationR
         raw_uuid = UUID(str(raw_id)) if raw_id else None
     except Exception:
         raw_uuid = None
+    winner = _winner_metrics(r)
     return OptimizationRunResponse(
         id=r.id,
         model=_convert_model(r.model),
@@ -219,6 +269,10 @@ def _convert_run(r, config_count: int = 0, stale: bool = False) -> OptimizationR
         pause=pab.get("pause"),
         config_count=int(config_count),
         stale=bool(stale),
+        best_gen_tok_s=winner["best_gen_tok_s"],
+        best_quality=winner["best_quality"],
+        best_context_length=winner["best_context_length"],
+        has_validated_winner=winner["has_validated_winner"],
     )
 
 
@@ -399,6 +453,60 @@ async def list_models():
             await client.close()
         except Exception:
             pass
+
+
+def _is_embedding_model(m) -> bool:
+    """Embedding-only models cannot be text-optimized (excluded from Optimize)."""
+    mid = (getattr(m, "id", "") or "").lower()
+    mt = (getattr(m, "model_type", "") or "").lower()
+    return "embed" in mid or mt in ("embeddings", "embedding")
+
+
+async def _read_inventory() -> tuple[list, str | None]:
+    """Live provider inventory plus an error string (never a silent empty).
+
+    Distinguishes a genuinely empty inventory from a failed provider call so
+    the dashboard can show an error state instead of a misleading 0.
+    """
+    try:
+        client = await get_lm_client(echo_probe=False)
+    except Exception as e:
+        return [], f"{type(e).__name__}: {e}"[:160]
+    try:
+        return list(await client.list_models()), None
+    except Exception as e:
+        return [], f"{type(e).__name__}: {e}"[:160]
+    finally:
+        try:
+            await client.close()
+        except Exception:
+            pass
+
+
+@router.get("/stats", response_model=StatsResponse)
+async def get_stats():
+    """Dashboard quick-stats with documented, tested meanings."""
+    models, inv_err = await _read_inventory()
+    total = len(models)
+    embedding_only = sum(1 for m in models if _is_embedding_model(m))
+    optimized = total_runs = runs_today = 0
+    try:
+        optimized = run_repo.count_models_with_validated_winner()
+        total_runs = run_repo.count_all()
+        runs_today = run_repo.count_created_on(datetime.now().strftime("%Y-%m-%d"))
+    except Exception as e:
+        logger.warning("Stats DB read failed", error=str(e)[:160])
+    return StatsResponse(
+        models_available=total - embedding_only,
+        models_total=total,
+        models_embedding_only=embedding_only,
+        inventory_ok=inv_err is None,
+        inventory_error=inv_err,
+        optimized_models=optimized,
+        runs_today=runs_today,
+        total_runs=total_runs,
+        as_of=datetime.now().isoformat(timespec="seconds"),
+    )
 
 
 @router.get("/models/{model_id}")
@@ -850,7 +958,15 @@ async def get_optimization_progress(run_id: UUID):
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
 
-    done_states = ("completed", "success", "partial_success", "failed", "cancelled", "interrupted")
+    done_states = (
+        "completed",
+        "success",
+        "partial_success",
+        "completed_no_validated_winner",
+        "failed",
+        "cancelled",
+        "interrupted",
+    )
     return {
         "run_id": run_id,
         "stage": run.stage.value,
@@ -1503,13 +1619,21 @@ async def abandon_run(run_id: UUID, force: bool = False):
         run_repo.save(run)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Abandon failed: {str(e)[:160]}")
-    try:
-        from lm_optimizer.storage.run_checkpoint import remove_checkpoint as _rm
-
-        _rm(str(run_id))
-    except Exception:
-        pass
+    # Checkpoint is intentionally preserved: history + diagnostics + a possible
+    # later resume must survive an abandon. Abandon is not deletion.
     return {"success": True, "id": str(run_id), "status": "interrupted"}
+
+
+@router.post("/runs/reconcile")
+async def reconcile_runs(apply: bool = False):
+    """Preview/apply stale-running reconciliation (idempotent, non-destructive).
+
+    Default preview only; pass ``?apply=true`` to mark stale runs interrupted.
+    Keeps all candidate results, reports and checkpoints.
+    """
+    from lm_optimizer.services.run_reconcile import reconcile_stale_runs
+
+    return reconcile_stale_runs(dry_run=not apply, current_run_id=_current_run_id)
 
 
 def _persist_duel(job_id: str, request: SandboxRequest, status: str,

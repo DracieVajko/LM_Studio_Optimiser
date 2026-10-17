@@ -40,7 +40,7 @@ _OLD = {
     "model_id": "m1",
     "quantization": "q4",
     "architecture": "qwen",
-    "lm_studio_version": "0.3.10",
+    "lm_studio_version": "semver:0.3.10",
     "hardware_fingerprint": "hw1",
     "benchmark_suite_version": "2026-10-10",
 }
@@ -50,7 +50,7 @@ def test_decide_action():
     """Test action decision logic."""
     from lm_optimizer.cli.auto_run import _decide_action
 
-    new = {**_OLD, "lm_studio_version": "0.3.12"}
+    new = {**_OLD, "lm_studio_version": "semver:0.3.12"}
 
     # No run -> FULL
     assert _decide_action(None, "fp1", {}) == ("FULL", None)
@@ -108,7 +108,7 @@ def test_identity_fields_excluded_from_revalidation_scope():
     # Environment fields all match; only the identity fields are stale.
     run = _seed_run(RunStatus.INTERRUPTED, "old_fp", {
         "model_id": "", "quantization": None, "architecture": None,
-        "lm_studio_version": "0.3.12",
+        "lm_studio_version": "semver:0.3.12",
         "hardware_fingerprint": "hw1",
         "benchmark_suite_version": "2026-10-15",
     })
@@ -116,7 +116,7 @@ def test_identity_fields_excluded_from_revalidation_scope():
         "model_id": "m1",
         "quantization": "q4",
         "architecture": "qwen",
-        "lm_studio_version": "0.3.12",
+        "lm_studio_version": "semver:0.3.12",
         "hardware_fingerprint": "hw1",
         "benchmark_suite_version": "2026-10-15",
     }
@@ -132,7 +132,7 @@ def test_environment_change_does_scope_revalidation():
 
     run = _seed_run(RunStatus.INTERRUPTED, "old_fp", {
         "model_id": "", "quantization": None, "architecture": None,
-        "lm_studio_version": "0.3.10",
+        "lm_studio_version": "semver:0.3.10",
         "hardware_fingerprint": "hw1",
         "benchmark_suite_version": "2026-10-15",
     })
@@ -140,7 +140,7 @@ def test_environment_change_does_scope_revalidation():
         "model_id": "m1",
         "quantization": "q4",
         "architecture": "qwen",
-        "lm_studio_version": "0.3.12",
+        "lm_studio_version": "semver:0.3.12",
         "hardware_fingerprint": "hw1",
         "benchmark_suite_version": "2026-10-15",
     }
@@ -153,6 +153,7 @@ def test_environment_change_does_scope_revalidation():
 def test_compute_current_fingerprint():
     """Test fingerprint computation for a model."""
     from lm_optimizer.cli.auto_run import _compute_current_fingerprint, _get_lms_version
+    from lm_optimizer.services.version_identity import VersionIdentity
     from unittest.mock import patch
 
     model = ModelIdentity(
@@ -172,17 +173,29 @@ def test_compute_current_fingerprint():
         gpus=[GPUInfo(index=0, name="RTX 3060", vram_gb=6.0, vendor="NVIDIA")],
     )
 
-    with patch('lm_optimizer.cli.auto_run._get_lms_version', return_value="test-version"):
+    with patch(
+        'lm_optimizer.cli.auto_run._version_identity',
+        return_value=VersionIdentity(
+            raw="CLI commit: dcefd5a", semantic=None, build="dcefd5a",
+            source="lms-cli", compatibility_key="build:non-loading",
+        ),
+    ):
         fp, components = _compute_current_fingerprint(model, hardware)
         assert len(fp) == 64
         assert components["model_id"] == "test-model"
         assert components["quantization"] == "q4_k_m"
         assert components["architecture"] == "qwen3"
-        assert components["lm_studio_version"] == "test-version"
+        # The compatibility key is fingerprinted, never the raw build string.
+        assert components["lm_studio_version"] == "build:non-loading"
+        # The raw build string travels for diagnostics only.
+        assert components["_version_identity"]["raw"] == "CLI commit: dcefd5a"
+        assert "_version_identity" not in (
+            __import__("lm_optimizer.services.fingerprint", fromlist=["FINGERPRINT_FIELDS"]).FINGERPRINT_FIELDS
+        )
 
 
-def test_generate_report():
-    """Test markdown report generation."""
+def test_generate_report(tmp_path):
+    """Report rendering writes ONLY into the given temporary directory."""
     from lm_optimizer.cli.auto_run import _generate_report
 
     hardware = HardwareInfo(
@@ -196,22 +209,27 @@ def test_generate_report():
     )
 
     results = [
-        {"model": "m1", "action": "SKIP", "run_id": "run1", "best_score": 0.9, "fp_diff": None, "error": None},
-        {"model": "m2", "action": "RESUME", "run_id": "run2", "best_score": 0.8, "fp_diff": None, "error": None},
-        {"model": "m3", "action": "FULL", "run_id": "run3", "best_score": 0.85, "fp_diff": None, "error": None},
-        {"model": "m4", "action": "FAILED", "run_id": None, "best_score": None, "fp_diff": None, "error": "Connection failed"},
+        {"model": "qwen3-32b-instruct", "action": "SKIP", "run_id": "run-a", "best_score": 0.9, "fp_diff": None, "error": None},
+        {"model": "llama3.1-8b", "action": "RESUME", "run_id": "run-b", "best_score": 0.8, "fp_diff": None, "error": None},
+        {"model": "mistral-7b-v0.3", "action": "FULL", "run_id": "run-c", "best_score": 0.85, "fp_diff": None, "error": None},
+        {"model": "gemma-2-2b", "action": "FAILED", "run_id": None, "best_score": None, "fp_diff": None, "error": "Connection refused"},
     ]
 
-    md = _generate_report(results, Path("results"), hardware, "0.3.12")
+    md = _generate_report(results, tmp_path, hardware, "0.3.12")
 
     assert "## Summary" in md
-    assert "m1" in md and "SKIP" in md
-    assert "m2" in md and "RESUME" in md
-    assert "m3" in md and "FULL" in md
-    assert "m4" in md and "FAILED" in md
-    assert "Connection failed" in md
+    assert "qwen3-32b-instruct" in md and "SKIP" in md
+    assert "llama3.1-8b" in md and "RESUME" in md
+    assert "mistral-7b-v0.3" in md and "FULL" in md
+    assert "gemma-2-2b" in md and "FAILED" in md
+    assert "Connection refused" in md
     assert "RTX 3060" in md
     assert "AMD Ryzen 7" in md
+
+    # Regression: a unit test must never write into the repository's
+    # persistent results directory.
+    assert list(tmp_path.glob("auto-run-*.md")), "report written to tmp_path"
+    assert not (Path.cwd() / "results" / "auto-run-2026").exists()
 
 
 def test_confirm_plan():

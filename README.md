@@ -8,7 +8,7 @@ transparent results with per-test outputs, and a dark-mode web UI.
 **Status: v1.5.2.** Pause/resume for partial successes (Web UI + CLI), AI-assisted model selection,
 speed-first search (cheap probes → quality validation on finalists → bounded causal recovery → adaptive validation),
 sandbox duels with history, Prompt/Thinking/Output transparency, OS-following dark mode, resilient Web UI.
-543 automated tests green, E2E-validated on a live server + live LM Studio.
+719 automated tests green (mock-only; live-server E2E validated on earlier suites).
 
 | Platform | Status |
 |-|-|
@@ -219,6 +219,18 @@ dimension (`optimize` / `auto`). RoPE stays opt-in (`--enable-rope`);
 temperatures are covered by `--style` (precise/balanced/creative),
 `sample-sweep` and the auto precision probe.
 
+**Reliability hardening (unreleased).** `optimize` / `auto` show one
+pre-flight summary (model, profile, phases, experiments) and ask once
+(`--yes` / `--non-interactive` never prompt; `--enable-rope False` as a
+positional is rejected with exit 2). Experimental runs record
+requested/resolved/applied/exercised detail in the report. Quality-skipped
+exploration writes `<model>-explore.md` (`quality_validated: false`) and
+never overwrites the validated preset or `-best.md`. `resume-menu` shows
+checkpoint presence, phase/cursor, last progress and a safe-to-resume hint.
+Failed-run reports group errors by normalized signature with per-signature
+durations and a repeat-failure circuit-breaker verdict (flash-specific
+failures never trip it).
+
 ## How it works (Phase-A strategy)
 
 ```
@@ -296,7 +308,7 @@ CPU-only paths are coded and unit-tested, not physically exercised.
 
 ```bash
 pip install -e ".[dev]"
-python -m pytest -q                       # 513 tests
+python -m pytest -q                       # 719 tests (mock-only)
 python scripts/generate_parameter_matrix.py
 ```
 

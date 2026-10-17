@@ -1,9 +1,9 @@
 // LM Studio Auto Optimizer - Results Page
 
-import { API } from './api.js?v=6';
-import { UI } from './ui.js?v=6';
-import { Charts } from './charts.js?v=6';
-import { WebSocketManager } from './websocket.js?v=6';
+import { API } from './api.js?v=8';
+import { UI } from './ui.js?v=8';
+import { Charts } from './charts.js?v=8';
+import { WebSocketManager } from './websocket.js?v=8';
 
 const ResultsPage = {
     state: {
@@ -609,6 +609,10 @@ const ResultsPage = {
     getStatusBadge(status) {
         const badges = {
             'passed': 'badge-success',
+            'success': 'badge-success',
+            'completed': 'badge-success',
+            'completed_no_validated_winner': 'badge-warning',
+            'partial_success': 'badge-warning',
             'failed': 'badge-error',
             'load_failed': 'badge-error',
             'verify_failed': 'badge-error',

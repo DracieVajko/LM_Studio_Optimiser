@@ -42,7 +42,25 @@ def test_acquire_writes_pid_purpose_json(tmp_path):
         assert record["purpose"] == "job-a"
         raw = json.loads((tmp_path / ".optimizer.lock").read_text(encoding="utf-8"))
         assert raw == record
-        assert set(raw) == {"pid", "started", "purpose"}
+        # Contract: the holder must be identifiable and liveness-checkable.
+        # Extra diagnostic fields are allowed (create_time defeats PID reuse).
+        assert {"pid", "started", "purpose"} <= set(raw)
+    finally:
+        release_lock(lock_dir=tmp_path)
+
+
+def test_lock_records_creation_time_when_available(tmp_path):
+    """create_time lets a later reader detect PID reuse."""
+    record = acquire_lock("job-a", lock_dir=tmp_path)
+    try:
+        try:
+            import psutil
+
+            available = psutil.Process(record["pid"]).create_time()
+        except Exception:
+            available = None
+        if available is not None:
+            assert abs(record["create_time"] - available) < 2.0
     finally:
         release_lock(lock_dir=tmp_path)
 

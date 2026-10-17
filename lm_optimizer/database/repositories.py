@@ -447,6 +447,37 @@ class RunRepository:
             ).fetchone()
             return int(row[0]) if row else 0
 
+    def count_all(self) -> int:
+        """Total number of runs (dashboard: Total Runs)."""
+        with db_manager.get_connection() as conn:
+            row = conn.execute("SELECT COUNT(*) FROM runs").fetchone()
+            return int(row[0]) if row else 0
+
+    def count_created_on(self, day: str) -> int:
+        """Runs created on a local calendar day (ISO ``YYYY-MM-DD``).
+
+        ``created_at`` is stored as a naive local ISO timestamp, so a plain
+        date prefix comparison keeps the machine's local day boundary.
+        """
+        with db_manager.get_connection() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM runs WHERE substr(created_at, 1, 10) = ?", (day,)
+            ).fetchone()
+            return int(row[0]) if row else 0
+
+    def count_models_with_validated_winner(self) -> int:
+        """Distinct models that have a validated best configuration.
+
+        A run with ``best_config_id`` reached a validated winner; counting
+        DISTINCT model_id gives "Optimized models", not run/configuration
+        totals.
+        """
+        with db_manager.get_connection() as conn:
+            row = conn.execute(
+                "SELECT COUNT(DISTINCT model_id) FROM runs WHERE best_config_id IS NOT NULL"
+            ).fetchone()
+            return int(row[0]) if row else 0
+
     def _get_configurations(self, run_id: str) -> list[ConfigurationResult]:
         """Get all configurations for a run."""
         with db_manager.get_connection() as conn:
@@ -715,9 +746,23 @@ class ConfigurationRepository:
         )
 
 
+    def get_best_for_run(self, run_id: str) -> ConfigurationResult | None:
+        """Highest-score PASSED+scored configuration for a run (winner lookup).
+
+        Fallback for history lists that must not load every configuration:
+        returns the validated winner row for a run, or None.
+        """
+        with db_manager.get_connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM configurations WHERE run_id = ? AND status = 'passed' "
+                "AND score IS NOT NULL ORDER BY score DESC LIMIT 1",
+                (run_id,),
+            ).fetchone()
+            return self._row_to_config(row) if row else None
+
+
 class PresetRepository:
     """Repository for saved presets."""
-
     def save(self, preset: dict) -> str:
         """Save preset, return ID."""
         import uuid

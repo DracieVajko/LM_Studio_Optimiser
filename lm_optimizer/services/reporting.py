@@ -4,7 +4,7 @@ import re
 from datetime import datetime
 from pathlib import Path
 
-from lm_optimizer.domain.models import OptimizationRun
+from lm_optimizer.domain.models import OptimizationRun, RunStatus
 from lm_optimizer.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -14,6 +14,25 @@ def sanitize_model_filename(model_id: str) -> str:
     """Make a filesystem-safe stem from a model id."""
     stem = re.sub(r"[^A-Za-z0-9_.-]+", "-", model_id).strip("-")
     return stem or "model"
+
+
+def _skip_tokens(run) -> set[str]:
+    """Lowercased skip-phase tokens from advanced_settings + benchmark_params."""
+    toks: set[str] = set()
+    for src in (getattr(run, "advanced_settings", None), getattr(run, "benchmark_params", None)):
+        if not isinstance(src, dict):
+            continue
+        val = src.get("skip_phases")
+        if isinstance(val, str):
+            toks.update(p.strip().lower() for p in val.split(",") if p.strip())
+        elif isinstance(val, (list, tuple, set)):
+            toks.update(str(p).strip().lower() for p in val if str(p).strip())
+    return toks
+
+
+def is_exploratory_run(run) -> bool:
+    """True when the quality phase was skipped: speed-only exploration."""
+    return "quality" in _skip_tokens(run)
 
 
 def _fmt(value: object, na: str = "N/A") -> str:
@@ -176,6 +195,52 @@ def _failed_guidance(configs: list) -> list[str]:
     return hints
 
 
+def no_winner_title(status: Any) -> str:
+    """Title wording for a run with no validated winner.
+
+    Derived from the canonical run-level status, never from the presence of
+    failed candidates. A campaign that completed and produced usable output
+    but never passed the quality gate is NOT a run-level failure, and saying
+    "FAILED" would misreport it.
+    """
+    value = getattr(getattr(status, "value", status), "__str__", lambda: str(status))()
+    if value == RunStatus.FAILED.value:
+        return "FAILED run"
+    if value == RunStatus.CANCELLED.value:
+        return "CANCELLED run"
+    if value == RunStatus.INTERRUPTED.value:
+        return "INTERRUPTED run"
+    if value == RunStatus.PARTIAL_SUCCESS.value:
+        return "PARTIAL run"
+    return "NO WINNER"
+
+
+def no_winner_summary(status: Any) -> str:
+    """One-line explanation matching the title wording above."""
+    value = getattr(getattr(status, "value", status), "__str__", lambda: str(status))()
+    if value == RunStatus.FAILED.value:
+        return (
+            "Run-level failure: the model produced no usable output. "
+            "The table below shows why each candidate was rejected."
+        )
+    if value == RunStatus.CANCELLED.value:
+        return "Run was cancelled before a configuration passed validation."
+    if value == RunStatus.INTERRUPTED.value:
+        return "Run was interrupted before a configuration passed validation."
+    if value == RunStatus.PARTIAL_SUCCESS.value:
+        return (
+            "Campaign ended before finishing; no candidate passed validation. "
+            "Some candidates failed individually, which does not by itself "
+            "make the run failed."
+        )
+    return (
+        "Campaign completed and the model generated usable output, but no "
+        "configuration passed the configured quality threshold. This is an "
+        "honest terminal state, not an operational failure. Individual "
+        "candidate failures are listed per-config below."
+    )
+
+
 def save_failed_report(
     run: OptimizationRun,
     out_dir: str | Path = "results",
@@ -211,7 +276,7 @@ def save_failed_report(
         return "—"
 
     lines = [
-        f"# FAILED run: {run.model.id} (no validated winner)",
+        f"# {no_winner_title(run.status)}: {run.model.id} (no validated winner)",
         "",
         f"- Date: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
         f"- Profile: {run.profile.value}",
@@ -220,6 +285,8 @@ def save_failed_report(
         f"- Elapsed: {run.duration_seconds:.1f}s" if run.duration_seconds else "- Elapsed: N/A",
         f"- Configs tested: {len(configs)}",
         f"- Failure classes: {classes}",
+        "",
+        no_winner_summary(run.status),
         "",
         "## Per-config results",
         "",
@@ -280,6 +347,24 @@ def save_failed_report(
     lines += ["## Guidance", ""]
     for hint in _failed_guidance(configs):
         lines.append(f"- {hint}")
+    lines += ["", "## Failure signatures (grouped, with durations)", ""]
+    try:
+        from lm_optimizer.services.failure_states import (
+            failure_signature_rows,
+            should_stop_repeating,
+        )
+
+        lines += failure_signature_rows(configs)
+        verdict = should_stop_repeating(configs)
+        if verdict.get("trip"):
+            lines.append(
+                f"- Circuit-breaker TRIPPED: {verdict.get('count')}x "
+                f"'{verdict.get('signature')}' — {verdict.get('reason')}"
+            )
+        else:
+            lines.append(f"- Circuit-breaker: no trip ({verdict.get('reason')})")
+    except Exception:
+        lines.append("- Signature diagnostics unavailable.")
     lines += [""]
     path.write_text("\n".join(lines), encoding="utf-8")
     logger.info("Failed report saved", path=str(path))
@@ -502,6 +587,23 @@ def _per_test_rows(best) -> list[str]:
     return lines
 
 
+def _experimental_detail_rows(run) -> list[str]:
+    """Requested vs resolved vs applied experimental rows (legacy-safe)."""
+    detail = (getattr(run, "benchmark_params", None) or {}).get("experimental_detail")
+    if not detail:
+        return ["- No experimental detail recorded (legacy run)."]
+    rows = []
+    for key in ("enable_rope", "enable_cpu_moe", "enable_speculative"):
+        req = (detail.get("requested") or {}).get(key)
+        res = (detail.get("resolved") or {}).get(key)
+        app = (detail.get("applied") or {}).get(key)
+        exe = (detail.get("exercised") or {}).get(key)
+        rows.append(f"- {key}: requested={req} resolved={res} applied={app} exercised={exe}")
+    for key, reason in (detail.get("skipped") or {}).items():
+        rows.append(f"- {key} skipped: {reason}")
+    return rows
+
+
 def _verification_rows(best) -> list[str]:
     """Requested vs applied rows from the recorded load verification (§13)."""
     recorded = (best.generation or {}).get("load_verification") or {}
@@ -569,7 +671,9 @@ def save_best_report(
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     # Canonical model identity from the actual run (§6/§33).
-    path = out / f"{sanitize_model_filename(run.model.id)}-best.md"
+    exploratory = is_exploratory_run(run)
+    suffix = "-explore.md" if exploratory else "-best.md"
+    path = out / f"{sanitize_model_filename(run.model.id)}{suffix}"
 
     bc = best.config
     qs = best.quality_score
@@ -605,14 +709,25 @@ def save_best_report(
 
     lines = (
         [
-            f"# Best settings: {run.model.id}",
+            f"# Best settings: {run.model.id}" if not exploratory
+            else f"# Exploratory settings (NOT quality-validated): {run.model.id}",
             "",
             f"- Date: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
             f"- Profile: {run.profile.value} (style: {style})",
             f"- Run: {run.id} (status: {run.status.value})",
             f"- Optimizer: {run.optimizer_version}",
             f"- Elapsed: {run.duration_seconds:.1f}s" if run.duration_seconds else "- Elapsed: N/A",
-            "",
+        ]
+        + (
+            [
+                "- quality_validated: false (quality phase skipped — speed-only exploration)",
+                "- This file never overwrites the validated -best.md report.",
+                "",
+            ]
+            if exploratory
+            else [""]
+        )
+        + [
             "## Results",
             "",
             f"- Generation: {best.get_avg_generation_tok_s():.1f} tok/s",
@@ -688,6 +803,12 @@ def save_best_report(
             "",
         ]
         + _verification_rows(best)
+        + [
+            "",
+            "## Experimental detail (requested vs applied)",
+            "",
+        ]
+        + _experimental_detail_rows(run)
         + [
             "",
             "## Winner typical across identical runs",

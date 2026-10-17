@@ -49,3 +49,9 @@ Thumbs.db
 
 # Linked git worktrees (local checkouts, never commit)
 .worktrees/
+
+# Superpowers local working ledgers
+.superpowers/
+
+# Exported LM Studio preset files (generated, machine-specific)
+lmstudio-presets/
