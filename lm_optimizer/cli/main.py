@@ -1260,6 +1260,48 @@ def optimize(
     except Exception:
         console.print("[red]Invalid --workload (interactive/throughput)[/red]")
         sys.exit(2)
+    if not resume_id:
+        # Auto-recovery: if a previous process for this model died (crash,
+        # kill, reboot) and left a stale "running" run with a usable
+        # checkpoint, resume it automatically instead of starting fresh.
+        # This is what lets an optimization survive a BSOD/reboot: after the
+        # machine comes back up, re-running `optimize <model>` continues
+        # where it left off.
+        try:
+            from lm_optimizer.services.joblock import _holder_alive, _read_holder
+            from lm_optimizer.services.run_reconcile import reconcile_stale_runs
+            from lm_optimizer.storage.run_checkpoint import load_checkpoint
+
+            holder_dead = True
+            try:
+                from lm_optimizer.services.joblock import _lock_path
+
+                holder = _read_holder(_lock_path())
+                if holder and _holder_alive(holder):
+                    holder_dead = False
+            except Exception:
+                pass
+
+            if holder_dead:
+                recon = reconcile_stale_runs(
+                    dry_run=True, model_id=model, is_fresh=lambda rid, now: False
+                )
+                if recon.get("changed", 0) > 0:
+                    for ch in recon.get("changes", []):
+                        try:
+                            ckpt = load_checkpoint(ch["id"])
+                        except Exception:
+                            ckpt = None
+                        if ckpt:
+                            console.print(
+                                f"[yellow]Stale run {ch['id'][:8]} found for "
+                                f"{model} with a valid checkpoint. Auto-resuming.[/yellow]"
+                            )
+                            resume_id = ch["id"]
+                            break
+        except Exception as e:
+            logger.debug("Auto-resume detection failed", error=str(e))
+
     if resume_id:
         # Delegate to resume flow (model arg is ignored except for display).
         resume(run_id=resume_id, revalidate=revalidate, style=style, skip_phases=None)
