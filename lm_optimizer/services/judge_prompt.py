@@ -4,7 +4,14 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
-from lm_optimizer.services.model_judge import JudgeBackend
+
+@dataclass
+class RunData:
+    """Run data for prompt building."""
+    run_id: str
+    model_id: str
+    quality_threshold: float
+    configs: list[dict]
 
 
 @dataclass
@@ -15,7 +22,7 @@ class JudgeRequest:
     use_case: str = "general"
     custom_prompt: str | None = None
     priority: str = "balanced"
-    backend: str = "heuristic"
+    backend: str = "heuristic"  # "local" | "api" | "heuristic"
     judge_model: str = "heuristic"
     api_key: str | None = None
     api_base: str | None = None
