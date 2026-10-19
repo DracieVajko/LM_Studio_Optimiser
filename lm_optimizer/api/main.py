@@ -60,9 +60,91 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# API routes
-app.include_router(api_router, prefix="/api")
-app.include_router(ws_router)
+# API routes - manually include routes due to FastAPI 0.141.1 include_router bug
+# We need to recreate routes with proper prefix since include_router is broken
+from fastapi.routing import APIRoute
+from fastapi import FastAPI
+
+# Collect all routes from both routers with /api prefix
+# Sort routes: static paths (no {param}) first, then parameterized paths
+# This ensures /judge/history is matched before /judge/{judge_id}
+def route_sort_key(route):
+    path = route.path if isinstance(route, APIRoute) else route.path
+    # Paths without {param} come first (more specific)
+    return (0 if '{' not in path else 1, path)
+
+all_routes = []
+
+# Process api_router routes, sorted by specificity
+api_routes = [r for r in api_router.routes if isinstance(r, APIRoute)]
+api_routes.sort(key=lambda r: (0 if '{' not in r.path else 1, r.path))
+for route in api_routes:
+    new_route = APIRoute(
+        path="/api" + route.path,
+        endpoint=route.endpoint,
+        methods=route.methods,
+        response_class=route.response_class,
+        status_code=route.status_code,
+        name=route.name,
+        include_in_schema=route.include_in_schema,
+        dependencies=route.dependencies,
+        summary=route.summary,
+        description=route.description,
+        response_description=route.response_description,
+        response_model=route.response_model,
+        response_model_include=route.response_model_include,
+        response_model_exclude=route.response_model_exclude,
+        response_model_by_alias=route.response_model_by_alias,
+        response_model_exclude_unset=route.response_model_exclude_unset,
+        response_model_exclude_defaults=route.response_model_exclude_defaults,
+        response_model_exclude_none=route.response_model_exclude_none,
+        openapi_extra=route.openapi_extra,
+        deprecated=route.deprecated,
+    )
+    all_routes.append(new_route)
+
+# Add non-APIRoute (Mount, etc.)
+for route in api_router.routes:
+    if not isinstance(route, APIRoute):
+        route.path = "/api" + route.path
+        all_routes.append(route)
+
+# Process ws_router routes similarly
+ws_routes = [r for r in ws_router.routes if isinstance(r, APIRoute)]
+ws_routes.sort(key=lambda r: (0 if '{' not in r.path else 1, r.path))
+for route in ws_routes:
+    new_route = APIRoute(
+        path="/api" + route.path,
+        endpoint=route.endpoint,
+        methods=route.methods,
+        response_class=route.response_class,
+        status_code=route.status_code,
+        name=route.name,
+        include_in_schema=route.include_in_schema,
+        dependencies=route.dependencies,
+        summary=route.summary,
+        description=route.description,
+        response_description=route.response_description,
+        response_model=route.response_model,
+        response_model_include=route.response_model_include,
+        response_model_exclude=route.response_model_exclude,
+        response_model_by_alias=route.response_model_by_alias,
+        response_model_exclude_unset=route.response_model_exclude_unset,
+        response_model_exclude_defaults=route.response_model_exclude_defaults,
+        response_model_exclude_none=route.response_model_exclude_none,
+        openapi_extra=route.openapi_extra,
+        deprecated=route.deprecated,
+    )
+    all_routes.append(new_route)
+
+for route in ws_router.routes:
+    if not isinstance(route, APIRoute):
+        route.path = "/api" + route.path
+        all_routes.append(route)
+
+# Add all routes to app
+for route in all_routes:
+    app.router.routes.append(route)
 
 # Static files
 app.mount("/static", StaticFiles(directory="lm_optimizer/ui/static"), name="static")

@@ -1,6 +1,7 @@
 """API routes for the optimizer."""
 
 import asyncio
+import sqlite3
 from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException
@@ -25,6 +26,10 @@ from lm_optimizer.api.schemas import (
     ProfileWeightsSchema,
     SettingsSchema,
     StatsResponse,
+    JudgeRequest,
+    JudgeBackendSchema,
+    JudgeVerdictResponse,
+    JudgeHistoryItem,
 )
 from lm_optimizer.database.repositories import (
     config_repo,
@@ -1693,6 +1698,166 @@ async def _run_sandbox_task(job_id: str, request: SandboxRequest) -> None:
             "error": err,
         }
         _persist_duel(job_id, request, "failed", None, err)
+
+
+# ==================== JUDGE ENDPOINTS ====================
+
+# In-memory job tracking for async judge requests
+_judge_jobs: dict[str, dict] = {}
+
+
+async def _run_judge_async(judge_id: str, request: JudgeRequest):
+    """Background task to run judge evaluation."""
+    from lm_optimizer.services.judge_service import JudgeService
+    from lm_optimizer.database.manager import DatabaseManager
+    from lm_optimizer.config import config
+
+    try:
+        db = DatabaseManager(config.storage.database_path)
+        svc = JudgeService(db_path=config.storage.database_path)
+        verdict = await svc.run_judge(request)
+
+        _judge_jobs[judge_id] = {
+            "status": "completed",
+            "verdict": verdict.to_dict(),
+            "error_message": None,
+        }
+    except Exception as e:
+        _judge_jobs[judge_id] = {
+            "status": "failed",
+            "verdict": None,
+            "error_message": str(e),
+        }
+
+
+@router.post("/judge", response_model=JudgeVerdictResponse)
+async def judge_submit(request: JudgeRequest, background: BackgroundTasks, wait: bool = False):
+    """Submit a judge evaluation request."""
+    import uuid
+
+    # Validate request
+    if not request.run_ids and not request.model_ids:
+        raise HTTPException(status_code=400, detail="Either run_ids or model_ids must be provided")
+
+    if request.backend == JudgeBackendSchema.API and not request.api_key:
+        raise HTTPException(status_code=400, detail="API key required for API backend")
+
+    judge_id = str(uuid.uuid4())
+    _judge_jobs[judge_id] = {"status": "pending", "verdict": None, "error_message": None}
+
+    if wait:
+        # Run synchronously
+        from lm_optimizer.services.judge_service import JudgeService
+        from lm_optimizer.database.manager import DatabaseManager
+        from lm_optimizer.config import config
+
+        db = DatabaseManager(config.storage.database_path)
+        svc = JudgeService(db_path=config.storage.database_path)
+        verdict = await svc.run_judge(request)
+
+        _judge_jobs[judge_id] = {
+            "status": "completed",
+            "verdict": verdict.to_dict(),
+            "error_message": None,
+        }
+        return JudgeVerdictResponse(
+            judge_id=judge_id,
+            status="completed",
+            verdict=verdict.to_dict(),
+            error_message=None,
+            poll_url=f"/api/judge/{judge_id}",
+        )
+    else:
+        # Run in background - return 202 Accepted
+        from fastapi import Response
+        _judge_jobs[judge_id] = {"status": "pending", "verdict": None, "error_message": None}
+        background.add_task(_run_judge_async, judge_id, request)
+        return Response(
+            content=JudgeVerdictResponse(
+                judge_id=judge_id,
+                status="pending",
+                verdict=None,
+                error_message=None,
+                poll_url=f"/api/judge/{judge_id}",
+            ).model_dump_json(),
+            status_code=202,
+            media_type="application/json",
+        )
+
+
+@router.get("/judge/{judge_id}", response_model=JudgeVerdictResponse)
+async def judge_get(judge_id: str):
+    """Get judge verdict by ID."""
+    # First check in-memory jobs (for pending/running)
+    job = _judge_jobs.get(judge_id)
+    if job:
+        return JudgeVerdictResponse(
+            judge_id=judge_id,
+            status=job["status"],
+            verdict=job.get("verdict"),
+            error_message=job.get("error_message"),
+            poll_url=f"/api/judge/{judge_id}",
+        )
+
+    # Fallback to database (for completed verdicts)
+    from lm_optimizer.database.manager import DatabaseManager
+    from lm_optimizer.config import config
+    import json
+
+    db = DatabaseManager(config.storage.database_path)
+    with db.get_connection() as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT id, run_ids_json, config_ids_json, use_case, custom_prompt, priority, backend, judge_model, verdict_json, prompt_tokens, completion_tokens, latency_ms, status, error_message, created_at "
+            "FROM judge_verdicts WHERE id = ?",
+            (judge_id,)
+        ).fetchone()
+
+        if not row:
+            raise HTTPException(status_code=404, detail="Judge job not found")
+
+        verdict = json.loads(row["verdict_json"]) if row["verdict_json"] else {}
+
+        return JudgeVerdictResponse(
+            judge_id=row["id"],
+            status=row["status"],
+            verdict=verdict,
+            error_message=row["error_message"],
+            poll_url=f"/api/judge/{judge_id}",
+        )
+
+
+@router.get("/judge/history", response_model=list[JudgeHistoryItem])
+async def judge_history(limit: int = 20):
+    """Get recent judge verdicts from database."""
+    from lm_optimizer.database.manager import DatabaseManager
+    from lm_optimizer.config import config
+    import json
+
+    db = DatabaseManager(config.storage.database_path)
+    with db.get_connection() as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT id, run_ids_json, use_case, backend, judge_model, verdict_json, created_at, status "
+            "FROM judge_verdicts ORDER BY created_at DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
+
+        results = []
+        for row in rows:
+            verdict = json.loads(row["verdict_json"]) if row["verdict_json"] else {}
+            results.append(JudgeHistoryItem(
+                id=row["id"],
+                run_ids=json.loads(row["run_ids_json"]),
+                use_case=row["use_case"],
+                backend=row["backend"],
+                judge_model=row["judge_model"],
+                created_at=row["created_at"],
+                status=row["status"],
+                confidence=verdict.get("confidence"),
+                overall_winner_model=verdict.get("overall_winner", {}).get("model_id"),
+            ))
+        return results
 
 
 # Import logger

@@ -300,3 +300,46 @@ class SandboxResponse(BaseModel):
     kind: str
     result: dict | None = None
     error: str | None = None
+
+
+class JudgeBackendSchema(str, Enum):
+    LOCAL = "local"
+    API = "api"
+    HEURISTIC = "heuristic"
+
+
+class JudgeRequest(BaseModel):
+    run_ids: list[str] = Field(default_factory=list)
+    config_ids: list[str] | None = None
+    model_ids: list[str] | None = None
+    use_case: str = "general"
+    custom_prompt: str | None = None
+    priority: str = "balanced"
+    backend: JudgeBackendSchema = JudgeBackendSchema.HEURISTIC
+    judge_model: str = "heuristic"
+    api_key: str | None = None
+    api_base: str | None = None
+    top_n_detail: int = 3
+    include_reasoning_matrix: bool = True
+    fastest_context_preset: bool = False
+    wait: bool = False
+
+
+class JudgeVerdictResponse(BaseModel):
+    judge_id: str
+    status: str  # pending | completed | failed
+    verdict: dict | None = None
+    error_message: str | None = None
+    poll_url: str | None = None
+
+
+class JudgeHistoryItem(BaseModel):
+    id: str
+    run_ids: list[str]
+    use_case: str
+    backend: str
+    judge_model: str
+    created_at: str
+    status: str
+    confidence: float | None = None
+    overall_winner_model: str | None = None
