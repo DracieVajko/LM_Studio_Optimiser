@@ -120,6 +120,13 @@ class BenchmarkService:
         style: str = "balanced",
         reasoning: str | None = "off",
         gpu_via_cli: bool = False,
+        include_categories: set[str] | None = None,
+        test_only: bool = False,
+        speed_only: bool = False,
+        quality_only: bool = False,
+        speed_context: int | None = None,
+        mtp_test: bool = False,
+        reasoning_sweep: bool = False,
     ):
         self.client = client
         self.config = benchmark_config or BenchmarkConfig(
@@ -133,6 +140,13 @@ class BenchmarkService:
         # --gpu` when enabled (and available); otherwise REST with the ratio
         # recorded-but-not-applied (never silently claimed as applied).
         self.gpu_via_cli = gpu_via_cli
+        self.include_categories = include_categories
+        self.test_only = test_only
+        self.speed_only = speed_only
+        self.quality_only = quality_only
+        self.speed_context = speed_context
+        self.mtp_test = mtp_test
+        self.reasoning_sweep = reasoning_sweep
         # Benchmarks score the ANSWER, not the thinking trace (R32). The native
         # chat endpoint exposes reasoning off/low/medium/high/on; default off
         # keeps outputs deterministic and scorable.
@@ -294,7 +308,9 @@ class BenchmarkService:
                 pass
 
     def create_cases_for_context(
-        self, context_length: int, style: str | None = None
+        self, 
+        context_length: int, 
+        style: str | None = None,
     ) -> list[BenchmarkCase]:
         """Create benchmark cases adapted for the given context length and style."""
         from lm_optimizer.benchmark.suite import create_benchmark_cases
@@ -306,6 +322,16 @@ class BenchmarkService:
         except (TypeError, ValueError):
             scale = 1.0
         scale = min(1.0, max(0.25, scale))
+        
+        # Determine context length for speed_only mode
+        effective_context = self.speed_context if self.speed_only and self.speed_context else context_length
+        
+        cases = create_benchmark_cases(
+            effective_context, 
+            include_categories=self.include_categories,
+            reasoning_sweep=self.reasoning_sweep
+        )
+        
         return [
             BenchmarkCase(
                 name=c.name,
@@ -315,7 +341,7 @@ class BenchmarkService:
                 temperature=overrides.get(c.category, c.temperature),
                 stop_sequences=c.stop_sequences,
             )
-            for c in create_benchmark_cases(context_length)
+            for c in cases
         ]
 
     async def run_benchmark(

@@ -311,6 +311,13 @@ async def _run_optimization(
         ),
         style=style,
         gpu_via_cli=gpu_via_cli,
+        include_categories=advanced.get("include_categories"),
+        test_only=advanced.get("test_only", False),
+        speed_only=advanced.get("speed_only", False),
+        quality_only=advanced.get("quality_only", False),
+        speed_context=advanced.get("speed_context"),
+        mtp_test=advanced.get("mtp_test", False),
+        reasoning_sweep=advanced.get("reasoning_sweep", False),
     )
     quality_evaluator = QualityEvaluator(QualityConfig(minimum_score=quality_threshold))
     search_generator = SearchSpaceGenerator(client)
@@ -1098,6 +1105,14 @@ def _preflight_optimize(
     yes: bool,
     non_interactive: bool,
     dry_run: bool,
+    # Granular test selection
+    test: list[str] | None = None,
+    test_only: bool = False,
+    speed_only: bool = False,
+    quality_only: bool = False,
+    context: int | None = None,
+    mtp_test: bool = False,
+    reasoning_sweep: bool = False,
 ) -> dict:
     """Pure local validation + resolution for optimize. No server calls."""
     if not 0 <= warmup_runs <= 5:
@@ -1127,6 +1142,50 @@ def _preflight_optimize(
         if not batches or any(b <= 0 for b in batches):
             console.print("[red]Invalid --physical-batches (positive integers required)[/red]")
             sys.exit(2)
+
+    # Parse test selection options
+    include_categories = None
+    if test:
+        # Map test names to categories
+        test_to_category = {
+            "short_instruction": "instruction",
+            "medium_reasoning": "reasoning",
+            "long_context": "context",
+            "coding_task": "coding",
+            "structured_output": "format",
+        }
+        cats = set()
+        for t in test:
+            if t in test_to_category:
+                cats.add(test_to_category[t])
+            else:
+                console.print(f"[red]Unknown test: {t}. Valid: {', '.join(test_to_category.keys())}[/red]")
+                sys.exit(2)
+        include_categories = cats
+
+    # Validate test selection options
+    if speed_only and quality_only:
+        console.print("[red]Cannot use --speed-only and --quality-only together[/red]")
+        sys.exit(2)
+    if speed_only and test:
+        console.print("[red]Cannot use --speed-only with --test[/red]")
+        sys.exit(2)
+    if speed_only and context is None:
+        console.print("[red]--speed-only requires --context[/red]")
+        sys.exit(2)
+    if mtp_test and speed_only:
+        console.print("[red]Cannot use --mtp-test with --speed-only[/red]")
+        sys.exit(2)
+    if mtp_test and quality_only:
+        console.print("[red]Cannot use --mtp-test with --quality-only[/red]")
+        sys.exit(2)
+    if reasoning_sweep and speed_only:
+        console.print("[red]Cannot use --reasoning-sweep with --speed-only[/red]")
+        sys.exit(2)
+    if context is not None and not speed_only:
+        console.print("[red]--context only valid with --speed-only[/red]")
+        sys.exit(2)
+
     experimental_flags = _resolve_experimental_flags(
         enable_rope,
         enable_cpu_moe,
@@ -1147,6 +1206,14 @@ def _preflight_optimize(
         "physical_batches": batches,
         "experimental": experimental_flags,
         "dry_run": dry_run,
+        # Test selection options
+        "include_categories": include_categories,
+        "test_only": test_only,
+        "speed_only": speed_only,
+        "quality_only": quality_only,
+        "speed_context": context,
+        "mtp_test": mtp_test,
+        "reasoning_sweep": reasoning_sweep,
     }
 
 
@@ -1248,6 +1315,42 @@ def optimize(
         30,
         "--max-waits",
         help="Max re-checks for a foreign model before pausing with a resume hint",
+    ),
+    # Granular test selection
+    test: list[str] = typer.Option(
+        None,
+        "--test",
+        help="Comma-separated test names to run (short_instruction,medium_reasoning,long_context,coding_task,structured_output)",
+    ),
+    test_only: bool = typer.Option(
+        False,
+        "--test-only",
+        help="Run only specified tests, skip speed discovery phase",
+    ),
+    speed_only: bool = typer.Option(
+        False,
+        "--speed-only",
+        help="Run only speed test (short_instruction) at specific context",
+    ),
+    quality_only: bool = typer.Option(
+        False,
+        "--quality-only",
+        help="Skip speed discovery, run quality tests only",
+    ),
+    context: int = typer.Option(
+        None,
+        "--context",
+        help="Context size for speed-only test",
+    ),
+    mtp_test: bool = typer.Option(
+        False,
+        "--mtp-test",
+        help="Enable speculative decoding (MTP) test",
+    ),
+    reasoning_sweep: bool = typer.Option(
+        False,
+        "--reasoning-sweep",
+        help="Test all reasoning levels: off,low,medium,high,xhigh",
     ),
 ):
     """Optimize a model configuration."""

@@ -136,11 +136,43 @@ class BenchmarkCase:
     context_length: int
 
 
-def create_benchmark_cases(context_length: int, seed: int = 42) -> list[BenchmarkCase]:
-    """Create benchmark cases adapted for the given context length."""
+def create_benchmark_cases(
+    context_length: int, 
+    seed: int = 42,
+    include_categories: set[str] | None = None,
+    reasoning_sweep: bool = False
+) -> list[BenchmarkCase]:
+    """Create benchmark cases adapted for the given context length.
+    
+    Args:
+        context_length: The context length to adapt prompts for.
+        seed: Random seed for reproducibility.
+        include_categories: Optional set of categories to include. 
+            If None, includes all categories. Valid categories: 
+            "instruction", "reasoning", "context", "coding", "format".
+        reasoning_sweep: If True, creates 5 variants of reasoning tests 
+            with different temperature settings (off, low, medium, high, xhigh).
+    """
+    # Define reasoning temperature sweep levels
+    REASONING_LEVELS = {
+        "off": 0.0,
+        "low": 0.1,
+        "medium": 0.3,
+        "high": 0.5,
+        "xhigh": 0.7,
+    }
+    
+    # If include_categories is None or empty, include all categories
+    if not include_categories:
+        include_categories = {"instruction", "reasoning", "context", "coding", "format"}
+    
     cases = []
 
     for bp in BENCHMARK_SUITE:
+        # Skip if category not in include_categories
+        if bp.category not in include_categories:
+            continue
+            
         # For long context test, scale the prompt if context allows
         prompt = bp.prompt
         max_tokens = bp.max_tokens
@@ -152,16 +184,38 @@ def create_benchmark_cases(context_length: int, seed: int = 42) -> list[Benchmar
                 "DOCUMENT:\n", "DOCUMENT:\n" + "\n".join(["---"] * repeat_count) + "\n"
             )
 
-        case = BenchmarkCase(
-            name=bp.name,
-            category=bp.category,
-            prompt=prompt,
-            max_tokens=min(max_tokens, context_length // 4),  # Leave room for prompt
-            temperature=bp.temperature,
-            stop_sequences=bp.stop_sequences,
-            context_length=context_length,
-        )
-        cases.append(case)
+        # Handle reasoning sweep
+        if reasoning_sweep and bp.category == "reasoning":
+            # Create 5 variants with different reasoning temperatures
+            for level_name, level_temp in {
+                "off": 0.0,
+                "low": 0.1,
+                "medium": 0.3,
+                "high": 0.5,
+                "xhigh": 0.7,
+            }.items():
+                case = BenchmarkCase(
+                    name=f"{bp.name}_{level_name}",
+                    category=bp.category,
+                    prompt=prompt,
+                    max_tokens=min(max_tokens, context_length // 4),
+                    temperature=level_temp,
+                    stop_sequences=bp.stop_sequences,
+                    context_length=context_length,
+                )
+                cases.append(case)
+        else:
+            # Normal single case
+            case = BenchmarkCase(
+                name=bp.name,
+                category=bp.category,
+                prompt=prompt,
+                max_tokens=min(max_tokens, context_length // 4),
+                temperature=bp.temperature,
+                stop_sequences=bp.stop_sequences,
+                context_length=context_length,
+            )
+            cases.append(case)
 
     return cases
 
