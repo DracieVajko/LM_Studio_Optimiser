@@ -808,7 +808,7 @@ def sandbox(
 
     import asyncio
 
-    result = asyncio.run(runner.run(_generate))
+    result = asyncio.run(runner.run_async(_generate))
     # Artifact retention: keep the newest N runs per task (spec §13.5).
     from lm_optimizer.services.sandbox_runner import apply_retention
 

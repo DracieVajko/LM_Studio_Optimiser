@@ -19,6 +19,7 @@ tool can honestly promise.
 
 from __future__ import annotations
 
+import inspect
 import os
 import shlex
 import shutil
@@ -186,11 +187,18 @@ class SandboxRunner:
     custom_checks: dict[str, tuple[bool, str]] = field(default_factory=dict)
 
     def run(self, generate) -> SandboxResult:
-        """Run the task.
+        """Synchronous wrapper around `run_async` (used by the tests)."""
+        import asyncio
 
-        `generate(feedback: str) -> str` is called for every attempt; the
-        first call gets an empty feedback string, later ones get the
-        evidence-only repair feedback.
+        return asyncio.run(self.run_async(generate))
+
+    async def run_async(self, generate) -> SandboxResult:
+        """Run the task with the repair loop.
+
+        `generate(feedback: str) -> str` (or an async equivalent) is called
+        for every attempt; the first call gets an empty feedback string,
+        later ones get the evidence-only repair feedback. Async generators
+        are awaited - the CLI talks to LM Studio through an async client.
         """
         result = SandboxResult(task_id=self.task.id)
         feedback = ""
@@ -198,6 +206,8 @@ class SandboxRunner:
             started = time.perf_counter()
             try:
                 produced = generate(feedback)
+                if inspect.isawaitable(produced):
+                    produced = await produced
             except Exception as e:  # noqa: BLE001
                 result.error = f"{type(e).__name__}: {e}"[:200]
                 break
