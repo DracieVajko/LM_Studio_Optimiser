@@ -100,10 +100,59 @@ class HeuristicJudge(ModelJudge):
             return getattr(c, key, default)
 
         def get_quality(c):
+            """Quality overall from either an object or the stored JSON.
+
+            The judge service passes the persisted rows as JSON strings
+            (`quality_json`), while tests may pass objects. Both must work -
+            otherwise every heuristic verdict says "Quality: N/A".
+            """
             qs = get_attr(c, "quality_score")
             if isinstance(qs, dict):
-                return qs.get("overall", 0)
-            return qs.overall if qs else 0
+                return qs.get("overall", 0) or 0
+            if qs is not None:
+                return getattr(qs, "overall", 0) or 0
+            raw = get_attr(c, "quality_json")
+            if isinstance(raw, str) and raw:
+                try:
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, dict):
+                        return parsed.get("overall", 0) or 0
+                except Exception:
+                    return 0
+            elif isinstance(raw, dict):
+                return raw.get("overall", 0) or 0
+            return 0
+
+        def get_speed(c):
+            """Median generation tok/s from a method, a dict or metrics_json."""
+            method = get_attr(c, "get_avg_generation_tok_s")
+            if callable(method):
+                try:
+                    return float(method() or 0)
+                except Exception:
+                    return 0.0
+            raw = get_attr(c, "metrics_json")
+            tests = None
+            if isinstance(raw, str) and raw:
+                try:
+                    tests = json.loads(raw)
+                except Exception:
+                    tests = None
+            elif isinstance(raw, list):
+                tests = raw
+            if not isinstance(tests, list):
+                return 0.0
+            speeds = [
+                float(t.get("generation_tok_s") or 0)
+                for t in tests
+                if isinstance(t, dict)
+                and isinstance(t.get("generation_tok_s"), (int, float))
+                and t.get("generation_tok_s")
+            ]
+            if not speeds:
+                return 0.0
+            speeds.sort()
+            return speeds[len(speeds) // 2]
 
         # Filter passed configs
         passed = [c for c in configs if get_attr(c, "status") == "passed"]
@@ -120,7 +169,7 @@ class HeuristicJudge(ModelJudge):
 
         # Score based on priority
         if comparison.priority == "speed":
-            best = max(passed, key=lambda c: get_attr(c, "get_avg_generation_tok_s", lambda: 0)() or 0)
+            best = max(passed, key=get_speed)
             reasoning = "Highest generation speed among passing configs"
         elif comparison.priority == "quality":
             best = max(passed, key=lambda c: get_quality(c))
@@ -131,7 +180,7 @@ class HeuristicJudge(ModelJudge):
         else:  # balanced
             # Weighted score: speed * quality
             def balanced_score(c):
-                speed = get_attr(c, "get_avg_generation_tok_s", lambda: 0)() or 0
+                speed = get_speed(c)
                 qual = get_quality(c)
                 return speed * qual
             best = max(passed, key=balanced_score)
@@ -147,16 +196,16 @@ class HeuristicJudge(ModelJudge):
             within_limit = [c for c in passed if get_attr(c, "peak_vram_gb", 0) <= vram_limit]
             if within_limit:
                 if comparison.priority == "speed":
-                    best = max(within_limit, key=lambda c: get_attr(c, "get_avg_generation_tok_s", lambda: 0)() or 0)
+                    best = max(within_limit, key=get_speed)
                 elif comparison.priority == "quality":
                     best = max(within_limit, key=lambda c: get_quality(c))
                 else:
-                    best = max(within_limit, key=lambda c: (get_attr(c, "get_avg_generation_tok_s", lambda: 0)() or 0) * get_quality(c))
+                    best = max(within_limit, key=lambda c: get_speed(c) * get_quality(c))
                 best_ctx = get_attr(best, "context_length", 0)
                 warnings.append(f"Auto-selected alternative within VRAM limit: {best_ctx} ctx")
 
         alternatives = [get_attr(c, "id") for c in passed if get_attr(c, "id") != get_attr(best, "id")][:3]
-        best_speed = get_attr(best, "get_avg_generation_tok_s", lambda: 0)() or 0
+        best_speed = get_speed(best)
         best_qual = get_quality(best)
 
         return JudgeVerdict(

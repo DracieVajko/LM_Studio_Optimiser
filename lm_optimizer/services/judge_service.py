@@ -183,6 +183,9 @@ class JudgeService:
                     "metrics_json": cfg["metrics_json"],
                     "quality_json": cfg["quality_json"],
                     "config_json": cfg["config_json"],
+                    # The heuristic backend filters on this field; dropping it
+                    # made every verdict say "no configurations passed".
+                    "status": cfg.get("status", "passed"),
                 })
 
         # Determine hardware constraints
