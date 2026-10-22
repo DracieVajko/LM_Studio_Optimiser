@@ -58,3 +58,4 @@ lmstudio-presets/
 
 # Runtime data (DB, logs, reports, checkpoints)\ndata/
 data/archive/
+data/model_hashes.json
