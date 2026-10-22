@@ -20,20 +20,36 @@ from typing import Any
 ProbeFn = Callable[[int], Awaitable[dict[str, Any]]]
 
 
-def geometric_contexts(min_ctx: int, max_ctx: int) -> list[int]:
-    """Doubling ladder clamped to [min_ctx, max_ctx], always incl. endpoints."""
+def geometric_contexts(
+    min_ctx: int,
+    max_ctx: int,
+    factor: float = 2.0,
+    round_to: int = 1,
+) -> list[int]:
+    """Geometric ladder clamped to [min_ctx, max_ctx], always incl. endpoints.
+
+    `factor` controls the growth (default 2.0 = classic doubling; use 1.5 for
+    finer 1.5x bracketing per spec section 8.3, which can land on boundaries
+    like 76 288 instead of only powers of two). `round_to` snaps rungs to a
+    selectable granularity (512/1024).
+    """
     if min_ctx <= 0:
         min_ctx = 512
     if max_ctx < min_ctx:
         max_ctx = min_ctx
+    round_to = max(1, int(round_to or 1))
     out = []
-    v = min_ctx
-    while v < max_ctx:
-        out.append(v)
-        nxt = v * 2
-        if nxt >= max_ctx:
+    v = float(min_ctx)
+    guard = 0
+    while v < max_ctx and guard < 256:
+        guard += 1
+        rung = int(round(v / round_to) * round_to)
+        rung = max(min_ctx, rung)
+        if rung >= max_ctx:
             break
-        v = nxt
+        if not out or rung > out[-1]:
+            out.append(rung)
+        v *= factor
     if not out or out[-1] != max_ctx:
         out.append(max_ctx)
     # Guarantee the first geometric step exists even for narrow ranges.

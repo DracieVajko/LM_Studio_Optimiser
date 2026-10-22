@@ -3066,6 +3066,10 @@ def ctx(
     min_context: int = typer.Option(2048, "--min-context", help="Minimum context"),
     max_context: int = typer.Option(65536, "--max-context", help="Maximum context"),
     step: int = typer.Option(1000, "--step", help="Refinement granularity (500/1000)"),
+    factor: float = typer.Option(
+        2.0, "--factor", help="Geometric growth factor (1.5 for spec-compliant bracketing)"
+    ),
+    round_to: int = typer.Option(512, "--round-to", help="Rung rounding granularity"),
     profile: str = typer.Option("balanced", "--profile", "-p", help="Profile for recommendation"),
     gpu_ratio: float = typer.Option(1.0, "--gpu-ratio", help="GPU offload ratio (0-1)"),
     kv_gpu: bool = typer.Option(True, "--kv-gpu/--kv-cpu", help="KV cache on GPU"),
@@ -3098,7 +3102,7 @@ def ctx(
     if step not in (500, 1000):
         console.print("[red]Invalid --step (use 500 or 1000)[/red]")
         sys.exit(2)
-    ladder = _ctx_ladder(min_context, max_context)
+    ladder = _ctx_ladder(min_context, max_context, factor=factor, round_to=round_to)
     if dry_run:
         console.print(
             f"[yellow]Dry run: would probe {ladder} then bisect with step {step}[/yellow]"
