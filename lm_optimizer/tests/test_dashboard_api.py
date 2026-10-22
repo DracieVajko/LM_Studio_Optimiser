@@ -93,7 +93,9 @@ class TestDashboardRenders:
             for path, module in (("/", "app.js"), ("/history", "history.js"),
                                  ("/results/x", "results.js"),
                                  ("/settings", "settings.js"),
-                                 ("/lab", "lab.js")):
+                                 ("/lab", "lab.js"),
+                                 ("/experiments", "experiments.js"),
+                                 ("/models/x", "model-detail.js")):
                 html = client.get(path).text
                 assert "main-content" in html, path
                 # Boot reporter turns silent blank pages into visible errors.

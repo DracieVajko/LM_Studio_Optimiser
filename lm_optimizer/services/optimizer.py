@@ -235,6 +235,29 @@ def phase_skips_of(advanced_settings) -> set[str]:
         return set()
 
 
+def compose_granular_skips(advanced_settings) -> list[str]:
+    """Merge granular mode flags into an explicit phase-skip list.
+
+    Shared by the CLI preflight and the web start endpoint so both surfaces
+    produce the SAME skip set for the same flags (§23 acceptance: the web
+    endpoint accepts granular flags).
+    """
+    adv = advanced_settings or {}
+    skips: set[str] = set()
+    if adv.get("skip_phases"):
+        try:
+            skips |= parse_phase_skips(adv.get("skip_phases"))
+        except ValueError:
+            pass
+    if adv.get("speed_only"):
+        skips |= {"quality", "recovery", "validation", "context"}
+    if adv.get("quality_only") or adv.get("reasoning_sweep"):
+        skips |= {"speed", "recovery", "validation", "context"}
+    if adv.get("mtp_test"):
+        skips |= {"quality", "recovery", "validation", "context"}
+    return sorted(skips)
+
+
 def granular_quality_frontier(
     skips: set[str], advanced: dict | None, baseline_result
 ) -> dict:
@@ -2511,9 +2534,79 @@ class AdaptiveOptimizer:
                 "RESUME_SKIP quality_completed",
                 f"config={str(result.id)[:8]} status={status}",
             )
+        # P3: deterministic Quality Lab on every PASSING finalist, with hard
+        # gates that can veto the winner (a broken output never wins).
+        if (
+            getattr(self.benchmark, "quality_lab", False)
+            and result.status == ConfigurationStatus.PASSED
+            and existing is None
+        ):
+            lab = await self._run_quality_lab(self.state.run.model.id)
+            if result.quality_score is not None:
+                try:
+                    result.quality_score.details["quality_lab"] = lab
+                except Exception:
+                    pass
+            if lab.get("hard_gate_failures"):
+                result.status = ConfigurationStatus.QUALITY_FAILED
+                self._log_event(
+                    "QUALITY_LAB hard gate failed",
+                    ",".join(lab["hard_gate_failures"])[:180],
+                )
+                try:
+                    config_repo.save(result)
+                except Exception as e:
+                    logger.error("Quality Lab result save failed", error=str(e))
+            else:
+                self._log_event(
+                    "QUALITY_LAB passed",
+                    f"mean={lab.get('mean', 0):.3f} tasks={lab.get('tasks', 0)}",
+                )
         if result.id not in [c.id for c in self.state.tested_configs]:
             self.state.tested_configs.append(result)
         return result
+
+    async def _run_quality_lab(self, model_id: str) -> dict:
+        """Run the deterministic Quality Lab tasks against the loaded model.
+
+        Returns a compact summary merged into the configuration's quality
+        details: mean score, task count and the hard gates that failed.
+        Every task is a real generation on the currently loaded config.
+        """
+        import statistics as _stats
+
+        from lm_optimizer.services.quality_lab import default_tasks, run_task
+
+        async def _chat(prompt: str, max_tokens: int) -> str:
+            response = await self.client.chat_completion(
+                model=model_id,
+                input_text=prompt,
+                temperature=0.0,
+                max_output_tokens=max_tokens,
+            )
+            choices = response.get("choices") or []
+            if not choices:
+                return ""
+            return choices[0].get("message", {}).get("content", "") or ""
+
+        outcomes = []
+        hard_gate_failures: list[str] = []
+        for task in default_tasks():
+            try:
+                outcome = await run_task(task, _chat)
+            except Exception as e:  # noqa: BLE001 - one task must not abort the suite
+                logger.warning("Quality Lab task failed", task=task.id, error=str(e)[:160])
+                continue
+            outcomes.append(outcome.as_dict())
+            if not outcome.gate_passed:
+                hard_gate_failures.append(task.id)
+        scores = [o["score"] for o in outcomes]
+        return {
+            "mean": _stats.fmean(scores) if scores else 0.0,
+            "tasks": len(outcomes),
+            "hard_gate_failures": hard_gate_failures,
+            "outcomes": outcomes,
+        }
 
     def _quality_result_exists(
         self, candidate_key: tuple, context_length: int
@@ -2586,6 +2679,19 @@ class AdaptiveOptimizer:
         except (TypeError, ValueError):
             return 4
 
+    @staticmethod
+    def rotate_order(items: list, offset: int) -> list:
+        """Rotate a list so a different candidate leads each round.
+
+        Master spec §7.3: finalists must be rotated (ABC/BCA/CAB) so a later
+        candidate is not systematically penalized by thermal throttling -
+        the first-measured finalist always runs on the coolest machine.
+        """
+        if not items or offset <= 0:
+            return list(items)
+        k = int(offset) % len(items)
+        return list(items[k:]) + list(items[:k])
+
     async def _phase_quality(self, frontier: dict) -> tuple[list, list]:
         """QUALITY: full suite on frozen finalists at the frozen quality ctx."""
         self.state.phase = OptimizationPhase.QUALITY.value
@@ -2601,6 +2707,15 @@ class AdaptiveOptimizer:
             ordered.append(contrarian)
         limit = self._finalist_limit()
         ordered = ordered[: max(limit + 1, 1)]
+        # Rotate the finalist order per run so the coolest first slot is not
+        # always the same candidate (spec §7.3: ABC/BCA/CAB rotation).
+        if len(ordered) > 1:
+            seed = str(self.state.run.id).replace("-", "")
+            try:
+                offset = int(seed[:8], 16) % len(ordered)
+            except ValueError:
+                offset = 0
+            ordered = self.rotate_order(ordered, offset)
         self.state.planned_total += len(ordered)  # one suite per finalist
         self._log_event("QUALITY validation started", f"ctx={quality_ctx} n={len(ordered)}")
 

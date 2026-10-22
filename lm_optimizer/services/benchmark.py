@@ -60,6 +60,31 @@ def _sample_mem() -> dict:
         return {}
 
 
+def _collect_thermal() -> dict:
+    """Thermal/power snapshot after a generation (spec §11.4).
+
+    Missing values stay None (never fabricated). A GPU above 85 C is flagged
+    as thermally contaminated so a winner cannot silently be a throttled
+    measurement.
+    """
+    try:
+        from lm_optimizer.services.metrics_providers import collect_metrics
+
+        metrics = collect_metrics()
+    except Exception:
+        return {}
+    gpu = metrics.gpus[0] if metrics.gpus else None
+    temp = getattr(gpu, "temperature_c", None)
+    flag = "throttled" if isinstance(temp, (int, float)) and temp >= 85.0 else ""
+    return {
+        "gpu_temp_c": temp,
+        "gpu_util_pct": getattr(gpu, "utilization_pct", None),
+        "gpu_power_w": getattr(gpu, "power_w", None),
+        "on_ac": metrics.power.on_ac,
+        "thermal_flag": flag,
+    }
+
+
 def _extract_mtp_metrics(stats: dict | None) -> dict:
     """MTP / speculative-decoding metrics from the server's chat stats.
 
@@ -188,6 +213,7 @@ class BenchmarkService:
         speed_context: int | None = None,
         mtp_test: bool = False,
         reasoning_sweep: bool = False,
+        quality_lab: bool = False,
     ):
         self.client = client
         self.config = benchmark_config or BenchmarkConfig(
@@ -208,6 +234,9 @@ class BenchmarkService:
         self.speed_context = speed_context
         self.mtp_test = mtp_test
         self.reasoning_sweep = reasoning_sweep
+        # P3: run the deterministic Quality Lab tasks on every quality
+        # finalist and enforce its hard gates before a winner is declared.
+        self.quality_lab = quality_lab
         # Set (model id) only when the trailing ensure_unloaded of an attempt
         # could NOT verify the model left the host. The optimizer reads this
         # between candidates and refuses to load another memory-heavy config.
@@ -794,6 +823,7 @@ class BenchmarkService:
             )
 
             mtp = _extract_mtp_metrics(stats)
+            thermal = _collect_thermal()
 
             return BenchmarkMetrics(
                 test_name=case.name,
@@ -812,6 +842,7 @@ class BenchmarkService:
                 thinking_text=thinking_text,
                 prompt=case.prompt,
                 **mtp,
+                **thermal,
             )
 
         except Exception as e:

@@ -198,6 +198,18 @@ async def lab_page(request: Request):
     return templates.TemplateResponse(request, "lab.html")
 
 
+@app.get("/models/{model_id}", response_class=HTMLResponse)
+async def model_detail_page(request: Request, model_id: str):
+    """Model detail page: identity, capabilities, presets, history."""
+    return templates.TemplateResponse(request, "model_detail.html")
+
+
+@app.get("/experiments", response_class=HTMLResponse)
+async def experiments_page(request: Request):
+    """Experiment Builder: mode -> model -> budget -> review -> run."""
+    return templates.TemplateResponse(request, "experiments.html")
+
+
 @app.get("/results/{run_id}/configs/{config_id}", response_class=HTMLResponse)
 async def config_json_page(request: Request, run_id: str, config_id: str):
     """Clean pretty-printed JSON of one tested configuration."""

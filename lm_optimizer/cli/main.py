@@ -324,6 +324,7 @@ async def _run_optimization(
         speed_context=advanced.get("speed_context"),
         mtp_test=advanced.get("mtp_test", False),
         reasoning_sweep=advanced.get("reasoning_sweep", False),
+        quality_lab=advanced.get("quality_lab", False),
     )
     quality_evaluator = QualityEvaluator(QualityConfig(minimum_score=quality_threshold))
     search_generator = SearchSpaceGenerator(client)
@@ -1119,6 +1120,7 @@ def _preflight_optimize(
     context: int | None = None,
     mtp_test: bool = False,
     reasoning_sweep: bool = False,
+    quality_lab: bool = False,
 ) -> dict:
     """Pure local validation + resolution for optimize. No server calls."""
     if not 0 <= warmup_runs <= 5:
@@ -1246,6 +1248,7 @@ def _preflight_optimize(
         "speed_context": context,
         "mtp_test": mtp_test,
         "reasoning_sweep": reasoning_sweep,
+        "quality_lab": quality_lab,
     }
 
 
@@ -1388,6 +1391,12 @@ def optimize(
         help="Run only the reasoning sweep (off,low,medium,high,xhigh); "
         "--reasoning-sweep kept as an alias",
     ),
+    quality_lab: bool = typer.Option(
+        False,
+        "--quality-lab",
+        help="Run the deterministic Quality Lab tasks on every quality finalist "
+        "(hard gates can veto the winner)",
+    ),
 ):
     """Optimize a model configuration."""
     setup_logging()
@@ -1459,6 +1468,7 @@ def optimize(
         context=context,
         mtp_test=mtp_test,
         reasoning_sweep=reasoning_sweep,
+        quality_lab=quality_lab,
     )
 
     if not _preflight_confirm(effective, dry_run, yes, non_interactive):
@@ -1548,6 +1558,7 @@ def optimize(
             advanced["quality_only"] = bool(quality_only)
             advanced["mtp_test"] = bool(mtp_test)
             advanced["reasoning_sweep"] = bool(reasoning_sweep)
+            advanced["quality_lab"] = bool(quality_lab)
             if context is not None:
                 advanced["speed_context"] = int(context)
 
@@ -3085,6 +3096,16 @@ def ctx(
     quality_threshold: float = typer.Option(
         0.97, "--quality-threshold", help="Pass threshold for quality-rung verdicts"
     ),
+    retrieval: bool = typer.Option(
+        True,
+        "--retrieval/--no-retrieval",
+        help="Validate needle retrieval on the largest stable rung (spec 8.6)",
+    ),
+    detailed_fill: bool = typer.Option(
+        False,
+        "--detailed-fill",
+        help="Full fill-ratio matrix (0/25/50/75/90/98%) instead of fast (0/50/90%)",
+    ),
     dry_run: bool = typer.Option(False, "--dry-run", help="Show plan without running"),
     wait_interval: float = typer.Option(
         60.0,
@@ -3193,6 +3214,68 @@ def ctx(
                 )
             if bal:
                 console.print(f"\nBalanced recommended:\n{bal['ctx']}")
+
+            # --- 8.6 Retrieval validation on the largest stable rung ---
+            if retrieval and report.get("maximum_stable_context"):
+                from lm_optimizer.services.context_explorer import (
+                    build_filler,
+                    build_needles,
+                    fill_ratios,
+                    score_retrieval,
+                )
+
+                target_ctx = int(report["maximum_stable_context"])
+                ratios = fill_ratios(detailed=detailed_fill)
+                # Use the deepest fill ratio that still fits comfortably.
+                fill_ratio = max(r for r in ratios if r <= 0.90)
+                filler_tokens = max(256, int(target_ctx * fill_ratio))
+                filler = build_filler(filler_tokens, kind="mixed", seed=42)
+                needles = build_needles(filler)
+                if needles:
+                    needle = needles[-1]
+                    cfg = LoadConfiguration(
+                        context_length=target_ctx,
+                        gpu_ratio=gpu_ratio,
+                        flash_attention=flash,
+                        offload_kv_cache_to_gpu=kv_gpu,
+                        eval_batch_size=batch,
+                    )
+                    console.print(
+                        f"\n[dim]Retrieval validation @ ctx {target_ctx} "
+                        f"(fill {fill_ratio:.0%}, needle at 95%)[/dim]"
+                    )
+                    ok_load, _i, _l, _ch, _ap, err = await svc._channel_load(model, cfg)
+                    if not ok_load:
+                        console.print(
+                            f"[yellow]Retrieval skipped: load failed ({err[:120]})[/yellow]"
+                        )
+                    else:
+                        prompt = needle.prompt + "\n\n" + needle.question
+                        try:
+                            response = await client.chat_completion(
+                                model=model,
+                                input_text=prompt,
+                                temperature=0.0,
+                                max_output_tokens=64,
+                            )
+                            text = ""
+                            choices = response.get("choices") or []
+                            if choices:
+                                text = choices[0].get("message", {}).get("content", "")
+                            passed = score_retrieval(text, needle.key)
+                            console.print(
+                                f"Retrieval: "
+                                f"{'[green]PASS[/green]' if passed else '[red]FAIL[/red]'} "
+                                f"(key {needle.key})"
+                            )
+                        except Exception as e:  # noqa: BLE001
+                            console.print(f"[yellow]Retrieval failed: {e}[/yellow]")
+                        finally:
+                            try:
+                                await svc.ensure_unloaded(model)
+                            except Exception:
+                                pass
+
             if quality_rungs > 0:
                 if not 0 <= warmup_runs <= 5:
                     console.print("[red]Invalid --warmup-runs (0-5)[/red]")
@@ -3515,6 +3598,7 @@ def resume(
                 speed_context=adv.get("speed_context"),
                 mtp_test=bool(adv.get("mtp_test")),
                 reasoning_sweep=bool(adv.get("reasoning_sweep")),
+                quality_lab=bool(adv.get("quality_lab")),
             )
             quality_evaluator = QualityEvaluator(QualityConfig(minimum_score=run.quality_threshold))
             search_generator = SearchSpaceGenerator(client)
@@ -3957,6 +4041,7 @@ def _run_resume(run_id: str, revalidate: bool, style: str, skip_phases: str | No
                 speed_context=adv.get("speed_context"),
                 mtp_test=bool(adv.get("mtp_test")),
                 reasoning_sweep=bool(adv.get("reasoning_sweep")),
+                quality_lab=bool(adv.get("quality_lab")),
             )
             quality_evaluator = QualityEvaluator(QualityConfig(minimum_score=run.quality_threshold))
             search_generator = SearchSpaceGenerator(client)

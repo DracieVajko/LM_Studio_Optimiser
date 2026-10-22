@@ -26,6 +26,10 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from lm_optimizer.logging_config import get_logger
+
+logger = get_logger(__name__)
+
 from lm_optimizer.services.sandbox_lab import (
     RepairAttempt,
     SandboxPolicy,
@@ -184,13 +188,26 @@ class SandboxRunner:
                 )
 
             files = read_workdir_files(self.workdir)
+            # Web tasks get the static HTML/JS validation automatically
+            # (spec 13.1 criteria achievable without a browser engine).
+            custom = dict(self.custom_checks or {})
+            if self.task.kind.value == "web":
+                try:
+                    from lm_optimizer.services.web_validator import (
+                        validate_web_files,
+                    )
+
+                    for check in validate_web_files(files):
+                        custom[check.name] = (check.passed, check.detail)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("Web validation failed", error=str(e)[:160])
             score, failing, critical = score_attempt(
                 self.task,
                 files,
                 stdout=execution.stdout,
                 stderr=execution.stderr,
                 exit_code=execution.exit_code,
-                custom_results=self.custom_checks or None,
+                custom_results=custom or None,
             )
             passed = not failing and execution.ok
             record = RepairAttempt(

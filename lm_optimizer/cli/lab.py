@@ -765,5 +765,118 @@ def sandbox(
     console.print(f"\nReport saved: {path}")
 
 
+@app.command("community-import")
+def community_import(
+    file: Path = typer.Argument(..., help="JSON file with community benchmark records"),
+):
+    """Import community benchmark records (spec 16.4).
+
+    Records are validated strictly; malformed ones are reported and skipped.
+    Duplicates against the shipped database are skipped, never overwritten.
+    """
+    setup_logging()
+    from lm_optimizer.services.community_benchmarks import COMMUNITY_BENCHMARKS
+    from lm_optimizer.services.community_import import import_records, load_json_file
+
+    try:
+        payload = load_json_file(file)
+        merged, warnings = import_records(payload, existing=COMMUNITY_BENCHMARKS)
+    except Exception as e:  # noqa: BLE001
+        console.print(f"[red]Import failed: {e}[/red]")
+        sys.exit(1)
+    added = len(merged) - len(COMMUNITY_BENCHMARKS)
+    for warning in warnings:
+        console.print(f"[yellow]{warning}[/yellow]")
+    console.print(
+        f"Imported {added} new record(s); "
+        f"{len(COMMUNITY_BENCHMARKS)} already present."
+    )
+
+
+@app.command("community-export")
+def community_export(
+    file: Path = typer.Argument(Path("results") / "community-benchmarks.json"),
+):
+    """Export the shipped community benchmark database to JSON."""
+    setup_logging()
+    import json as _json
+
+    from lm_optimizer.services.community_benchmarks import COMMUNITY_BENCHMARKS
+    from lm_optimizer.services.community_import import export_records
+
+    file.parent.mkdir(parents=True, exist_ok=True)
+    file.write_text(
+        _json.dumps(export_records(COMMUNITY_BENCHMARKS), indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    console.print(f"Exported {len(COMMUNITY_BENCHMARKS)} record(s) to {file}")
+
+
+@app.command("full-optimize")
+def full_optimize(
+    model: str = typer.Argument(..., help="Model ID"),
+    skip_context: bool = typer.Option(False, "--skip-context", help="Skip the context explorer"),
+    skip_quality: bool = typer.Option(False, "--skip-quality", help="Skip the Quality Lab"),
+    max_context: int = typer.Option(32768, "--max-context"),
+    quality_threshold: float = typer.Option(0.97, "--quality-threshold"),
+):
+    """Run the full workflow: runtime optimization -> context -> quality (spec §15).
+
+    This command only ORCHESTRATES the existing modules; it never duplicates
+    their logic. Each stage is a separate, resumable invocation.
+    """
+    setup_logging()
+    import subprocess
+    import sys as _sys
+
+    stages: list[tuple[str, list[str]]] = [
+        (
+            "runtime",
+            [
+                _sys.executable, "-m", "lm_optimizer", "optimize", model,
+                "--quality-lab", "--max-context", str(max_context),
+                "--quality", str(quality_threshold), "--yes", "--non-interactive",
+            ],
+        ),
+    ]
+    if not skip_context:
+        stages.append(
+            (
+                "context",
+                [
+                    _sys.executable, "-m", "lm_optimizer", "ctx", model,
+                    "--factor", "1.5", "--round-to", "512",
+                    "--max-context", str(max_context),
+                ],
+            )
+        )
+    if not skip_quality:
+        stages.append(
+            (
+                "quality",
+                [
+                    _sys.executable, "-m", "lm_optimizer", "lab", "quality-lab", model,
+                    "--seeds", "3",
+                ],
+            )
+        )
+
+    console.print(f"[bold]Full optimization: {model}[/bold]")
+    for name, cmd in stages:
+        console.print(f"  stage: {name}")
+    results: dict[str, int] = {}
+    for name, cmd in stages:
+        console.print(f"\n[bold]=== {name} ===[/bold]")
+        rc = subprocess.call(cmd, cwd=Path.cwd())
+        results[name] = rc
+        if rc != 0:
+            console.print(f"[yellow]stage {name} exited with {rc}[/yellow]")
+            break
+    console.print("")
+    for name, rc in results.items():
+        status = "[green]ok[/green]" if rc == 0 else f"[red]rc={rc}[/red]"
+        console.print(f"  {name}: {status}")
+
+
 if __name__ == "__main__":
     app()

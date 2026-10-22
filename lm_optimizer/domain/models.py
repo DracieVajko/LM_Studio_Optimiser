@@ -390,6 +390,13 @@ class BenchmarkMetrics:
     draft_ram_delta_mb: float = 0.0
     draft_ttft_delta_ms: float = 0.0
 
+    # Thermal / power (spec §11.4, §17.2). None means unavailable.
+    gpu_temp_c: float | None = None
+    gpu_util_pct: float | None = None
+    gpu_power_w: float | None = None
+    on_ac: bool | None = None
+    thermal_flag: str = ""
+
     @property
     def ttft_ms(self) -> float:
         """Backward compatibility alias for estimated_ttft_ms."""

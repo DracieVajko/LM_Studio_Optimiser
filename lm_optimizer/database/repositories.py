@@ -586,6 +586,11 @@ class ConfigurationRepository:
                     "draft_vram_delta_mb": m.draft_vram_delta_mb,
                     "draft_ram_delta_mb": m.draft_ram_delta_mb,
                     "draft_ttft_delta_ms": m.draft_ttft_delta_ms,
+                    "gpu_temp_c": m.gpu_temp_c,
+                    "gpu_util_pct": m.gpu_util_pct,
+                    "gpu_power_w": m.gpu_power_w,
+                    "on_ac": m.on_ac,
+                    "thermal_flag": m.thermal_flag,
                 }
                 for m in config.metrics
             ]

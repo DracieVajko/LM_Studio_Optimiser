@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Model Detail - LM Studio Auto Optimizer</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="/static/css/app.css">
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%232563eb' stroke-width='2'%3E%3Cpath stroke-linecap='round' stroke-linejoin='round' d='M13 10V3L4 14h7v7l9-11h-7z'/%3E%3C/svg%3E">
+    <script src="/static/js/theme.js?v=8"></script>
+    <script src="/static/js/navstatus.js?v=8"></script>
+</head>
+<body class="bg-gray-50 min-h-screen">
+    <div id="app">
+        <nav class="bg-white border-b border-gray-200 sticky top-0 z-40">
+            <div class="container mx-auto px-4">
+                <div class="flex items-center justify-between h-16">
+                    <div class="flex items-center space-x-8">
+                        <a href="/" class="flex items-center space-x-2">
+                            <svg class="w-8 h-8 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path>
+                            </svg>
+                            <span class="text-xl font-bold text-gray-900">LM Optimizer</span>
+                        </a>
+                        <div class="hidden md:flex space-x-6">
+                            <a href="/" class="nav-link text-gray-600 hover:text-blue-600 font-medium">Dashboard</a>
+                            <a href="/history" class="nav-link text-gray-600 hover:text-blue-600 font-medium">History</a>
+                            <a href="/sandbox" class="nav-link text-gray-600 hover:text-blue-600 font-medium">Sandbox</a>
+                            <a href="/experiments" class="nav-link text-gray-600 hover:text-blue-600 font-medium">Experiments</a>
+                            <a href="/lab" class="nav-link text-gray-600 hover:text-blue-600 font-medium">Lab</a>
+                            <a href="/settings" class="nav-link text-gray-600 hover:text-blue-600 font-medium">Settings</a>
+                        </div>
+                    </div>
+                    <div class="flex items-center space-x-4">
+                        <button class="theme-toggle btn btn-outline btn-sm" aria-label="Toggle dark mode">dYOT</button>
+                        <span id="lm-status" class="status-badge status-offline text-sm font-medium">
+                            <span class="status-dot"></span>Disconnected
+                        </span>
+                    </div>
+                </div>
+            </div>
+        </nav>
+
+        <main class="container mx-auto px-4 py-8" id="main-content">
+            <div class="flex items-center justify-between mb-4">
+                <h1 class="text-2xl font-bold" id="md-title">Model</h1>
+                <div class="flex gap-2">
+                    <button id="md-run-optimize" class="btn btn-primary">Optimize this model</button>
+                    <a href="/history" class="btn btn-outline">History</a>
+                </div>
+            </div>
+
+            <div class="grid md:grid-cols-3 gap-4 mb-6">
+                <div class="card"><div class="card-body">
+                    <h2 class="font-semibold mb-2">Identity</h2>
+                    <div id="md-identity" class="text-sm text-gray-500">Loading...</div>
+                </div></div>
+                <div class="card"><div class="card-body">
+                    <h2 class="font-semibold mb-2">Capabilities</h2>
+                    <div id="md-capabilities" class="text-sm text-gray-500">Loading...</div>
+                </div></div>
+                <div class="card"><div class="card-body">
+                    <h2 class="font-semibold mb-2">Presets</h2>
+                    <div id="md-presets" class="text-sm text-gray-500">Loading...</div>
+                </div></div>
+            </div>
+
+            <div class="card mb-6"><div class="card-body">
+                <h2 class="font-semibold mb-2">Run history</h2>
+                <div id="md-runs" class="text-sm text-gray-500">Loading...</div>
+            </div></div>
+
+            <div class="card"><div class="card-body">
+                <h2 class="font-semibold mb-2">Measured configurations</h2>
+                <p class="text-xs text-gray-400 mb-3">
+                    Passing speed probes from the newest run; the median drives every
+                    keep/delete decision. Context is always shown.
+                </p>
+                <div id="md-configs" class="text-sm text-gray-500">Loading...</div>
+            </div></div>
+        </main>
+    </div>
+    <script>
+    window.__bootError = null;
+    window.addEventListener('error', function (e) {
+        window.__bootError = (e && e.message) || 'script error';
+        var main = document.getElementById('main-content');
+        var stillLoading = main && main.querySelector('.spinner');
+        if (stillLoading) {
+            main.innerHTML = '<div class="card"><div class="card-body text-center py-12">'
+                + '<h3 class="text-lg font-medium text-gray-900">Model page failed to start.</h3>'
+                + '<p class="text-sm text-gray-500 mt-1">JavaScript error: '
+                + String(window.__bootError).slice(0, 300) + '</p>'
+                + '<button class="btn btn-outline mt-4" onclick="window.location.reload()">Retry</button>'
+                + '</div></div>';
+        }
+    }, true);
+    </script>
+    <script src="/static/js/model-detail.js?v=8"></script>
+</body>
+</html>

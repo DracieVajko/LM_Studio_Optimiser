@@ -109,6 +109,13 @@ class AdvancedSettingsSchema(BaseModel):
     optimize_context: bool = False  # Phase B opt-in: max-context on frozen winner
     skip_phases: list[str] = []  # subset of: speed, quality, recovery, validation, context
     warmup_runs: int | None = Field(default=None, ge=0, le=5)  # None = server default
+    # Granular test selection (v1.6.x): the same flags the CLI exposes.
+    speed_only: bool = False
+    quality_only: bool = False
+    reasoning_sweep: bool = False
+    mtp_test: bool = False
+    quality_lab: bool = False
+    speed_context: int | None = None
 
 
 class OptimizationRequest(BaseModel):

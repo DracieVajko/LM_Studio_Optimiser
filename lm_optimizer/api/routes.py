@@ -593,8 +593,28 @@ async def start_optimization(request: OptimizationRequest, background_tasks: Bac
         adv.setdefault("workload_type", normalize_workload(request.workload_type))
         adv["workload_type"] = normalize_workload(adv.get("workload_type"))
 
+        # Granular modes: compose the skip set the same way the CLI does, so
+        # the web endpoint honours --speed-only/--quality-only/... too.
+        from lm_optimizer.services.optimizer import compose_granular_skips
+
+        if any(
+            adv.get(key)
+            for key in ("speed_only", "quality_only", "reasoning_sweep", "mtp_test")
+        ):
+            adv["skip_phases"] = compose_granular_skips(adv)
+        if adv.get("reasoning_sweep"):
+            adv["include_categories"] = {"reasoning"}
+
         # Create services
-        benchmark_service = BenchmarkService(client)
+        benchmark_service = BenchmarkService(
+            client,
+            speed_only=bool(adv.get("speed_only")),
+            quality_only=bool(adv.get("quality_only")),
+            speed_context=adv.get("speed_context"),
+            mtp_test=bool(adv.get("mtp_test")),
+            reasoning_sweep=bool(adv.get("reasoning_sweep")),
+            quality_lab=bool(adv.get("quality_lab")),
+        )
         if adv.get("warmup_runs") is not None:
             try:
                 benchmark_service.config.warmup_repetitions = min(
