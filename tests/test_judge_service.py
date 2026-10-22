@@ -3,6 +3,7 @@
 import json
 import tempfile
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 from uuid import uuid4
 
@@ -13,7 +14,7 @@ from lm_optimizer.database.manager import DatabaseManager
 
 def _setup_test_db(db_path: Path):
     """Set up test database with hardware, models, runs, and configs."""
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         # Insert hardware snapshot
         conn.execute(
             "INSERT INTO hardware_snapshots (id, os, cpu_name, cpu_cores_physical, cpu_cores_logical, total_ram_gb, gpu_count, gpus_json, cuda_version, metal_available, vulkan_available, detected_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -28,7 +29,7 @@ def _setup_test_db(db_path: Path):
 
 def _create_test_run(db_path: Path, run_id: str, model_id: str = "test-model"):
     """Create a test run with configurations directly via SQL."""
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         # Insert run
         conn.execute(
             """INSERT INTO runs (id, model_id, hardware_id, profile, profile_weights_json, quality_threshold,
@@ -128,7 +129,7 @@ def test_load_run_data_empty_run_raises(temp_db):
     from lm_optimizer.services.judge_service import JudgeService
 
     run_id = str(uuid4())
-    with sqlite3.connect(temp_db) as conn:
+    with closing(sqlite3.connect(temp_db)) as conn, conn:
         conn.execute(
             """INSERT INTO runs (id, model_id, hardware_id, profile, profile_weights_json, quality_threshold,
                 status, stage, search_space_json, optimizer_version, benchmark_repetitions, validation_repetitions,
@@ -153,7 +154,7 @@ def test_load_run_data_multiple_runs(temp_db):
     from lm_optimizer.services.judge_service import JudgeService
 
     # Add second model
-    with sqlite3.connect(temp_db) as conn:
+    with closing(sqlite3.connect(temp_db)) as conn, conn:
         conn.execute(
             "INSERT INTO models (id, name, architecture, parameter_count, quantization, context_limit, is_moe, num_experts, size_bytes, metadata_json, first_seen, last_seen) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             ("model-b", "model-b", "test", 1000000000, "q4", 32768, 0, None, 1000000000, "{}", "2026-01-01T00:00:00", "2026-01-01T00:00:00")

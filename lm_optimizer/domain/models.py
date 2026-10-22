@@ -296,6 +296,16 @@ class LMStudioCapabilities:
     supports_context_checkpoints: bool = True
     supports_num_experts: bool = False
     supports_rope_scaling: bool = False
+    # Speculative decoding / MTP (probed 2026-10-21: all five keys are
+    # recognized by the live REST v1 API).
+    supports_speculative_draft: bool = False
+    supports_speculative_mtp: bool = False
+    # Runtime-only facts on this build: KV cache quantization, CPU threads,
+    # mmap and keep-in-memory are NOT settable through REST (400
+    # unrecognized_keys in every spelling tried). They are observed, never
+    # searched - see lm_optimizer/services/lm_studio_capabilities.py.
+    supports_cpu_threads: bool = False
+    supports_mmap: bool = False
     load_parameters: list[str] = field(default_factory=list)
 
     def get_supported_load_params(self) -> list[str]:
@@ -323,7 +333,18 @@ class LMStudioCapabilities:
             params.append("num_experts")
         if self.supports_rope_scaling:
             params.extend(["rope_freq_base", "rope_freq_scale"])
-        for extra in ("reasoning_budget_message", "speculative_draft_max_tokens"):
+        if self.supports_speculative_draft:
+            params.extend(
+                [
+                    "speculative_draft_max_tokens",
+                    "speculative_draft_min_tokens",
+                    "speculative_draft_min_continue_probability",
+                ]
+            )
+        if self.supports_speculative_mtp:
+            params.append("speculative_draft_mtp")
+        for extra in ("reasoning_budget_message", "speculative_draft_simple",
+                      "speculative_draft_model"):
             if extra in (self.load_parameters or []) and extra not in params:
                 params.append(extra)
         return params
@@ -357,6 +378,17 @@ class BenchmarkMetrics:
     thinking_text: str = ""
     # The exact prompt sent (for per-test Prompt/Thinking/Output display).
     prompt: str = ""
+
+    # MTP / Speculative Decoding metrics (P0)
+    # Only populated when speculative decoding / MTP is active and server
+    # exposes the statistics. Remain None/0 when not applicable.
+    draft_tokens_proposed: int = 0
+    draft_tokens_accepted: int = 0
+    acceptance_rate: float = 0.0
+    speedup_ratio: float = 1.0
+    draft_vram_delta_mb: float = 0.0
+    draft_ram_delta_mb: float = 0.0
+    draft_ttft_delta_ms: float = 0.0
 
     @property
     def ttft_ms(self) -> float:

@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Lab - LM Studio Auto Optimizer</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="/static/css/app.css">
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%232563eb' stroke-width='2'%3E%3Cpath stroke-linecap='round' stroke-linejoin='round' d='M13 10V3L4 14h7v7l9-11h-7z'/%3E%3C/svg%3E">
+    <script src="/static/js/theme.js?v=8"></script>
+    <script src="/static/js/navstatus.js?v=8"></script>
+</head>
+<body class="bg-gray-50 min-h-screen">
+    <div id="app">
+        <nav class="bg-white border-b border-gray-200 sticky top-0 z-40">
+            <div class="container mx-auto px-4">
+                <div class="flex items-center justify-between h-16">
+                    <div class="flex items-center space-x-8">
+                        <a href="/" class="flex items-center space-x-2">
+                            <svg class="w-8 h-8 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path>
+                            </svg>
+                            <span class="text-xl font-bold text-gray-900">LM Optimizer</span>
+                        </a>
+                        <div class="hidden md:flex space-x-6">
+                            <a href="/" class="nav-link text-gray-600 hover:text-blue-600 font-medium">Dashboard</a>
+                            <a href="/history" class="nav-link text-gray-600 hover:text-blue-600 font-medium">History</a>
+                            <a href="/sandbox" class="nav-link text-gray-600 hover:text-blue-600 font-medium">Sandbox</a>
+                            <a href="/lab" class="nav-link text-blue-600 font-medium">Lab</a>
+                            <a href="/settings" class="nav-link text-gray-600 hover:text-blue-600 font-medium">Settings</a>
+                        </div>
+                    </div>
+                    <div class="flex items-center space-x-4">
+                        <button class="theme-toggle btn btn-outline btn-sm" aria-label="Toggle dark mode">dYOT</button>
+                        <span id="lm-status" class="status-badge status-offline text-sm font-medium">
+                            <span class="status-dot"></span>Disconnected
+                        </span>
+                    </div>
+                </div>
+            </div>
+        </nav>
+
+        <main class="container mx-auto px-4 py-8" id="main-content">
+            <h1 class="text-2xl font-bold mb-2">Lab</h1>
+            <p class="text-sm text-gray-500 mb-6">
+                Context Explorer, Quality Lab, Model Recommender and Duel &mdash; the workflows that are
+                <em>not</em> the runtime optimizer. Local measurements always outrank community priors.
+            </p>
+
+            <div class="flex gap-2 mb-6 flex-wrap" id="lab-tabs">
+                <button class="btn btn-outline lab-tab" data-tab="recommend">Recommender</button>
+                <button class="btn btn-outline lab-tab" data-tab="tasks">Quality tasks</button>
+                <button class="btn btn-outline lab-tab" data-tab="duels">Duel types</button>
+            </div>
+
+            <!-- Recommender -->
+            <section id="lab-panel-recommend" class="lab-panel">
+                <div class="card"><div class="card-body">
+                    <h2 class="font-semibold mb-1">Model recommendations for this hardware</h2>
+                    <p class="text-sm text-gray-500 mb-4">
+                        Fit is decided by file size and bits/weight &mdash; never by parameter count.
+                        A 27B at Q1_0 (4.4 GB) fits a 6 GB card; the same 27B at Q4_K_M (17.4 GB) does not.
+                    </p>
+                    <div class="grid md:grid-cols-4 gap-4 mb-4">
+                        <div>
+                            <label class="font-medium text-sm">Min tok/s</label>
+                            <input id="lab-min-tps" class="input w-full mt-1" type="number" value="5" step="0.5">
+                        </div>
+                        <div>
+                            <label class="font-medium text-sm">Min context</label>
+                            <input id="lab-min-ctx" class="input w-full mt-1" type="number" value="8192" step="1024">
+                        </div>
+                        <div>
+                            <label class="font-medium text-sm">Use case</label>
+                            <select id="lab-use-case" class="input w-full mt-1">
+                                <option value="general">general</option>
+                                <option value="coding">coding</option>
+                                <option value="reasoning">reasoning</option>
+                                <option value="fast">fast</option>
+                                <option value="long_context">long context</option>
+                                <option value="tools">tools</option>
+                            </select>
+                        </div>
+                        <div class="flex items-end">
+                            <label class="flex items-center gap-2 text-sm">
+                                <input id="lab-vram-only" type="checkbox"> VRAM only (no RAM spill)
+                            </label>
+                        </div>
+                    </div>
+                    <button id="lab-run-recommend" class="btn btn-primary">Compute recommendations</button>
+                </div></div>
+
+                <div id="lab-recommend-result" class="mt-6"></div>
+            </section>
+
+            <!-- Quality tasks -->
+            <section id="lab-panel-tasks" class="lab-panel hidden">
+                <div class="card"><div class="card-body">
+                    <h2 class="font-semibold mb-1">Deterministic quality tasks</h2>
+                    <p class="text-sm text-gray-500 mb-4">
+                        Hard gates run BEFORE scoring: an empty output, a failed schema or a missing
+                        function caps the score at zero &mdash; a broken answer never wins on appearance.
+                        Run them with <code class="font-mono">lm-optimizer lab quality-lab &lt;model&gt;</code>.
+                    </p>
+                    <div id="lab-tasks-result" class="text-sm text-gray-500">Loading...</div>
+                </div></div>
+            </section>
+
+            <!-- Duel types -->
+            <section id="lab-panel-duels" class="lab-panel hidden">
+                <div class="card"><div class="card-body">
+                    <h2 class="font-semibold mb-1">Duel types</h2>
+                    <p class="text-sm text-gray-500 mb-4">
+                        Controlled duels use identical context, sampling and seed for both sides;
+                        the blind judge only ever sees &ldquo;Candidate A&rdquo; and &ldquo;Candidate B&rdquo;.
+                        Run them with <code class="font-mono">lm-optimizer lab duel &lt;a&gt; &lt;b&gt;</code>.
+                    </p>
+                    <div id="lab-duels-result" class="text-sm text-gray-500">Loading...</div>
+                </div></div>
+            </section>
+        </main>
+    </div>
+    <script>
+    // Boot reporter: if the module below fails (syntax, import, CDN),
+    // the page explains itself instead of staying blank forever.
+    window.__bootError = null;
+    window.addEventListener('error', function (e) {
+        window.__bootError = (e && e.message) || 'script error';
+        var main = document.getElementById('main-content');
+        var stillLoading = main && main.querySelector('.spinner');
+        if (stillLoading) {
+            main.innerHTML = '<div class="card"><div class="card-body text-center py-12">'
+                + '<h3 class="text-lg font-medium text-gray-900">Lab failed to start.</h3>'
+                + '<p class="text-sm text-gray-500 mt-1">JavaScript error: '
+                + String(window.__bootError).slice(0, 300) + '</p>'
+                + '<p class="text-xs text-gray-400 mt-2">Check DevTools console (F12), then '
+                + '<a class="underline" href="/history">History</a> or '
+                + '<a class="underline" href="/settings">Settings</a>.</p>'
+                + '<button class="btn btn-outline mt-4" onclick="window.location.reload()">Retry</button>'
+                + '</div></div>';
+        }
+    }, true);
+    window.addEventListener('unhandledrejection', function (e) {
+        var reason = (e && e.reason && (e.reason.message || e.reason)) || 'request failed';
+        console.error('Unhandled rejection:', reason);
+    });
+    </script>
+    <script src="/static/js/lab.js?v=8"></script>
+</body>
+</html>

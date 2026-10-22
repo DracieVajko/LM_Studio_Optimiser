@@ -64,7 +64,10 @@ strict = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-testpaths = ["lm_optimizer/tests"]
+# Both test roots must be collected: lm_optimizer/tests holds the unit
+# suite, tests/ holds the integration/tooling suite. Before this fix the
+# tests/ tree was silently skipped by the default `pytest` run.
+testpaths = ["lm_optimizer/tests", "tests"]
 python_files = "test_*.py"
 python_functions = "test_*"
 

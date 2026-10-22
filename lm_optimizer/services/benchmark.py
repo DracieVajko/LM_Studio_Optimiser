@@ -60,6 +60,67 @@ def _sample_mem() -> dict:
         return {}
 
 
+def _extract_mtp_metrics(stats: dict | None) -> dict:
+    """MTP / speculative-decoding metrics from the server's chat stats.
+
+    LM Studio's native /api/v1/chat `stats` object may expose draft token
+    counters when speculative decoding or MTP is active. Field spelling
+    differs between runtime versions, so every accepted alias is probed and
+    the FIRST match wins. Missing fields stay at their honest defaults
+    (0 proposed / 0 accepted / 0.0 acceptance) - never fabricated.
+
+    A non-empty result means the server really reported the counters; an
+    empty dict means "not exposed" and the caller keeps the neutral values.
+    """
+    if not isinstance(stats, dict):
+        return {}
+
+    def _int(*keys: str) -> int:
+        for key in keys:
+            value = stats.get(key)
+            if isinstance(value, (int, float)):
+                return int(value)
+        return 0
+
+    def _float(*keys: str) -> float:
+        for key in keys:
+            value = stats.get(key)
+            if isinstance(value, (int, float)):
+                return float(value)
+        return 0.0
+
+    proposed = _int(
+        "draft_tokens_proposed",
+        "draft_tokens",
+        "predicted_draft_tokens",
+        "speculative_draft_tokens",
+        "n_draft",
+    )
+    accepted = _int(
+        "draft_tokens_accepted",
+        "accepted_draft_tokens",
+        "draft_tokens_accepted_count",
+        "n_accepted",
+    )
+    acceptance = _float(
+        "draft_acceptance_rate",
+        "acceptance_rate",
+        "draft_tokens_accepted_ratio",
+    )
+    if acceptance <= 0.0 and proposed > 0 and accepted > 0:
+        acceptance = accepted / proposed
+
+    if proposed <= 0 and accepted <= 0 and acceptance <= 0.0:
+        # Server exposed no draft counters at all: leave the neutral values.
+        return {}
+
+    return {
+        "draft_tokens_proposed": proposed,
+        "draft_tokens_accepted": accepted,
+        "acceptance_rate": round(acceptance, 4),
+    }
+
+
 def _peak_usage(before: dict | None, after: dict | None) -> tuple[float | None, float | None]:
     """Peak GB used = total - min(free) over snapshots; None if unmeasurable."""
     peak_vram = peak_ram = None
@@ -147,6 +208,11 @@ class BenchmarkService:
         self.speed_context = speed_context
         self.mtp_test = mtp_test
         self.reasoning_sweep = reasoning_sweep
+        # Set (model id) only when the trailing ensure_unloaded of an attempt
+        # could NOT verify the model left the host. The optimizer reads this
+        # between candidates and refuses to load another memory-heavy config.
+        # None means the last attempt verified an empty state.
+        self.last_unverified_unload: str | None = None
         # Benchmarks score the ANSWER, not the thinking trace (R32). The native
         # chat endpoint exposes reasoning off/low/medium/high/on; default off
         # keeps outputs deterministic and scorable.
@@ -221,10 +287,16 @@ class BenchmarkService:
             return False, 0.0, f"{type(e).__name__}: {e}"
         finally:
             try:
-                if not await self.client.ensure_unloaded(model_id):
+                if await self.client.ensure_unloaded(model_id):
+                    self.last_unverified_unload = None
+                else:
+                    self.last_unverified_unload = model_id
                     logger.warning("Smoke left model loaded", model=model_id)
-            except Exception:
-                pass
+            except Exception as e:
+                self.last_unverified_unload = model_id
+                logger.warning(
+                    "Smoke unload verification failed", model=model_id, error=str(e)[:160]
+                )
 
     async def measure_throughput(
         self,
@@ -302,10 +374,17 @@ class BenchmarkService:
             return out
         finally:
             try:
-                if not await self.client.ensure_unloaded(model_id):
+                if await self.client.ensure_unloaded(model_id):
+                    self.last_unverified_unload = None
+                else:
+                    self.last_unverified_unload = model_id
                     logger.warning("Throughput probe left model loaded", model=model_id)
-            except Exception:
-                pass
+            except Exception as e:
+                self.last_unverified_unload = model_id
+                logger.warning(
+                    "Throughput unload verification failed",
+                    model=model_id, error=str(e)[:160],
+                )
 
     def create_cases_for_context(
         self, 
@@ -486,9 +565,19 @@ class BenchmarkService:
             result.status = "failed"
             result.error = str(e)
         finally:
-            # Always unload and verify server state
-            if not await self.client.ensure_unloaded(model_id):
-                logger.warning("Model may still be loaded", model=model_id)
+            # Always unload and verify server state; an unverified leftover
+            # flags the host dirty (the optimizer stops before its next load).
+            try:
+                if await self.client.ensure_unloaded(model_id):
+                    self.last_unverified_unload = None
+                else:
+                    self.last_unverified_unload = model_id
+                    logger.warning("Model may still be loaded", model=model_id)
+            except Exception as e:
+                self.last_unverified_unload = model_id
+                logger.warning(
+                    "Unload verification failed", model=model_id, error=str(e)[:160]
+                )
 
         logger.info("Benchmark complete", config_id=str(config_id), status=result.status)
         return result
@@ -704,6 +793,8 @@ class BenchmarkService:
                 (prompt_tokens / (prompt_processing_ms / 1000)) if prompt_processing_ms > 0 else 0
             )
 
+            mtp = _extract_mtp_metrics(stats)
+
             return BenchmarkMetrics(
                 test_name=case.name,
                 category=case.category,
@@ -720,6 +811,7 @@ class BenchmarkService:
                 output_text=output_text,
                 thinking_text=thinking_text,
                 prompt=case.prompt,
+                **mtp,
             )
 
         except Exception as e:

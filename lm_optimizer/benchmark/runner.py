@@ -315,6 +315,9 @@ class BenchmarkRunner:
                 ),
                 generation_ms=statistics.median([m.generation_ms for m in successful]),
                 prompt_tok_s=statistics.median([m.prompt_tok_s for m in successful]),
+                # Per-test value: MEDIAN OF REPETITIONS for this test (robust
+                # central). Cross-test aggregation is a separate, explicit step
+                # (get_median_generation_tok_s / get_mean_generation_tok_s).
                 generation_tok_s=statistics.median([m.generation_tok_s for m in successful]),
                 output_text=best_text_run.output_text,  # Use most complete run for quality check
             )
@@ -344,12 +347,36 @@ class BenchmarkRunner:
             passed=all_passed,
         )
 
-    def get_avg_generation_tok_s(self, result: BenchmarkResult) -> float:
-        """Get average generation tokens/sec across successful tests."""
+    def get_median_generation_tok_s(self, result: BenchmarkResult) -> float:
+        """Median generation tok/s across successful tests (canonical central).
+
+        Robust against one short/fast test (e.g. structured output) dominating
+        the aggregate. This is the value the reports headline.
+        """
         speeds = [
             m.generation_tok_s for m in result.metrics if m.success and m.generation_tok_s > 0
         ]
         return statistics.median(speeds) if speeds else 0.0
+
+    def get_mean_generation_tok_s(self, result: BenchmarkResult) -> float:
+        """Arithmetic mean generation tok/s across successful tests.
+
+        MUST be exported under a distinct name (e.g. ``gen_tok_s_mean``);
+        never merged with the median headline value.
+        """
+        speeds = [
+            m.generation_tok_s for m in result.metrics if m.success and m.generation_tok_s > 0
+        ]
+        return statistics.fmean(speeds) if speeds else 0.0
+
+    def get_avg_generation_tok_s(self, result: BenchmarkResult) -> float:
+        """HISTORICAL alias = median across successful tests (NOT the mean).
+
+        Named 'avg' for compatibility; computes the robust median (R33).
+        Exports wanting the arithmetic mean must call
+        ``get_mean_generation_tok_s`` and label the field explicitly.
+        """
+        return self.get_median_generation_tok_s(result)
 
     def get_avg_prompt_tok_s(self, result: BenchmarkResult) -> float:
         """Get average prompt processing tokens/sec."""

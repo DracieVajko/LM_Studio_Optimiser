@@ -740,8 +740,8 @@ def save_best_report(
                 else "- Quality: N/A"
             ),
             f"- Context: {best.context_length}",
-            f"- Verdict: fastest quality-passing of {len(tested)} "
-            f"(profile {run.profile.value})",
+            f"- Verdict: winner of {len(tested)} tested (non-inferiority band, "
+            f"profile {run.profile.value})",
             "",
             "## Model identity (from this run, not execution order)",
             "",
@@ -928,6 +928,30 @@ def save_best_report(
         )
     if len(pareto) != len(tested):
         lines += ["", f"Pareto-optimal: {len(pareto)} of {len(tested)} passed."]
+    else:
+        lines += ["", "Pareto-optimal: all tested configurations are non-dominated."]
+    # Winner transparency (audit): the winner is chosen progressively during
+    # the run under then-current score bounds and is finalized as the median
+    # validated copy of its config. A different eligible config may end the
+    # run with a higher recomputed score; surface that explicitly.
+    better = [
+        c
+        for c in configs
+        if c.id != best.id
+        and c.status.value == "passed"
+        and c.score is not None
+        and best.score is not None
+        and c.score > best.score * 1.05
+    ]
+    if better:
+        top = max(better, key=lambda c: c.score)
+        lines += [
+            "",
+            f"NOTE: config {top.id} closed with a higher recomputed score "
+            f"({top.score:.3f} vs winner {best.score:.3f}); winner was "
+            "selected under running bounds during the search (winner remains "
+            "the median of its final validation).",
+        ]
     lines += [""]
 
     if failed:

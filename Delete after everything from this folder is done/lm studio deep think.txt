@@ -1,0 +1,4555 @@
+bolo by fajn skusat miesat a skusat kv cache v cpu a kv cache v gpu a podoben veci co sa daju presuvat v mdoelcoch medzi gpu a cpu za ucelom zvysenia kontextu alebo speed. 
+v lm studio som si stiahol 27b uncensore hauhacs model qwen 3.8 , asi 14gb iq3 model, a k nemu bol este asi 1.6gb mpt model alebo co to je , to ako funguje? lebo ja v modeloch uz mam zapnute mpt ale nevidim tam zeby sa dalo mtp modely vyrat alebo nieco?
+Copilot said:
+To čo popisuješ, bude skoro určite MTP (Multi-Token Prediction) model, nie "MPT".
+
+Pri nových Qwen modeloch bývajú v LM Studio dve súčasti:
+
+Hlavný model (u teba cca 14 GB IQ3 GGUF)
+
+toto je ten samotný LLM
+generuje odpovede
+vyberáš ho v chate
+MTP model (cca 1-2 GB)
+
+pomocný model
+neslúži na chatovanie
+používa sa na zrýchlenie generovania tokenov
+LM Studio ho pripne k hlavnému modelu automaticky
+Preto ho nikde nevidíš medzi modelmi na výber. Nie je to samostatný chatbot.
+
+Ako zistíš či sa používa:
+
+Po načítaní modelu pozri v LM Studio:
+
+Developer / Model Info / Runtime logs
+
+často tam býva niečo ako:
+
+
+
+Loaded MTP Draft Model
+Speculative Decoding Enabled
+alebo
+
+
+
+Draft Model Active
+To znamená, že MTP funguje.
+
+Princíp je jednoduchý:
+
+Bez MTP:
+
+
+
+Token 1
+Token 2
+Token 3
+Token 4
+Model počíta token po tokene.
+
+S MTP:
+
+
+
+MTP navrhne:
+1 2 3 4
+ 
+hlavný model overí
+Preto je generovanie často o 20-80 % rýchlejšie podľa HW.
+
+Pri tvojom:
+
+Qwen3 27B Uncensored IQ3 (~14 GB)
+
+je MTP dosť užitočný, lebo 27B model je veľký a každý nárast TPS (tokens/sec) cítiť.
+
+Ak chceš, pošli mi:
+
+presný názov modelu z LM Studio (celý názov GGUF)
+screenshot záložky Model Settings
+a poviem ti:
+
+či ten MTP naozaj využívaš,
+či ho máš správne zapnutý,
+aký približný nárast rýchlosti môžeš čakať na tvojom hardware.
+
+
+
+
+You said:
+urob research co vsetko v lmstudio mozem cez endpointy nastvaovat ,robim lm studiio optimiser kde sa testuju uplne vsetky mozne kombinacie
+Copilot said:
+Spravím to ako technický audit pre optimizer: oddelím REST inference parametre, model-load nastavenia, CLI/SDK možnosti a veci dostupné iba v GUI/runtime. Zároveň označím, čo sa dá reálne automatizovať a čo optimizer musí meniť reštartom alebo reloadom modelu.
+
+
+Reasoned for 14s
+Áno. Pre LM Studio Optimiser, ktorý má testovať maximum kombinácií, nestačí iba OpenAI-compatible endpoint. Potrebuješ rozdeliť parametre na:
+
+load-time parametre: vyžadujú unload/load modelu,
+inference-time parametre: meniteľné pri každom requeste,
+speculative decoding / MTP,
+serverové parametre,
+parametre dostupné iba cez Python/TypeScript SDK alebo CLI.
+Najdôležitejší záver: native REST API v1 nepokrýva všetky nastavenia, ktoré LM Studio interne podporuje. Pre úplný optimizer by som použil kombináciu:
+
+REST /api/v1/* na model management,
+lmstudio-python na pokročilé load/inference nastavenia,
+lms CLI na GPU offload, TTL a memory estimation,
+samostatné OS/GPU meranie VRAM, RAM, CPU a spotreby.
+Interné firemné hľadanie našlo iba 1 nesúvisiaci výsledok o Oracle SQL optimizéri, takže nižšie vychádzam z aktuálnej oficiálnej dokumentácie LM Studio.
+
+1. Endpointy, ktoré má LM Studio
+Od LM Studio 0.4.0 je odporúčaná native REST API v1:
+
+
+
+GET  /api/v1/models
+POST /api/v1/models/load
+POST /api/v1/models/unload
+POST /api/v1/models/download
+GET  /api/v1/models/download/status
+POST /api/v1/chat
+Okrem toho sú dostupné OpenAI-compatible, Anthropic-compatible a Jev-compatible endpointy. Native /api/v1/chat navyše podporuje stavové konverzácie, MCP integrácie, udalosti načítavania modelu a zadanie context length priamo v requeste.
+lmstudio
+
+Pre optimizer odporúčam ako základ:
+
+
+
+POST /api/v1/models/load
+POST /api/v1/chat
+POST /api/v1/models/unload
+2. Load-time parametre cez REST API
+Endpoint:
+
+
+
+POST /api/v1/models/load
+Aktuálne zdokumentované telo:
+
+
+
+{
+  "model": "publisher/model-name",
+  "context_length": 8192,
+  "eval_batch_size": 512,
+  "flash_attention": true,
+  "num_experts": 4,
+  "offload_kv_cache_to_gpu": true,
+  "echo_load_config": true
+}
+Parametre
+model
+Identifikátor modelu:
+
+
+
+{
+  "model": "publisher/model-name"
+}
+context_length
+Rozumná testovacia množina:
+
+
+
+2048
+4096
+8192
+16384
+32768
+Vyšší kontext zásadne zvyšuje veľkosť KV cache. Netestoval by som automaticky hodnoty nad deklarovaný limit modelu.
+
+eval_batch_size
+Ovplyvňuje prompt processing a pamäť:
+
+
+
+64
+128
+256
+512
+1024
+Nie každý systém zvládne všetky hodnoty. OOM alebo load failure musí byť legitímny výsledok experimentu, nie pád celého optimizeru.
+
+flash_attention
+
+
+false
+true
+num_experts
+Iba pre MoE modely:
+
+
+
+1
+2
+4
+8
+Hodnoty musíš limitovať podľa architektúry modelu. Pre dense model, akým môže byť aj tvoj konkrétny Qwen, parameter nemá zmysel.
+
+offload_kv_cache_to_gpu
+
+
+false
+true
+Pri false je KV cache v CPU RAM, pri true v GPU pamäti. Parameter má účinok pri LLM a decision modeloch používajúcich llama.cpp engine.
+
+echo_load_config
+Nastav vždy:
+
+
+
+{
+  "echo_load_config": true
+}
+LM Studio ti vráti skutočne aplikovanú konfiguráciu. To je veľmi dôležité, pretože optimizer nesmie predpokladať, že LM Studio prijatú hodnotu aj reálne použilo. REST load endpoint dokumentuje presne tieto load parametre a vracia instance_id, čas načítania a aplikovanú konfiguráciu.
+lmstudio
+
+3. Pokročilé load parametre dostupné cez SDK
+TypeScript/Python SDK sprístupňuje širšiu konfiguráciu než /api/v1/models/load.
+
+Kompletný dokumentovaný load priestor
+
+
+gpu
+contextLength
+ropeFrequencyBase
+ropeFrequencyScale
+evalBatchSize
+flashAttention
+keepModelInMemory
+seed
+useFp16ForKVCache
+tryMmap
+numExperts
+llamaKCacheQuantizationType
+llamaVCacheQuantizationType
+Tieto parametre sú dokumentované v LLMLoadModelConfig.
+lmstudio
+
+Najdôležitejšie pre optimizer
+gpu
+GPU offload ratio:
+
+
+
+{
+    "gpu": {
+        "ratio": 0.0
+    }
+}
+Testovací priestor:
+
+
+
+0.00
+0.25
+0.50
+0.75
+1.00
+Ale efektívnejší postup je binárne alebo adaptívne hľadať najvyšší offload, ktorý sa zmestí do VRAM.
+
+CLI má na to:
+
+
+
+lms load MODEL --gpu off
+lms load MODEL --gpu 0.5
+lms load MODEL --gpu max
+CLI podporuje aj --estimate-only, pričom odhad zohľadňuje context length, Flash Attention a vision konfiguráciu.
+lmstudio
+
+ropeFrequencyBase
+Testuj iba pri experimente s predĺženým kontextom. Nie je to normálny performance tuner.
+
+
+
+default
+10000
+500000
+1000000
+Konkrétne hodnoty však nemôžeš univerzálne aplikovať na každý model. Musia byť viazané na architektúru a metadata modelu.
+
+ropeFrequencyScale
+Tiež iba pre context-extension experimenty:
+
+
+
+default
+0.5
+1.0
+2.0
+4.0
+Toto môže ovplyvniť kvalitu. Výsledok preto nesmieš hodnotiť iba cez tokens/s.
+
+keepModelInMemory
+
+
+false
+true
+Má význam najmä pri opakovaných testoch a možnom swapovaní.
+
+seed
+Použi pevnú hodnotu, napríklad:
+
+
+
+42
+Pri speed benchmarkoch potrebuješ rovnaký priebeh generovania. Seed však sám osebe neznamená absolútne reprodukovateľný výstup medzi rôznymi runtime verziami alebo hardvérom.
+
+useFp16ForKVCache
+
+
+false
+true
+Ale pozor, v novšom llama.cpp priestore je vhodnejšie explicitne testovať K/V cache quantization.
+
+tryMmap
+
+
+false
+true
+Môže ovplyvniť:
+
+čas načítania,
+RAM pressure,
+paging,
+správanie modelu pri nedostatku RAM.
+llamaKCacheQuantizationType
+Testovací priestor vytvor dynamicky podľa hodnôt podporovaných nainštalovaným runtime.
+
+Prakticky môžeš očakávať varianty typu:
+
+
+
+false
+f16
+q8_0
+q4_0
+Názvy však neposielaj naslepo. Pred spustením optimizeru ich over proti konkrétnej SDK verzii.
+
+llamaVCacheQuantizationType
+Rovnaký princíp, ale V-cache quantization podľa dokumentácie vyžaduje Flash Attention.
+lmstudio
+
+Preto musí optimizer vynútiť závislosť:
+
+
+
+if v_cache_quantization is not False:
+    flash_attention = True
+4. Inference-time parametre cez /api/v1/chat
+Zdokumentované parametre:
+
+
+
+{
+  "model": "model-id",
+  "input": "Test prompt",
+  "system_prompt": "You are a helpful assistant.",
+  "stream": true,
+ 
+  "temperature": 0.7,
+  "top_p": 0.95,
+  "top_k": 40,
+  "min_p": 0.05,
+  "repeat_penalty": 1.05,
+  "max_output_tokens": 512,
+ 
+  "reasoning": "medium"
+}
+Native chat endpoint podporuje:
+
+
+
+temperature
+top_p
+top_k
+min_p
+repeat_penalty
+max_output_tokens
+reasoning
+context_length
+system_prompt
+stream
+integrations
+reasoning môže byť:
+
+
+
+off
+low
+medium
+high
+on
+Ak ho model nepodporuje, endpoint má vrátiť chybu.
+lmstudio
+
+Odporúčané optimizer rozsahy
+Temperature
+
+
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Na čisto performance benchmark nastav:
+
+
+
+0.0
+Na quality benchmark testuj viac hodnôt.
+
+Top P
+
+
+0.80
+0.90
+0.95
+1.00
+Top K
+
+
+0
+20
+40
+80
+100
+Najprv over význam 0 v tvojej runtime verzii. Niektoré API používajú 0 ako vypnutie, inde môže byť neplatné.
+
+Min P
+
+
+0.00
+0.02
+0.05
+0.10
+Repeat penalty
+
+
+1.00
+1.05
+1.10
+1.15
+1.20
+Max output tokens
+Na benchmark:
+
+
+
+128
+256
+512
+1024
+Na porovnanie rýchlosti potrebuješ dostatočne dlhú odpoveď. Pri 30-tokenovej odpovedi bude výsledok príliš ovplyvnený TTFT.
+
+Reasoning
+Pre tvoj Qwen:
+
+
+
+off
+low
+medium
+high
+on
+Testuj len podporované režimy. Oddelene meraj:
+
+kvalitu,
+celkový čas,
+tokeny reasoning časti,
+tokeny viditeľnej odpovede.
+5. Rozšírené inference parametre cez SDK
+LLMPredictionConfigInput dokumentuje:
+
+
+
+maxTokens
+temperature
+stopStrings
+toolCallStopStrings
+contextOverflowPolicy
+structured
+topKSampling
+repeatPenalty
+minPSampling
+topPSampling
+xtcProbability
+xtcThreshold
+cpuThreads
+draftModel
+
+lmstudio
+
+Parametre navyše oproti jednoduchému REST testu
+stopStrings
+
+
+"stopStrings": [
+    "</answer>",
+    "END"
+]
+Nie je to performance tuner, ale optimizer má overiť správnosť ukončenia.
+
+contextOverflowPolicy
+Možnosti:
+
+
+
+stopAtLimit
+truncateMiddle
+rollingWindow
+
+lmstudio
+
+Toto testuj ako samostatnú funkcionalitu. Nemiešal by som to do základného TPS benchmarku.
+
+structured
+JSON/Zod schema constrained generation. Môže mať odlišný výkon od voľného textu, preto vytvor osobitný benchmark profil.
+
+XTC sampling
+
+
+xtcProbability
+xtcThreshold
+Príklad rozsahu:
+
+
+
+xtcProbability: false, 0.1, 0.3, 0.5
+xtcThreshold:   false, 0.05, 0.1, 0.2
+XTC testuj iba pri quality/creativity profile. Nemá význam pri deterministickom performance benchmarku.
+
+cpuThreads
+Toto je dôležité:
+
+
+
+1
+2
+4
+6
+8
+physical_core_count
+logical_core_count
+Neskúšaj automaticky všetky čísla od 1 po počet logických jadier. Vyber strategické body.
+
+6. Draft model, MTP a speculative decoding
+Cez SDK môžeš nastaviť:
+
+
+
+config={
+    "draftModel": "model-key"
+}
+Draft model netreba samostatne načítať. SDK ho spravuje automaticky a výsledok môže obsahovať počet prijatých draft tokenov.
+lmstudio
+
+Pri klasickom speculative decoding musí mať draft model rovnaký vocabulary/tokenizer ako hlavný model. Ak draft model nie je dostatočne rýchly alebo má nízku úspešnosť návrhov, výsledok môže byť pomalší než hlavný model bez draftu.
+lmstudio
+
+Pre tvoj MTP súbor
+Ten približne 1,6 GB súbor môže byť MTP draft komponent. Pre optimizer ho neeviduj ako normálny chat model, ale ako variant:
+
+
+
+speculative_mode = none
+speculative_mode = separate_draft_model
+speculative_mode = mtp
+Dôležité: oficiálne SDK pole draftModel je jasne zdokumentované. Nenašiel som však v oficiálnych REST v1 podkladoch samostatný parameter typu:
+
+
+
+{
+  "mtp_model": "..."
+}
+Preto by som MTP automatizáciu riešil nasledovne:
+
+overiť, či sa MTP komponent objaví v zozname modelov,
+skúsiť ho odovzdať ako draftModel,
+logovať accepted/predicted draft tokens,
+ak ho SDK nevystaví ako model key, spravovať MTP cez profil/model configuration LM Studio, nie cez vymyslený REST parameter.
+Pre každý draft/MTP test ukladaj:
+
+
+
+predicted_draft_tokens
+accepted_draft_tokens
+acceptance_rate
+TPS bez draftu
+TPS s draftom
+VRAM delta
+RAM delta
+TTFT delta
+Výpočet:
+
+
+
+acceptance_rate = accepted_draft_tokens / predicted_draft_tokens
+7. Čo sa nedá meniť na každom requeste
+Tieto parametre musia vytvoriť novú modelovú inštanciu:
+
+
+
+GPU offload
+context length pri loadnutí
+Flash Attention
+eval batch size
+KV cache umiestnenie
+K-cache quantization
+V-cache quantization
+mmap
+keep in memory
+RoPE base/scale
+num experts
+parallelism
+Správna slučka:
+
+
+
+for load_config in load_configs:
+    unload_previous_model()
+    load_model(load_config)
+    warm_up_model()
+ 
+    for inference_config in inference_configs:
+        run_benchmark(inference_config)
+ 
+    unload_model()
+Ak použiješ SDK .model() a model už je načítaný, nová load konfigurácia sa ignoruje. Na optimalizačné testy preto používaj novú inštanciu alebo explicitný unload/load.
+lmstudio
+
+8. Čo musíš merať
+Minimum pre jeden experiment:
+
+
+
+{
+  "experiment_id": "uuid",
+  "model": "model-key",
+  "model_hash": "sha256-if-available",
+  "runtime_version": "LM Studio version",
+  "load_config_requested": {},
+  "load_config_applied": {},
+  "inference_config": {},
+  "prompt_id": "coding-medium-01",
+ 
+  "load_time_s": 0,
+  "prompt_tokens": 0,
+  "output_tokens": 0,
+  "time_to_first_token_s": 0,
+  "generation_time_s": 0,
+  "total_time_s": 0,
+  "tokens_per_second": 0,
+ 
+  "peak_vram_mb": 0,
+  "peak_ram_mb": 0,
+  "average_cpu_percent": 0,
+  "average_gpu_percent": 0,
+ 
+  "draft_predicted_tokens": 0,
+  "draft_accepted_tokens": 0,
+  "draft_acceptance_rate": 0,
+ 
+  "output_hash": "",
+  "quality_score": null,
+  "error": null
+}
+SDK výsledok sprístupňuje napríklad počet vygenerovaných tokenov, TTFT a stop reason.
+lmstudio
+
+Pre VRAM/RAM budeš potrebovať externé meranie, napríklad:
+
+NVIDIA: nvidia-smi,
+Windows: Performance Counters alebo WMI/CIM,
+AMD: nástroje dostupné pre konkrétny ovládač,
+proces LM Studio/lmster: psutil.
+9. Netestuj úplný kartézsky súčin
+Ak by si mal:
+
+
+
+5 context lengths
+5 batch sizes
+2 flash attention
+5 GPU ratios
+4 KV-cache varianty
+8 thread counts
+6 temperatures
+4 top-p
+5 top-k
+4 min-p
+5 repeat penalties
+3 speculative režimy
+dostaneš milióny kombinácií. Väčšina bude zbytočná alebo neplatná.
+
+Použi viac fáz.
+
+Fáza A: pamäťová uskutočniteľnosť
+Hľadaj:
+
+maximálny GPU offload bez OOM,
+maximálny kontext,
+vhodný KV-cache formát,
+funkčné Flash Attention nastavenie.
+Fáza B: hrubý výkon
+Fixni:
+
+
+
+temperature = 0
+top_p = 1
+top_k = default
+min_p = disabled/default
+repeat_penalty = 1
+max_output_tokens = 512
+Optimalizuj:
+
+
+
+GPU offload
+Flash Attention
+eval batch
+CPU threads
+KV-cache location
+KV-cache quantization
+MTP/draft
+Fáza C: kvalita
+S najlepšími 3 až 5 výkonnostnými konfiguráciami testuj:
+
+
+
+temperature
+top_p
+top_k
+min_p
+repeat_penalty
+reasoning effort
+RoPE/context extension
+Fáza D: Pareto výber
+Nevyber iba najvyššie TPS. Výsledkom majú byť profily:
+
+
+
+FASTEST
+BEST_QUALITY
+BEST_BALANCED
+LOWEST_VRAM
+LOWEST_RAM
+BEST_LONG_CONTEXT
+BEST_MTP
+Konfigurácia je Pareto-optimal, ak neexistuje iná, ktorá je zároveň:
+
+rýchlejšia,
+kvalitnejšia,
+a používa menej pamäte.
+10. Odporúčaná architektúra optimizeru
+
+
+lm-studio-optimizer/
+├─ discovery/
+│  ├─ detect_models.py
+│  ├─ detect_runtime.py
+│  └─ detect_hardware.py
+├─ generators/
+│  ├─ load_space.py
+│  ├─ inference_space.py
+│  └─ dependency_rules.py
+├─ runners/
+│  ├─ rest_v1_runner.py
+│  ├─ lmstudio_sdk_runner.py
+│  ├─ lms_cli_runner.py
+│  └─ hardware_monitor.py
+├─ benchmarks/
+│  ├─ prompts.json
+│  ├─ coding.json
+│  ├─ reasoning.json
+│  └─ long_context.json
+├─ scoring/
+│  ├─ performance.py
+│  ├─ quality.py
+│  └─ pareto.py
+└─ results/
+   └─ optimizer.sqlite
+Dependency rules
+
+
+def valid(config):
+    if config.v_cache_quantized and not config.flash_attention:
+        return False
+ 
+    if config.num_experts is not None and not config.is_moe:
+        return False
+ 
+    if config.draft_model and not config.tokenizer_compatible:
+        return False
+ 
+    if config.context_length > config.model_max_context:
+        return False
+ 
+    return True
+Praktický záver
+Pre naozaj úplný optimizer použi túto hierarchiu:
+
+
+
+Native REST v1
+    model list/load/unload
+    základné inference testy
+    echo skutočnej load konfigurácie
+ 
+Python SDK
+    všetky prediction parametre
+    GPU ratio
+    RoPE
+    mmap
+    CPU threads
+    K/V cache quantization
+    draft model a draft štatistiky
+ 
+lms CLI
+    estimate-only
+    GPU offload
+    TTL
+    headless/server kontrola
+ 
+OS monitoring
+    RAM, VRAM, CPU, GPU, spotreba
+Najväčšie parametre, ktoré ti pravdepodobne chýbajú v súčasnom optimizéri, sú:
+
+
+
+cpuThreads
+evalBatchSize
+GPU offload ratio
+offload KV cache to GPU
+K-cache quantization
+V-cache quantization
+Flash Attention
+tryMmap
+context length
+draft/MTP accepted-token rate
+reasoning level
+XTC sampling
+context overflow policy
+A úplne zásadné pravidlo: vždy ukladaj requested config aj applied config. Bez toho môže optimizer vyhlásiť víťaza na základe kombinácie, ktorú runtime v skutočnosti ignoroval.
+
+
+
+
+
+Favicon type
+Sources
+You said:
+
+https://github.com/DracieVajko/LM_Studio_Optimiser
+ DracieVajko/LM_Studio_Optimiser: Hardware-aware automatic benchmark and optimization tool for LM Studio. Finds empirically optimized runtime configurations for speed, context, memory, and quality across different hardware. toto je ten moj program, plus nejake nove zmeny co este neisu commitnute 
+
+
+Copilot said:
+Pozriem priamo aktuálny verejný stav repozitára a porovnám jeho architektúru s tým, čo sme zistili o LM Studio endpointoch. Necommitnuté lokálne zmeny samozrejme v GitHube neuvidím, takže audit verejnej verzie jasne oddelím od toho, čo bude treba doplniť z tvojho lokálneho diffu.
+
+Áno, teraz už mám konkrétny kontext. LM Studio Auto Optimizer nie je iba jednoduchý benchmark skript. Verejná verzia už má rozumnú modulárnu architektúru rozdelenú na API, benchmarky, discovery, hardvér, optimizer, scoring, storage, testy, CLI a webové UI.
+github
+
+Čo už verejná verzia robí
+Repozitár už deklaruje:
+
+hardvérovo závislé generovanie konfigurácií,
+zisťovanie capabilities LM Studio,
+adaptívne viacstupňové vyhľadávanie,
+profily Speed, Balanced, Context, Quality a Custom,
+baseline porovnanie,
+Pareto frontier,
+SQLite históriu,
+checkpoint/resume,
+CLI aj Web UI,
+podporu vzdialeného LM Studio endpointu.
+github
+Aktuálny optimalizovaný load-space obsahuje:
+
+
+
+context_length
+gpu_ratio
+flash_attention
+offload_kv_cache_to_gpu
+eval_batch_size
+num_experts
+rope_freq_base
+rope_freq_scale
+RoPE nastavenia sú správne označené ako experimentálne a sú predvolene vypnuté.
+github
+
+To znamená, že veľká časť môjho predchádzajúceho návrhu už v projekte existuje. Netreba teda program prerábať od nuly. Treba rozšíriť existujúci capability-driven systém.
+
+Najväčšie medzery oproti úplnému LM Studio optimizeru
+Podľa verejného stavu by som prioritizoval tieto oblasti.
+
+1. MTP a speculative decoding
+V README ani optimalizačnej metodike verejnej verzie nevidím draft/MTP priestor.
+
+Do doménového modelu by som pridal:
+
+
+
+speculative_mode: Literal[
+    "disabled",
+    "draft_model",
+    "mtp"
+]
+ 
+draft_model_id: str | None
+A do výsledkov:
+
+
+
+draft_tokens_proposed: int | None
+draft_tokens_accepted: int | None
+draft_acceptance_rate: float | None
+speculative_speedup_ratio: float | None
+draft_vram_delta_mb: float | None
+draft_ram_delta_mb: float | None
+Najdôležitejšia metrika:
+
+
+
+speculative_speedup_ratio = (
+    generation_tps_with_draft / generation_tps_without_draft
+)
+MTP nesmie byť automaticky považované za lepšie. Výsledok môže byť:
+
+
+
+1.31 = 31 % zrýchlenie
+1.00 = bez rozdielu
+0.87 = 13 % spomalenie
+Optimizer má MTP ponechať iba vtedy, ak zrýchlenie prežije opakované validačné behy a neprekročí pamäťový limit.
+
+2. KV-cache quantization
+Verejná metodika rieši iba:
+
+
+
+offload_kv_cache_to_gpu = true/false
+Nevidím tam samostatne:
+
+
+
+K-cache quantization
+V-cache quantization
+Navrhovaný model:
+
+
+
+k_cache_quantization: str | None
+v_cache_quantization: str | None
+Capability discovery má zistiť konkrétne podporované hodnoty runtime. Nehardcodoval by som, že každé LM Studio podporuje rovnaké varianty.
+
+Závislosť:
+
+
+
+if config.v_cache_quantization is not None:
+    require(config.flash_attention is True)
+Optimalizácia KV cache je dôležitá hlavne pre:
+
+veľké context lengths,
+model, ktorý sa tesne nezmestí do VRAM,
+kombináciu hlavného modelu a MTP/draft modelu,
+porovnanie maximálneho stabilného kontextu.
+3. CPU threads a backend-specific parametre
+Do capability modelu by som doplnil:
+
+
+
+cpu_threads: int | None
+Strategické kandidáty:
+
+
+
+{
+    1,
+    physical_cores // 2,
+    physical_cores,
+    logical_cores,
+}
+Nie všetky integer hodnoty od 1 po počet jadier. To by zbytočne nafúklo search space.
+
+Význam to bude mať najmä pri:
+
+CPU-only inference,
+partial GPU offload,
+prompt evaluation s časťou vrstiev na CPU,
+nedostatku VRAM.
+4. Reálny TTFT cez streaming
+Toto je podľa mňa najdôležitejší metodický problém verejnej verzie.
+
+README explicitne uvádza, že momentálne sa používa:
+
+
+
+estimated_ttft = total_time * 0.1
+pretože implementácia nezachytáva timestamp prvého streamovaného tokenu.
+github
+
+Takýto údaj nie je nezávislé meranie TTFT. Automaticky koreluje s celkovým časom, takže môže započítať tú istú výhodu konfigurácie dvakrát:
+
+
+
+nižší total time
+→ nižší estimated TTFT
+→ lepšie performance skóre z dvoch metrík
+Odporúčaná implementácia:
+
+
+
+request_started = time.perf_counter()
+first_token_at = None
+last_token_at = None
+ 
+async for event in stream:
+    now = time.perf_counter()
+ 
+    if event_contains_first_text_token(event):
+        if first_token_at is None:
+            first_token_at = now
+ 
+    if event_contains_generated_text(event):
+        last_token_at = now
+ 
+ttft_s = first_token_at - request_started
+generation_s = last_token_at - first_token_at
+Po zavedení reálneho TTFT by som odstránil estimated_ttft zo scoringu alebo ho ponechal iba pri runtimoch, ktoré streaming timestamp neposkytnú, s explicitným príznakom:
+
+
+
+ttft_source: Literal[
+    "stream_measured",
+    "server_reported",
+    "estimated",
+    "unavailable"
+]
+5. Requested config verzus applied config
+V dokumentácii vidím capability discovery a ukladanie benchmark parametrov, ale pri každom výsledku potrebuješ samostatne ukladať:
+
+
+
+requested_load_config
+applied_load_config
+ignored_parameters
+modified_parameters
+unsupported_parameters
+Porovnanie:
+
+
+
+def compare_configs(requested, applied):
+    ignored = {}
+    modified = {}
+ 
+    for key, wanted in requested.items():
+        if key not in applied:
+            ignored[key] = wanted
+        elif applied[key] != wanted:
+            modified[key] = {
+                "requested": wanted,
+                "applied": applied[key],
+            }
+ 
+    return ignored, modified
+Inak môže optimizer „otestovať“ päť rôznych konfigurácií, ktoré LM Studio interne načíta úplne rovnako.
+
+6. Oddeliť load-space a generation-space
+Aktuálna metodika je veľmi dobre orientovaná na model load configuration. Sama to aj takto definuje.
+github
+
+To je správne. Sampling parametre by som však nepridal do rovnakého kartézskeho priestoru.
+
+Rozdelil by som optimalizáciu na:
+
+
+
+Stage A: runtime/load optimization
+Stage B: MTP/speculative optimization
+Stage C: generation/sampling optimization
+Stage D: combined finalist validation
+Stage A
+
+
+context_length
+gpu_ratio
+flash_attention
+KV placement
+KV quantization
+eval_batch_size
+cpu_threads
+num_experts
+mmap
+Stage B
+
+
+MTP on/off
+draft model
+draft candidate count, ak ho runtime sprístupní
+Stage C
+
+
+temperature
+top_p
+top_k
+min_p
+repeat_penalty
+XTC
+reasoning level
+Stage D
+Najlepšie kombinácie z A, B a C otestovať spolu.
+
+Sampling totiž typicky nemení iba výkon, ale aj výstup a quality score. Preto nesmie narušiť benchmark, ktorý má porovnávať dve load konfigurácie pri rovnakom generovaní.
+
+Čo je už navrhnuté dobre
+Toto by som nemenil:
+
+deterministický coarse search,
+refinement okolo sľubných kandidátov,
+explicitné interaction tests pre Flash Attention a KV placement,
+evidencia failed regions,
+samostatný batch sweep,
+medián z opakovaní,
+validačné behy finalistov,
+run-relative normalizácia,
+model-relative context score,
+hardware-relative memory score,
+Pareto frontier.
+Verejná metodika používa 20 reprezentatívnych coarse kandidátov, následne refinement okolo najlepšej konfigurácie a dvoch Pareto kandidátov. Testuje aj interakcie Flash Attention/KV cache a vynecháva známe zlyhané oblasti.
+github
+
+To je lepší základ než brute-force „otestuj všetko“. Pri pridaní MTP, cache quantization a CPU threads by úplný kartézsky súčin veľmi rýchlo explodoval.
+
+Navrhované poradie implementácie
+Podľa dopadu:
+
+Skutočný streaming TTFT
+Requested verzus applied config
+MTP/draft capability discovery
+MTP acceptance-rate a speedup metrics
+K/V cache quantization
+CPU threads
+Oddelený inference/sampling optimizer
+XTC a reasoning režimy
+Load-time mmap, keep-in-memory a ďalšie backend-specific parametre
+LLM-as-a-judge, ktorý je už v README vedený ako plánovaný
+Dôležité obmedzenie auditu
+Z GitHubu vidím iba commitnutý stav LM Studio Auto Optimizer. Tvoje nové lokálne necommitnuté zmeny v tomto audite nie sú zahrnuté. Preto je možné, že napríklad MTP, streaming TTFT alebo cache quantization už lokálne implementuješ.
+
+Najlepší vstup pre ďalšie presné porovnanie je lokálny výstup:
+
+
+
+git status --short
+git diff --stat
+git diff
+Z neho sa dá urobiť presný gap audit: verejný main + necommitnuté zmeny vs. kompletné možnosti LM Studio API, bez duplicitných odporúčaní.
+
+
+
+
+
+Favicon type
+Sources
+You said:
+a urob mi este nejake reseacrh online na hardware inych ludi a co na tom ebzia ake velke ako rychlo atd. ja mam rtx 3060 6GB, ryzen 7 5800h 1x32g ram single channel a ssd nvme. chcem najlepsi mozny model co najdem do vram iba, potom nieco do 14b mozno, gpt oss 20b ocnfig, qwen 3.8 27b config. aj presne modely chcem napriklad qwen ci iQš xs alebo iq4 a podobne, potom 30b coder qwn a 35b A3b qwen, tieto mdoely plus gemma 26b aj mam taktze na tie configy ale aj nejame ine ak su lepsie alternativy
+
+Copilot said:
+Spravím z toho konkrétnu maticu pre tvoju RTX 3060 6 GB: čo sa zmestí celé do VRAM, čo má zmysel čiastočne offloadovať do RAM, presný quant a očakávateľný výkon podľa reálnych reportov. Pri číslach oddelím komunitné benchmarky od bezpečných odhadov, pretože 5800H single-channel výrazne mení výsledok pri CPU/RAM offloade.
+Pozrel som verejné modelové karty, GGUF veľkosti aj dostupné komunitné benchmarky. Tvoja zostava má dve veľmi rozdielne prevádzkové oblasti:
+
+do približne 5 GB modelových váh: väčšina modelu môže byť na RTX 3060 a výkon bude dobrý,
+14 až 22 GB GGUF: väčšina váh zostane v systémovej RAM; tvoj jeden 32 GB modul v single-channel režime sa stane hlavným limitom.
+
+RTX 3060 Laptop 6 GB má približne 192 GB/s VRAM bandwidth. Zdroj pre túto kartu považuje 7B Q4 za komfortnú triedu, 8B za tesnú a 14B+ už za modely, ktoré sa celé do VRAM nezmestia.
+
+Moje odporúčanie v skratke
+
+Pre tvoju zostavu by som držal tieto hlavné modely:
+
+Najlepší model plne alebo takmer plne v GPU: Qwen3.5 4B vo vysokej quantizácii alebo Qwen3 8B v IQ3.
+Najlepší praktický väčší model: približne 9B až 14B v IQ4_XS/Q4_K_S s maximálnym možným GPU offloadom.
+Najlepší veľký model pre kvalitu: Qwen3.5/Qwen3.8 27B IQ4_XS, ak akceptuješ pomalšie generovanie cez RAM.
+Najzaujímavejší MoE: Qwen3.5 35B-A3B alebo Qwen3-Coder 30B-A3B, pretože počas tokenu používajú iba približne 3B aktívnych parametrov, hoci všetky váhy musia zostať dostupné v pamäti. Oficiálny Qwen3-30B-A3B má 30,5B celkových a 3,3B aktívnych parametrov.
+GPT-OSS 20B: zaujímavý, ale 12,1 GB MXFP4 váhy sa do 6 GB VRAM nezmestia. Bude to hybrid GPU+RAM.
+Gemma 3 27B: IQ4_XS má 14,77 GB, takže tiež hybrid GPU+RAM.
+1. Najlepší model, ktorý chceš dostať celý do VRAM
+Najistejšia voľba: Qwen3.5 4B
+
+Odporúčanie:
+
+Plain Text
+Model: Qwen3.5-4B
+Quant: Q6_K alebo Q8_0, podľa reálnej VRAM rezervy
+Context: 8192
+Flash Attention: ON
+KV cache: GPU
+K-cache: Q8_0
+V-cache: Q8_0 alebo Q4_0
+GPU offload: maximum
+Eval batch: začni 256
+
+Pre tvoju 6 GB kartu by som 4B model používal ako:
+
+rýchly pracovný chat,
+sumarizácia,
+jednoduchšie programovanie,
+model pre automatické benchmarkovanie,
+nízky TTFT.
+
+Pre 4B nemá zmysel ničiť kvalitu IQ3 quantom. Radšej menší model s Q6/Q8 než väčší model v extrémnom IQ2.
+
+Výkonnejší, ale tesnejší: 7B až 9B
+
+Pre Qwen3.5 9B alebo podobný 8B model:
+
+Plain Text
+Prvý pokus: IQ3_XS
+Alternatíva: Q3_K_M
+Kvalitnejší, ale pravdepodobne partial offload: IQ4_XS
+Context: 4096 až 8192
+Flash Attention: ON
+KV cache: GPU
+KV quantization: Q8_0/Q4_0
+GPU offload: maximum, ktoré prejde
+
+Pre Qwen3 8B sú uvádzané približné veľkosti:
+
+IQ4_XS: 4,25 GB váhy,
+Q3_K_M: 3,84 GB,
+IQ3_XS: 3,38 GB,
+Q4_K_M: 4,68 GB.
+
+K tomu treba pripočítať KV cache a runtime overhead. Pri 16K kontexte zdroj odhaduje pre Q4_K_M približne 2 GB KV cache, preto sa 4,68 GB váhy plus FP16 KV cache do 6 GB nezmestia.
+
+Môj výber pre maximálnu kvalitu v 6 GB
+Plain Text
+Qwen 8B IQ4_XS
+context 4096
+Flash Attention ON
+K-cache Q8_0
+V-cache Q4_0
+KV on GPU
+max GPU offload
+
+Ak to OOM-ne:
+
+Plain Text
+Qwen 8B Q3_K_M
+
+Ak chceš garantovať rezervu:
+
+Plain Text
+Qwen 8B IQ3_XS
+
+Komunitný článok uvádza pre Qwen3.5 9B Q4_K_M na RTX 3060 6 GB približne 15 až 22 tok/s a pre 4B Q4_K_M približne 25 až 40 tok/s. Tieto čísla ber ako komunitný rozsah, nie garanciu pre tvoj laptop.
+
+2. Modely okolo 14B
+
+14B Q4 býva približne 8 až 9,3 GB. Qwen3 14B má napríklad uvedený download približne 9,3 GB, takže sa celý do tvojej VRAM nezmestí.
+
+Odporúčaný quant
+Plain Text
+Najprv: IQ4_XS
+Potom: Q4_K_S
+Maximálna kvalita: Q4_K_M
+Ak je pomalý alebo nevychádza RAM/VRAM: Q3_K_M alebo IQ3_M
+Konfigurácia
+Plain Text
+Context: 8192
+GPU offload: maximum bez OOM
+Flash Attention: ON
+KV cache placement: najprv GPU
+K-cache: Q8_0
+V-cache: Q4_0
+Eval batch: 128 alebo 256
+CPU threads: 8 fyzických, následne otestovať 6/8/12/16
+Mmap: ON
+Očakávanie
+
+Na RTX 3060 12 GB, kde sa 14B Q4 zmestí do VRAM, boli publikované výsledky približne 22,7 tok/s pri 16K kontexte a 29,4 tok/s v inom Vulkan teste.
+
+Tvoja 6 GB verzia tento výkon nedosiahne, pretože časť váh pôjde cez systémovú RAM. Bez presného lokálneho benchmarku by som pre tvoju single-channel zostavu očakával iba približne 4 až 10 tok/s, ale toto je môj plánovací odhad, nie údaj priamo nameraný na identickom hardvéri.
+
+V tejto triede stojí za testovanie:
+
+Plain Text
+Qwen3 14B Instruct
+Qwen2.5-Coder 14B Instruct
+Phi-4 14B
+DeepSeek-R1-Distill-Qwen-14B
+Gemma 3 12B
+
+Pre programovanie by som z tejto skupiny prioritizoval Qwen Coder 14B. Pre všeobecné používanie Qwen3/Qwen3.5 alebo Gemma.
+
+3. GPT-OSS 20B
+
+Oficiálny GPT-OSS 20B má 21B celkových parametrov, ale iba 3,6B aktívnych parametrov. Používa MXFP4 a podporuje reasoning low/medium/high.
+
+GGUF MXFP4 má približne 12,1 GB.
+
+Odporúčaná konfigurácia
+Plain Text
+Model: ggml-org/gpt-oss-20b-GGUF alebo LM Studio community build
+Quant: natívny MXFP4
+Context: začni 8192
+Reasoning: low pre rýchlosť, medium pre normálnu prácu
+Flash Attention: ON
+GPU offload: maximum
+KV cache: najprv GPU
+K-cache: Q8_0
+V-cache: Q4_0
+Eval batch: 128
+CPU threads: otestovať 8 a 16
+
+Sampling z LM Studio model card:
+
+Plain Text
+temperature: 0.8
+top_p: 0.8
+top_k: 40
+min_p: 0.05
+repeat_penalty: 1.1
+
+Prečo môže dávať zmysel
+
+Hoci sa váhy nezmestia do VRAM, decode pracuje iba s menšou aktívnou časťou MoE. Nevýhodou ostáva:
+
+načítanie celých 12,1 GB váh,
+prenos a prístup k offloadovanej časti,
+single-channel RAM,
+väčší TTFT pri dlhom kontexte.
+
+Môj plánovací odhad pre tvoju zostavu je približne:
+
+Plain Text
+low reasoning: 8 až 16 tok/s
+medium reasoning: podobný raw tok/s, ale dlhšia odpoveď
+high reasoning: výrazne dlhší celkový čas
+
+To nie je benchmark identickej zostavy. Optimizer by mal zmerať zvlášť raw generation TPS a čas do finálnej odpovede.
+
+4. Qwen3.5/Qwen3.8 27B dense
+
+Pre oficiálny Qwen3.5-27B GGUF sú veľkosti:
+
+Plain Text
+Q4_K_M 17.98 GB
+Q4_K_S 16.93 GB
+IQ4_XS 15.78 GB
+Q3_K_XL 16.60 GB
+
+To znamená, že tvoj približne 14 GB IQ3 model je logická voľba pre 32 GB RAM, ale nie je to VRAM model. Väčšina bude v systémovej RAM.
+
+Ktorý quant by som zvolil
+Najlepšia kvalita pri rozumnej veľkosti
+Plain Text
+IQ4_XS, 15.78 GB
+Rozumný kompromis pre tvoju single-channel RAM
+Plain Text
+IQ3_M alebo IQ3_XS, približne 13 až 14 GB podľa konkrétneho buildu
+Čomu sa vyhnúť
+Plain Text
+IQ2_XS / IQ2_XXS iba preto, aby sa zmenšil download
+
+Pri quantizáciách pod 4-bit rastie strata kvality nelineárne; porovnanie quantov označuje 3-bit ako viditeľne stratový a 2-bit varianty vôbec neodporúča.
+
+Konfigurácia pre tvoj 27B IQ3
+Plain Text
+Context: 8192
+GPU offload: maximum
+Flash Attention: ON
+KV placement: GPU, ak zostane VRAM
+K-cache: Q8_0
+V-cache: Q4_0
+Eval batch: 128
+CPU threads: 8, 12, 16 otestovať
+Mmap: ON
+MTP: test OFF vs ON
+Spec draft max: 2, 3, 4
+
+Oficiálny Bartowski build už uvádza MTP vrstvy a draft-mtp podporu v príslušnej verzii llama.cpp.
+
+Pre 27B MTP build na 24 GB RTX 3090 Ti jeden modelový repozitár uvádza približne dvojnásobný decode výkon a ako vhodný spec-draft-n-max hodnotu 4. To však platí pre konkrétny patched runtime a GPU, nie automaticky pre tvoju 3060.
+
+Preto v optimizéri testuj:
+
+Plain Text
+MTP OFF
+MTP ON, draft_n=2
+MTP ON, draft_n=3
+MTP ON, draft_n=4
+
+a ponechaj ho iba vtedy, ak:
+
+Plain Text
+speedup > 1.05
+accepted_draft_rate je stabilný
+VRAM nevytlačí dôležitejšie vrstvy hlavného modelu
+
+Môj plánovací odhad pre 27B dense IQ3 s tvojou single-channel RAM:
+
+Plain Text
+približne 2 až 5 tok/s bez MTP
+potenciálne viac s úspešným MTP
+
+Presnú hodnotu online zdroje pre identickú zostavu neposkytli.
+
+5. Gemma 3 27B
+
+Pre Gemma 3 27B IT GGUF:
+
+Plain Text
+Q4_K_M 16.55 GB
+Q4_K_S 15.67 GB
+IQ4_XS 14.77 GB
+Q3_K_XL 14.88 GB
+
+Najlepšia voľba pre teba
+Plain Text
+Gemma 3 27B IT IQ4_XS
+
+Tento quant je iba približne 14,77 GB a zdroj ho opisuje ako menší než Q4_K_S s podobným výkonom.
+
+Konfigurácia
+Plain Text
+Context: 8192
+GPU offload: maximum
+Flash Attention: ON
+KV cache: Q8/Q4
+Eval batch: 128
+CPU threads: 8 alebo 16
+Vision/mmproj: nenačítavať, ak nepotrebuješ obrázky
+
+Vision modul F16 pridáva približne 858 MB. Ak testuješ iba text, nenahrávaj ho.
+
+Môj odhad:
+
+Plain Text
+2 až 5 tok/s
+
+Podobne ako pri dense Qwen 27B. Výsledok môže byť citeľne ovplyvnený RAM bandwidth.
+
+6. Qwen3-Coder 30B-A3B
+
+Oficiálny Qwen3-Coder 30B-A3B má približne 30,5B celkových a 3,3B aktívnych parametrov. MoE architektúra má 128 expertov a aktivuje osem.
+
+Q4_K_M má približne 18 až 20 GB podľa konkrétnej konverzie.
+
+Odporúčaný quant
+Plain Text
+Prvá voľba: IQ4_XS alebo dobrý Unsloth Dynamic Q4
+Ak potrebuješ menší súbor: IQ3_M / dynamic 3-bit
+Q4_K_M iba ak chceš referenčnú kvalitu a akceptuješ vyšší RAM traffic
+Konfigurácia
+Plain Text
+Context: 8192, neskôr 16384
+GPU offload: maximum
+Flash Attention: ON
+KV cache: Q8_0/Q4_0
+Eval batch: 128
+CPU threads: 8/16 test
+Expert count: neupravovať naslepo
+Thinking: OFF pri autocomplete, ON pri zložitej úlohe
+
+Toto môže byť pre programovanie lepšia praktická voľba než dense 27B, pretože aktívna časť je oveľa menšia. Stále však musíš držať kompletné váhy v RAM/VRAM.
+
+Môj plánovací odhad:
+
+Plain Text
+5 až 12 tok/s
+
+Ale MoE implementácia a expert offload môžu výsledok výrazne zmeniť.
+
+7. Qwen3.5 35B-A3B
+
+Oficiálny Qwen3.5-35B-A3B je multimodálny MoE model a Qwen ho opisuje ako kombináciu Gated Delta Networks a sparse MoE.
+
+Model má približne 35B celkovo a 3B aktívnych parametrov, 256 expertov a deväť aktívnych expertov.
+
+Pre tvoju zostavu
+
+Toto je podľa mňa zaujímavejší „veľký experiment“ než dense 27B, ak LM Studio/llama.cpp dobre podporuje jeho expert offload.
+
+Plain Text
+Quant: IQ3_M, IQ3_XS alebo kvalitný Dynamic 3-bit
+Context: 8192
+GPU offload: maximum
+Flash Attention: ON
+KV cache: kvantizovaná
+Vision: nepoužívať pri textovom benchmarku
+Eval batch: 128
+CPU threads: 8/16
+
+Q4 verzia vyžaduje približne 22 GB úložiska/pamäte podľa jedného nasadzovacieho prehľadu. Preto by som na tvojich 32 GB RAM uprednostnil 3-bit variant, aby ostala rezerva pre:
+
+Windows,
+LM Studio,
+KV cache,
+modelový runtime,
+prípadný MTP komponent.
+
+Môj plánovací odhad výkonu:
+
+Plain Text
+5 až 14 tok/s
+
+Je to však kandidát, pri ktorom môže správne expert offloading nastavenie rozhodnúť medzi veľmi zlým a prekvapivo použiteľným výsledkom.
+
+8. Čo presne by som stiahol
+GPU-resident / rýchly
+Plain Text
+Qwen3.5-4B Q6_K
+Qwen3.5-4B Q8_0
+Qwen3/novší 8B IQ3_XS
+Qwen3/novší 8B IQ4_XS
+Stredná trieda
+Plain Text
+Qwen Coder 14B IQ4_XS
+Qwen 14B IQ4_XS
+Gemma 3 12B IQ4_XS
+Veľké modely
+Plain Text
+ggml-org/gpt-oss-20b-GGUF MXFP4
+bartowski/Qwen_Qwen3.5-27B-GGUF IQ4_XS
+tvoj Qwen 27B IQ3 variant
+unsloth/gemma-3-27b-it-GGUF IQ4_XS
+Qwen3-Coder-30B-A3B IQ3/IQ4
+Qwen3.5-35B-A3B Dynamic IQ3/IQ4
+Finálne poradie pre tvoj notebook
+Všeobecné používanie
+Qwen 8B IQ4_XS, ak ho LM Studio zmestí s krátkym kontextom
+Qwen3.5 4B Q8/Q6, ak chceš výrazne vyššiu rýchlosť
+GPT-OSS 20B MXFP4, ak chceš reasoning a nevadí hybridná RAM prevádzka
+Qwen 27B IQ4_XS/IQ3, ak je priorita kvalita, nie rýchlosť
+Gemma 3 27B IQ4_XS
+Programovanie
+Qwen Coder 14B IQ4_XS
+Qwen3-Coder 30B-A3B IQ3/IQ4
+GPT-OSS 20B MXFP4
+Qwen 8B coder model vo vyššom quante
+Experimentálny víťaz
+Plain Text
+Qwen3.5 35B-A3B v dobrom 3-bit dynamickom quante
+
+Nie preto, že sa zmestí do GPU, ale preto, že MoE s približne 3B aktívnymi parametrami môže na hybridnej zostave prekonať dense 27B v pomere kvalita/rýchlosť.
+
+Najdôležitejší hardvérový upgrade
+
+Pre väčšie modely by ti výrazne pomohlo prejsť z:
+
+Plain Text
+1 × 32 GB single-channel
+
+na:
+
+Plain Text
+2 × 32 GB dual-channel
+
+alebo aspoň, ak notebook podporuje asymetrickú konfiguráciu:
+
+Plain Text
+32 GB + kompatibilný druhý modul
+
+Pri modeli plne uloženom v GPU to nebude zásadný rozdiel. Pri 14B až 35B GGUF, kde veľká časť váh ostáva v RAM, je práve memory bandwidth jeden z hlavných limitov. Tvoj NVMe pomáha pri načítaní a mmap, ale po zahriatí modelu nenahrádza RAM bandwidth.
+
+Provide your feedback on BizChat
+Sources
+You said:
+a potom som zvazolval aby lm studio dokazal nejak based on hardware aj odporucat modely? a chcem ale vyslovene ebcnhamrky a najlepsie setupy co na rovnakom alebo podobnom hw ludia urobili ,chcem konkretne settingy
+Copilot said:
+
+Rozumiem. Nechceš ďalšie všeobecné odhady, ale databázu reálnych behov: presný GPU/CPU/RAM, model a quant, backend, context, offload, Flash Attention, KV nastavenia, batch a namerané prompt/decode TPS. Vyhľadám teraz najmä pôvodné benchmarky a komunitné reporty pre RTX 3060 6 GB, potom 3060 12 GB a podobné notebookové Ampere karty, pričom neporovnateľné výsledky označím.
+
+Reasoned for 1s
+
+Áno, odporúčanie modelov podľa hardvéru je veľmi dobrý ďalší modul pre tvoj LM Studio Optimiser. Ale treba oddeliť dve veci:
+
+Capability predictor: čo sa pravdepodobne zmestí a spustí.
+Empirical recommender: čo bolo skutočne namerané na rovnakom alebo podobnom hardvéri.
+
+Po ďalšom hľadaní je dôležitý záver: kvalitných verejných benchmarkov presne pre RTX 3060 Laptop 6 GB + Ryzen 7 5800H + single-channel 32 GB RAM + LM Studio je málo. Našiel som niekoľko relevantných behov, ale väčšina reportov buď neuvádza kompletné settings, alebo používa RTX 3060 12 GB, staršie modely či iný backend. Preto by bolo nepresné prezentovať všetky čísla ako priamo porovnateľné.
+
+Najbližšie použiteľné verejné benchmarky
+1. RTX 3060 Laptop 6 GB, LM Studio, 7B Q6
+
+Používateľ s rovnakou 6 GB GPU uviedol:
+
+Plain Text
+GPU: RTX 3060 Laptop 6 GB
+Backend: LM Studio
+Model class: 7B
+Quant: Q6
+Výkon: približne 20 tok/s
+
+V rovnakom vlákne bolo odporúčané pre 7B Q4 použiť GQA model, 8-bit KV cache a zdroj uvádza, že 7B Q4 má necelé 4 GB. Presný model, kontext, počet offloadovaných vrstiev a batch však uvedené neboli.
+
+To je zatiaľ najbližší verejný výsledok k tvojmu notebooku.
+
+Reprodukovateľný kandidát pre tvoj optimizer
+
+Nie je to pôvodné nastavenie autora, pretože ho neuviedol. Toto je môj testovací profil založený na jeho výsledku:
+
+YAML
+profile: rtx3060_6gb_7b_q6
+model_class: 7B
+quantization: Q6_K
+context_length: 4096
+gpu_offload: max
+flash_attention: true
+offload_kv_cache_to_gpu: true
+k_cache_quant: Q8_0
+v_cache_quant: Q8_0
+eval_batch_size: 256
+cpu_threads: 8
+mmap: true
+expected_reference_decode_tps: 20
+reference_confidence: low
+
+Hodnota 20 tok/s je reportovaná; ostatné nastavenia sú návrh na reprodukčný test.
+
+2. RTX 3060 6 GB, 13B Q4, čiastočný offload
+
+Starší konkrétny postup použil 13B Q4 na 6 GB karte:
+
+Plain Text
+Model: Llama 13B
+Quant: Q4_0
+GPU layers: 18
+VRAM: približne 5,5 GB
+Maximum layers modelu: 40
+
+Autor uviedol, že 7B model bolo možné kompletne offloadovať do GPU. Benchmark však neobsahuje tok/s a pochádza z roku 2023, takže je vhodný hlavne ako dôkaz fungujúceho VRAM placementu, nie aktuálneho výkonu.
+
+Reprodukčný kandidát
+YAML
+profile: rtx3060_6gb_13b_q4_partial
+model_class: 13B
+quantization: Q4_0
+context_length: 2048
+gpu_layers_reference: 18
+gpu_offload_search: adaptive
+flash_attention: true
+kv_cache_gpu: true
+eval_batch_size_candidates: [64, 128, 256]
+cpu_threads_candidates: [8, 16]
+reference_vram_gb: 5.5
+reference_decode_tps: null
+reference_confidence: medium_for_fit_low_for_speed
+
+Pre novší 14B model sa počet vrstiev nedá preniesť 1:1. Optimizer musí hľadať maximálny offload empiricky.
+
+3. RTX 3060 12 GB, 7B a 13B, plný GPU beh
+
+Na desktope s RTX 3060 12 GB ľudia uvádzali:
+
+Plain Text
+7B Q4 GGUF: 20 až 30 tok/s
+7B Q4 GGUF priamo cez llama.cpp/Linux: 45 až 50 tok/s
+13B 4-bit cez ExLlama/Linux: 22 až 27 tok/s
+13B 4-bit na Windows: 6 až 10 tok/s
+
+Výsledky sú z komunitného vlákna a používajú rôzne backendy a operačné systémy, preto sa nedajú priamo porovnávať.
+
+Ďalší používateľ na RTX 3060 12 GB, Ubuntu 22.04 a GPTQ backend uvádzal:
+
+Plain Text
+7B 4-bit: 41,23 tok/s
+13B 4-bit: 25 tok/s
+
+Pri 7B reporte uviedol 341 tokenov za 8,27 sekundy. Používal text-generation-webui s GPTQ, nie LM Studio/GGUF.
+
+Tieto výsledky sú užitočné ako horný referenčný strop, nie ako očakávanie pre tvoju 6 GB kartu.
+
+4. Referenčný llama.cpp benchmark pre RTX 3060 12 GB
+
+Kompilácia benchmarkov uvádza:
+
+Plain Text
+Qwen3 8B Q4_K_XL, CUDA, 16K context: 42,0 tok/s
+Qwen3 8B Q4_K_XL, CUDA, 32K context: 31,9 tok/s
+Qwen3 14B Q4_K_XL, CUDA, 16K context: 22,7 tok/s
+
+Iný Vulkan benchmark uvádza:
+
+Plain Text
+Llama 2 7B Q4_K_M: 60,2 tok/s
+Llama 2 13B Q4_K_M: 32,8 tok/s
+DeepSeek-R1-Distill-Qwen-14B Q4_K_M: 29,4 tok/s
+
+Ide o RTX 3060 12 GB, takže modely sa zmestili oveľa viac alebo úplne do VRAM. Backend a testovacia metodika sa medzi skupinami líšili.
+
+Hodnota pre tvoj recommender
+
+Tieto záznamy môžeš použiť ako:
+
+Plain Text
+same GPU architecture
+same GPU family
+different VRAM capacity
+not directly comparable
+upper-bound reference
+
+Recommender nesmie z 22,7 tok/s na 3060 12 GB predpovedať rovnaký výkon na 6 GB variante pri partial offloade.
+
+Konkrétne nastavenia pre tvoje modely
+
+Nasledujúce profily sú najlepšie počiatočné kandidáty pre tvoj optimizer, nie fingované výsledky cudzích ľudí. Pri položkách, kde existuje verejný benchmark, uvádzam referenciu.
+
+A. Najlepší model celý v 6 GB VRAM
+Qwen 7B/8B IQ4_XS
+YAML
+model:
+family: Qwen
+parameters: 7B-8B
+quantization: IQ4_XS
+ 
+load:
+context_length: 4096
+gpu_ratio: 1.0
+flash_attention: true
+offload_kv_cache_to_gpu: true
+eval_batch_size: 256
+k_cache_quantization: Q8_0
+v_cache_quantization: Q4_0
+cpu_threads: 8
+mmap: true
+ 
+benchmark_variants:
+context_length: [4096, 8192]
+eval_batch_size: [128, 256, 512]
+v_cache_quantization: [Q8_0, Q4_0]
+
+Pre Qwen3 8B sú uvádzané veľkosti:
+
+Plain Text
+IQ4_XS: 4,25 GB
+Q3_K_M: 3,84 GB
+IQ3_XS: 3,38 GB
+
+Pri 16K kontexte je pre FP16 KV cache uvedený približný odhad 2 GB, preto je pre 6 GB kartu dôležitý krátky kontext alebo KV quantizácia.
+
+Alternatíva s vyššou istotou
+YAML
+quantization: IQ3_XS
+context_length: 8192
+flash_attention: true
+kv_cache_gpu: true
+k_cache: Q8_0
+v_cache: Q4_0
+gpu_ratio: 1.0
+
+Očakával by som nižšiu kvalitu než IQ4_XS, ale viac priestoru pre KV cache.
+
+B. 14B hybrid GPU + RAM
+YAML
+model_class: 14B
+quantization_priority:
+- IQ4_XS
+- Q4_K_S
+- Q3_K_M
+ 
+load:
+context_length: 8192
+gpu_ratio_candidates: [0.45, 0.55, 0.65, 0.75]
+flash_attention: true
+offload_kv_cache_to_gpu: true
+eval_batch_size_candidates: [128, 256]
+k_cache_quantization: Q8_0
+v_cache_quantization: Q4_0
+cpu_threads_candidates: [8, 12, 16]
+mmap: true
+
+Pre tvoj single-channel systém je zásadné porovnať:
+
+Plain Text
+viac GPU layers + KV cache v RAM
+versus
+menej GPU layers + KV cache v GPU
+
+Nie je garantované, že maximálny počet GPU vrstiev bude najrýchlejší, ak tým vytlačíš KV cache z GPU.
+
+C. GPT-OSS 20B MXFP4
+
+GPT-OSS 20B má 21B celkových, 3,6B aktívnych parametrov a jeho natívny MXFP4 GGUF má približne 12,1 GB.
+
+YAML
+model: gpt-oss-20b
+quantization: MXFP4
+ 
+load:
+context_length: 8192
+gpu_ratio_candidates: [0.35, 0.45, 0.55]
+flash_attention: true
+offload_kv_cache_to_gpu: true
+eval_batch_size_candidates: [64, 128, 256]
+k_cache_quantization: Q8_0
+v_cache_quantization: Q4_0
+cpu_threads_candidates: [8, 16]
+mmap: true
+ 
+generation:
+reasoning_candidates: [low, medium, high]
+temperature: 0.8
+top_p: 0.8
+top_k: 40
+min_p: 0.05
+repeat_penalty: 1.1
+
+Uvedené sampling defaults pochádzajú z modelovej stránky LM Studio.
+
+Pre odporúčanie treba viesť tri oddelené výsledky:
+
+Plain Text
+GPT-OSS Low Reasoning
+GPT-OSS Medium Reasoning
+GPT-OSS High Reasoning
+
+Raw tok/s samo o sebe nestačí, pretože celkový počet reasoning tokenov bude odlišný.
+
+D. Qwen 27B IQ3 + MTP
+
+Pre Qwen3.5-27B má IQ4_XS približne 15,78 GB a Q4_K_M približne 17,98 GB. Modelový repozitár uvádza aj pridanie MTP vrstiev a spustenie cez draft-mtp.
+
+YAML
+model_class: Qwen-27B
+quantization: IQ3
+ 
+load:
+context_length: 8192
+gpu_ratio_candidates: [0.25, 0.30, 0.35, 0.40]
+flash_attention: true
+offload_kv_cache_to_gpu: true
+eval_batch_size_candidates: [64, 128]
+k_cache_quantization: Q8_0
+v_cache_quantization: Q4_0
+cpu_threads_candidates: [8, 16]
+mmap: true
+ 
+speculative:
+modes:
+- disabled
+- mtp_draft_2
+- mtp_draft_3
+- mtp_draft_4
+
+Na odlišnom systéme s V100 32 GB priniesol MTP pri dense 27B modeloch:
+
+Plain Text
+Q4_K_M bez MTP: 31,2 tok/s
+MTP n=3: až 40,3 tok/s
+acceptance: približne 73 %
+
+V tom istom benchmarkovom repozitári bolo n=3 lepšie a stabilnejšie než n=5. Tento výsledok nie je predikcia pre tvoju RTX 3060, ale je explicitným dôvodom zaradiť draft_n=3 medzi prvé kandidáty.
+
+E. Qwen3-Coder 30B-A3B
+
+Oficiálny model má 30,5B celkových a 3,3B aktívnych parametrov, 128 expertov a osem aktívnych expertov.
+
+YAML
+model_class: Qwen3-Coder-30B-A3B
+quantization_priority:
+- IQ4_XS
+- Q4_K_M
+- IQ3_M
+ 
+load:
+context_length: 8192
+gpu_ratio: adaptive
+flash_attention: true
+offload_kv_cache_to_gpu: true
+eval_batch_size_candidates: [64, 128, 256]
+cpu_threads_candidates: [8, 16]
+k_cache_quantization: Q8_0
+v_cache_quantization: Q4_0
+mmap_candidates: [true, false]
+ 
+moe:
+expert_placement_candidates:
+- automatic
+- routed_experts_cpu
+
+Pre hybridné MoE má praktický zmysel držať vždy aktívne časti modelu na GPU a routed experts na CPU. Verejný MoE offload návod ukazuje konfiguráciu ngl 999, Flash Attention, 16 threadov, batch/ubatch 4096 a tensor override, ktorý umiestňuje vybrané bloky na CUDA a expertov na CPU. Ide o všeobecný llama.cpp príklad, nie priamo benchmark tvojho Qwen modelu.
+
+LM Studio API nemusí sprístupniť presný tensor override. Preto ho v recommenderi označ:
+
+Plain Text
+backend_required: llama.cpp-direct
+lm_studio_support: capability-dependent
+F. Qwen 35B-A3B
+
+Na RTX 3060 12 GB bol publikovaný konkrétny MoE benchmark:
+
+Plain Text
+GPU: RTX 3060 12 GB
+Context: 8K
+Flash Attention: ON
+GPU layers: 99
+MoE experts: CPU
+Qwen 35B-A3B Q4_K_M: 24,1 až 25,5 tok/s
+Prompt processing: 88 až 110 tok/s
+MTP n=3: pokles z 25,5 na 16,9 tok/s
+MTP n=5: pokles na 12,0 tok/s
+
+Autor z toho vyvodil, že na tejto konfigurácii MTP MoE model spomaľoval.
+
+To je veľmi hodnotný záznam pre tvoj optimizer: MTP sa nesmie automaticky odporučiť len preto, že ho model podporuje.
+
+Kandidátny profil pre tvoju 6 GB verziu
+YAML
+model_class: Qwen-35B-A3B
+quantization: IQ3_M
+ 
+load:
+context_length: 8192
+flash_attention: true
+offload_kv_cache_to_gpu: true
+gpu_ratio: adaptive
+eval_batch_size_candidates: [64, 128]
+cpu_threads_candidates: [8, 16]
+k_cache_quantization: Q8_0
+v_cache_quantization: Q4_0
+ 
+moe:
+expert_placement:
+- automatic
+- cpu
+ 
+mtp:
+test: true
+default_recommendation: disabled
+Ako má fungovať hardware-based model recommender
+
+Nerobil by som obyčajné pravidlo:
+
+Python
+if vram == 6:
+recommend_7b()
+
+To ignoruje RAM, channel count, backend a používateľský cieľ.
+
+Vstupy
+JSON
+{
+"gpu": {
+"name": "RTX 3060 Laptop GPU",
+"vram_gb": 6,
+"memory_bandwidth_gbps": 192
+},
+"cpu": {
+"name": "Ryzen 7 5800H",
+"physical_cores": 8,
+"logical_threads": 16
+},
+"ram": {
+"capacity_gb": 32,
+"channels": 1
+},
+"storage": {
+"type": "NVMe SSD"
+},
+"backend": {
+"name": "LM Studio",
+"runtime": "llama.cpp",
+"version": "detected"
+},
+"goal": "coding"
+}
+Tri úrovne výsledku
+GPU-resident
+Plain Text
+Váhy + KV cache + runtime overhead sa zmestia do VRAM.
+Hybrid-interactive
+Plain Text
+Časť váh je v RAM, ale predikovaný výkon presahuje používateľský limit.
+Hybrid-quality
+Plain Text
+Model sa zmestí do RAM+VRAM, ale bude pomalší; odporúča sa kvôli kvalite.
+
+Pre teba by predvolený limit mohol byť:
+
+Plain Text
+interactive: >= 10 tok/s
+usable: >= 5 tok/s
+quality-first: >= 2 tok/s
+
+Tieto hranice sú produktové rozhodnutie, nie univerzálna norma.
+
+Databáza komunitných benchmarkov
+
+Toto by podľa mňa zásadne odlíšilo tvoj optimizer od bežných kalkulačiek VRAM.
+
+Každý záznam:
+
+JSON
+{
+"hardware": {
+"gpu": "RTX 3060 Laptop GPU",
+"vram_mb": 6144,
+"gpu_tdp_w": 115,
+"cpu": "Ryzen 7 5800H",
+"ram_gb": 32,
+"ram_channels": 1,
+"os": "Windows"
+},
+"software": {
+"lm_studio_version": "...",
+"runtime": "llama.cpp",
+"runtime_version": "...",
+"backend": "CUDA"
+},
+"model": {
+"repository": "...",
+"filename": "...gguf",
+"sha256": "...",
+"parameters_total_b": 27,
+"parameters_active_b": 27,
+"quantization": "IQ3_M"
+},
+"settings": {
+"context_length": 8192,
+"gpu_ratio": 0.35,
+"gpu_layers": null,
+"flash_attention": true,
+"kv_gpu": true,
+"k_cache": "Q8_0",
+"v_cache": "Q4_0",
+"eval_batch": 128,
+"cpu_threads": 8,
+"mmap": true,
+"mtp": false
+},
+"results": {
+"prompt_tps": 0,
+"decode_tps": 0,
+"ttft_ms": 0,
+"peak_vram_mb": 0,
+"peak_ram_mb": 0,
+"quality_score": 0,
+"stability_cv": 0
+}
+}
+Similarity score
+Python
+similarity = (
+0.30 * gpu_architecture_match +
+0.25 * vram_similarity +
+0.15 * ram_bandwidth_similarity +
+0.10 * cpu_similarity +
+0.10 * backend_match +
+0.10 * os_match
+)
+
+Pri tvojom notebooku musí mať RAM channels vyššiu váhu pre modely, ktoré nie sú plne v GPU:
+
+Python
+if model_spills_to_ram:
+ram_bandwidth_weight *= 2
+Dôveryhodnosť záznamu
+Plain Text
+A: raw optimizer JSON + presný model hash + kompletné settings
+B: kompletný CLI command + benchmark output
+C: hardware/model/quant/context/TPS
+D: iba komunitné tvrdenie o TPS
+
+Výsledok „20 tok/s na 7B Q6 v LM Studio na RTX 3060 6 GB“ je užitočný, ale pre chýbajúci model, kontext a offload by dostal D.
+
+Benchmark 35B-A3B na RTX 3060 12 GB obsahuje model, quant, 8K context, Flash Attention, MoE placement, prompt/decode performance a MTP acceptance, takže by dostal A/B podľa dostupnosti raw artefaktov.
+
+Praktický výstup pre používateľa
+
+Optimizer by nemal povedať iba:
+
+Plain Text
+Odporúčame Qwen 14B.
+
+Mal by povedať:
+
+Plain Text
+Odporúčanie: Qwen 8B IQ4_XS
+ 
+Fit:
+- model weights: approximately 4.25 GB
+- expected fit: GPU-resident at 4K context
+- confidence: high
+ 
+Starting configuration:
+- context: 4096
+- full GPU offload
+- Flash Attention: ON
+- KV cache: GPU
+- K cache: Q8_0
+- V cache: Q4_0
+- eval batch: 256
+- CPU threads: 8
+ 
+Similar public result:
+- RTX 3060 Laptop 6 GB
+- 7B Q6
+- LM Studio
+- approximately 20 tok/s
+- confidence: low because context and exact model were not reported
+ 
+Local validation required:
+- benchmark batches 128/256/512
+- compare IQ4_XS against IQ3_XS
+- compare 4K against 8K context
+
+Takto sa jasne odlíši:
+
+čo je verejne namerané,
+čo je fit prediction,
+čo je navrhnuté nastavenie,
+čo bolo potvrdené priamo na používateľovom stroji.
+Môj záver
+
+Tvojmu programu by som pridal dva moduly:
+
+Plain Text
+Model Catalog
+Hardware Recommendation Engine
+
+A odporúčanie by malo byť dvojstupňové:
+
+Plain Text
+1. Nájde vhodné presné GGUF súbory podľa VRAM/RAM a účelu.
+2. Spustí krátku kalibráciu top 3 modelov/configov na lokálnom hardvéri.
+
+Online benchmarky sú dobrý prior, ale lokálny krátky benchmark musí mať posledné slovo, hlavne pri tvojom single-channel RAM a 6 GB laptop GPU. Verejné dáta ukazujú, že rovnaká „RTX 3060“ môže pri 7B Q4 reportovať približne 20 až 50 tok/s podľa VRAM variantu, OS a backendu.
+20t/s na vram je blbosit ,ja mam bonsai 27B Q+ pripadne ministral 3b a qwen 3.5 4b nad 70t/s. akurat sa neviem rozhodnut ktory z nich je lepsi.. skus mi este najst tedakompletne co svetko este z toho co si nespomenul vieme v lmstudio ovladat. a chcem vediet na co ake priroty robit , premysli optimalizacie co sa tyka samotneho optimizera aby fungoval co najrychlejsie a najspolahlivenjsie, becnhamrky, prompty alebo proces ako etstovat jednu vec po druhej s dosiahnutim najmensieho potrebneho casu bez kompromisu na nevysksuanie, mozno implementovat nejak aj detialny proces plus zrychleny proces, s tym ze moj plan je co sa tyka kontextu mat uplne vymazovane co sa da, a co som si vsimol tak cim vyssi kontext tym pomalsie generuje. ale pricenip chcem taky ze konetx sa nebude pridavat len power of 2 kym nenastane OOM alebo nebude geenrovat pod 1t/s , inak toto by som dal asi ako strop a pod toto generovanie beriem ako fail ale zapise sa do logu ze fail koli prilis pomalemu generovaniu. anyway proste sa bude hladat kontext aj naprkald ze 76k ak je najlepsi unosny kontext co hardware dokaze zniest plus an co si davat pozor ked to planujem crossplatform teda iwndows linux mac
+
+Copilot said:
+Máš pravdu, môj predchádzajúci údaj bol zlý benchmarkový anchor: miešal starší 7B/Q6 komunitný report s modernými modelmi a nebral do úvahy rozdiel medzi prompt processing, decode, MoE a MTP. Teraz sa sústredím na dve veci: úplný aktuálny parameter surface LM Studio a návrh optimizeru s exhaustive aj fast režimom, vrátane jemného hľadania maximálneho kontextu.
+
+
+Reasoned for 3s
+Máš pravdu. Tvojich 70+ tok/s pri Bonsai 27B Q1, Ministral 3B a Qwen 3.5 4B úplne mení kalibráciu. Bonsai 27B má síce 27B parametrov, ale LM Studio Community GGUF má iba 3,80 GB v čistom Q1_0, takže sa správa skôr ako malý GPU-resident model než bežný 27B IQ3/IQ4 model. Tento build bol vytvorený bez MTP a samostatný vision projector má 0,93 GB.
+huggingface
++1
+
+Tvoj reálny benchmark je pre recommender cennejší než starý komunitný údaj. Optimizer preto musí rozlišovať:
+
+
+
+parameter_count != memory footprint != active compute != quality
+A k otázke, ktorý z troch modelov je lepší: tok/s to nerozhodne.
+
+Bonsai 27B Q1: pravdepodobne najväčšia kapacita, ale extrémna 1-bit kompresia. Modelová karta uvádza 89,5 % priemernej FP16 benchmarkovej kvality pri 1,125 efektívnych bitoch, no to je tvrdenie autora/modelovej stránky, nie nezávislé meranie na tvojich úlohách.
+lmstudio
+Qwen 3.5 4B: menší model s podstatne normálnejšou presnosťou váh môže byť spoľahlivejší v presných úlohách.
+Ministral 3B: pravdepodobný kandidát na najnižšiu latenciu a najlepší pomer výkon/pamäť, ale treba ho otestovať na rovnakom benchmarku.
+Pre optimizer by som preto pridal samostatný model-comparison režim, ktorý porovná output quality pri zafixovanom runtime profile.
+
+1. Čo všetko ešte LM Studio umožňuje ovládať
+Treba rozlišovať štyri povrchy. Nie všetko je dostupné cez každý z nich.
+
+A. Native REST v1: load-time
+POST /api/v1/models/load oficiálne dokumentuje:
+
+
+
+model
+context_length
+eval_batch_size
+flash_attention
+num_experts
+offload_kv_cache_to_gpu
+echo_load_config
+echo_load_config=true vráti nastavenia, ktoré runtime skutočne použil.
+lmstudio
+
+Tvoj optimizer už časť z nich podporuje, ale pri každom teste musí ukladať:
+
+
+
+{
+  "requested_config": {},
+  "applied_config": {},
+  "ignored_fields": [],
+  "changed_by_runtime": {}
+}
+B. Python/TypeScript SDK: rozšírený load-time
+Aktuálne dokumentované LLMLoadModelConfig obsahuje:
+
+
+
+gpu
+contextLength
+ropeFrequencyBase
+ropeFrequencyScale
+evalBatchSize
+flashAttention
+keepModelInMemory
+seed
+useFp16ForKVCache
+tryMmap
+numExperts
+llamaKCacheQuantizationType
+llamaVCacheQuantizationType
+
+lmstudio
+
+Pre optimizer sú nové alebo dôležité najmä:
+
+keepModelInMemory
+Testovať skôr ako prevádzkové nastavenie, nie kvalitatívny parameter:
+
+
+
+OFF
+ON
+Môže ovplyvniť opakovaný load a správanie pri memory pressure.
+
+tryMmap
+
+
+OFF
+ON
+Meraj:
+
+cold load,
+warm load,
+RAM working set,
+decode po zahriatí,
+page faults, ak ich OS sprístupní.
+Výsledky musia byť oddelené. Mmap môže zlepšiť načítanie bez toho, aby zlepšil decode.
+
+K/V-cache quantization
+
+
+K: false, F16, Q8_0, Q4_0
+V: false, F16, Q8_0, Q4_0
+Presný zoznam musí optimizer získať z capabilities/runtime verzie, nie ho slepo posielať. V-cache kvantizácia je viazaná na Flash Attention podľa dokumentácie LLMLoadModelConfig.
+lmstudio
+
+RoPE base/scale
+Tieto parametre nespúšťaj v normálnom exhaustive teste. Sú to experimentálne quality-impacting parametre, nie bezpečné performance tunery.
+
+C. Inference-time konfigurácia
+Native /api/v1/chat dokumentuje:
+
+
+
+temperature
+top_p
+top_k
+min_p
+repeat_penalty
+max_output_tokens
+reasoning
+system_prompt
+stream
+integrations
+Reasoning môže byť off, low, medium, high alebo on, ak ho model podporuje.
+lmstudio
+
+SDK navyše dokumentuje:
+
+
+
+maxTokens
+stopStrings
+toolCallStopStrings
+contextOverflowPolicy
+structured
+topKSampling
+repeatPenalty
+minPSampling
+topPSampling
+xtcProbability
+xtcThreshold
+cpuThreads
+draftModel
+Context overflow policy môže byť:
+
+
+
+stopAtLimit
+truncateMiddle
+rollingWindow
+
+lmstudio
+
+D. Model/server prevádzka
+GET /api/v1/models vracia:
+
+architektúru,
+quantizáciu a bits-per-weight,
+veľkosť súboru,
+parameter count,
+loaded instances,
+aplikovanú konfiguráciu,
+parallel,
+podporovaný maximálny kontext,
+GGUF/MLX formát,
+vision/tool/reasoning capabilities,
+dostupné reasoning options,
+varianty modelu.
+lmstudio
+LM Studio tiež podporuje Max Concurrent Predictions cez continuous batching. Predvolená hodnota v UI je 4 a funkcia je dokumentovaná pre llama.cpp runtime.
+lmstudio
+
+To je samostatná optimalizačná dimenzia:
+
+
+
+parallel = 1, 2, 4, 8
+Ale iba pre server-throughput profil. Pri interaktívnom single-user TPS musí byť:
+
+
+
+parallel = 1
+Inak by si miešal single-request latency a aggregate throughput.
+
+E. JIT, TTL a Auto-Evict
+LM Studio podporuje:
+
+JIT load,
+idle TTL,
+automatické unloadnutie po nečinnosti,
+Auto-Evict pred načítaním nového JIT modelu.
+Predvolený JIT TTL je podľa dokumentácie 60 minút a Auto-Evict je predvolene zapnutý.
+lmstudio
+
+Optimizer má počas merania:
+
+
+
+JIT nepoužívať
+Auto-Evict kontrolovať
+TTL vypnúť alebo nastaviť nad dĺžku runu
+explicitne load/unloadovať model
+Inak môžeš omylom merať load modelu vo vnútri prvého inference requestu.
+
+F. lms ... --estimate-only
+CLI dokáže odhadnúť pamäť bez načítania modelu a zohľadňuje context length, GPU offload, Flash Attention a vision konfiguráciu.
+lmstudio
+
+Toto je výborný pre-filter, ale nie dôkaz, že konfigurácia je stabilná.
+
+2. Parameter priority: čo testovať v akom poradí
+Najväčšia chyba by bola urobiť jeden kartézsky súčin všetkého.
+
+Trieda 1: mení pamäť, fit a často aj výkon
+Testovať ako prvé:
+
+
+
+context length
+GPU offload ratio
+KV cache placement
+K-cache quantization
+V-cache quantization
+Flash Attention
+eval batch size
+Trieda 2: výkon bez zásadnej zmeny výstupu
+Testovať po nájdení stabilného memory profilu:
+
+
+
+CPU threads
+mmap
+MTP/draft model
+draft parameters, ak dostupné
+parallel/concurrency
+Trieda 3: mení správanie alebo kvalitu
+Testovať oddelene:
+
+
+
+temperature
+top-p
+top-k
+min-p
+repeat penalty
+XTC
+reasoning effort
+structured output
+RoPE scaling
+context overflow policy
+Nikdy neoptimalizuj sampling súčasne s load parametrami. Potom nebudeš vedieť, či zmenu kvality spôsobil quant/runtime alebo sampler.
+
+3. Dva režimy optimizeru
+Fast režim
+Cieľ: čo najrýchlejšie nájsť veľmi dobrú konfiguráciu.
+
+Fáza F0: capability discovery
+Bez inferencie:
+
+
+
+model metadata
+model size
+quant
+architecture
+dense/MoE
+max context
+reasoning support
+vision/tool support
+runtime/backend
+available config fields
+hardware totals
+Fáza F1: memory pre-filter
+Použi:
+
+
+
+lms load --estimate-only
+na vyradenie očividne nemožných kombinácií.
+lmstudio
+
+Fáza F2: baseline
+Fixné:
+
+
+
+context: 4096
+flash_attention: true
+gpu_offload: auto/max
+kv_gpu: true
+eval_batch: 256
+parallel: 1
+temperature: 0
+max_output_tokens: 256
+Spusti:
+
+1 warmup,
+2 merané decode behy,
+1 prompt-processing test.
+Fáza F3: greedy coordinate search
+Poradie:
+
+
+
+1. GPU offload
+2. Flash Attention
+3. KV placement
+4. K/V quantization
+5. eval batch
+6. CPU threads
+7. mmap
+8. MTP
+9. context ceiling
+Pri každej dimenzii:
+
+fixni aktuálneho víťaza,
+otestuj kandidátov iba tejto dimenzie,
+zober víťaza,
+pokračuj ďalej,
+na konci zopakuj prvé štyri dimenzie kvôli interakciám.
+To nie je mathematically exhaustive, ale je omnoho rýchlejšie.
+
+Fáza F4: interaction verification
+Povinne otestovať aspoň:
+
+
+
+GPU offload × KV placement
+Flash Attention × V-cache quantization
+context × KV quantization
+eval batch × context
+MTP × GPU offload
+MTP × context
+Fáza F5: finalist validation
+Top 3 konfigurácie:
+
+
+
+1 warmup
+5 measured repetitions
+rotované poradie ABC / BCA / CAB
+Rotovanie obmedzí systematické zvýhodnenie prvého kandidáta pred thermal throttlingom.
+
+Detailed režim
+Cieľ: nezanedbať žiadnu podporovanú kombináciu, ale stále neplytvať testami.
+
+Hierarchické exhaustive prehľadávanie
+Namiesto úplného kartézskeho súčinu:
+
+exhaustive memory topology,
+vyradenie dominated konfigurácií,
+exhaustive výkonové parametre iba na Pareto kandidátoch,
+quality sweep iba na top konfiguráciách,
+context ceiling search pre každý odlišný Pareto profil.
+Memory topology
+
+
+Flash Attention: OFF/ON
+KV placement: CPU/GPU
+K-cache: všetky podporované
+V-cache: všetky podporované
+GPU offload: adaptívne body
+Po tomto odhoď konfigurácie, ktoré sú súčasne:
+
+pomalšie,
+používajú viac VRAM,
+majú menší context ceiling,
+a neponúkajú vyššiu kvalitu.
+Performance sweep
+Iba nad nondominated konfiguráciami:
+
+
+
+eval batch
+CPU threads
+mmap
+MTP/draft model
+parallel
+Takto nič podstatné nevynecháš, ale netestuješ sampler na nefunkčnom memory profile.
+
+4. Správne hľadanie maximálneho kontextu
+Súhlasím, iba powers-of-two sú príliš hrubé. Ak 64K prejde a 128K zlyhá, optimom môže byť 76K, 91K alebo 112K.
+
+Treba však rozlíšiť tri veci:
+
+
+
+loadable context
+speed-acceptable context
+quality-usable context
+Krok A: zisti tvrdý horný limit
+Z API vezmi max_context_length. LM Studio ho vracia v model metadata.
+lmstudio
+
+Kandidát nikdy nesmie ísť nad tento limit bez explicitného experimentálneho RoPE režimu.
+
+Krok B: exponential bracketing
+Namiesto slepého powers-of-two:
+
+
+
+4K
+8K
+16K
+32K
+64K
+128K
+použi rastový faktor napríklad:
+
+
+
+4096
+6144
+9216
+13824
+20736
+31104
+46656
+69952
+104928
+Teda približne ×1.5, zarovnané na 256 alebo 512 tokenov.
+
+Tým dostaneš jemnejšie hranice bez veľkého počtu behov.
+
+Krok C: binárne hľadanie medzi PASS a FAIL
+Ak:
+
+
+
+69 632 PASS
+104 960 FAIL
+testuj stred:
+
+
+
+87 296
+Potom pokračuj binárne, až kým interval nebude napríklad:
+
+
+
+<= 1024 tokenov
+Výsledok môže byť pokojne:
+
+
+
+maximum admissible context = 76 288
+Krok D: neplň celý kontext pri každom pokuse
+Tu sa dá ušetriť najviac času.
+
+Load-fit test
+Najprv iba:
+
+načítať model s daným context allocation,
+overiť applied context,
+podať krátky prompt,
+vygenerovať 32 až 64 tokenov.
+Toto zisťuje, či runtime alokáciu fyzicky zvládne.
+
+Context-fill test
+Až pre kandidátov blízko hranice:
+
+prompt zaplniť na 25 %,
+potom 50 %,
+potom 75 %,
+potom 90 až 95 % okna.
+Pre maximálny context report musí prejsť minimálne 90 % zaplnenie. Samotné načítanie 128K kontextu nedokazuje, že model zvládne spracovať 128K prompt.
+
+Krok E: tvoj limit pod 1 tok/s
+To je rozumná používateľská politika:
+
+
+
+decode_tps < 1.0 = TOO_SLOW
+Ale nedávaj to do rovnakého statusu ako OOM.
+
+Použi:
+
+
+
+PASS
+FAIL_OOM_LOAD
+FAIL_OOM_INFERENCE
+FAIL_TOO_SLOW
+FAIL_TIMEOUT
+FAIL_CRASH
+FAIL_CONTEXT_OVERFLOW
+FAIL_QUALITY
+FAIL_UNSUPPORTED
+FAIL_CONFIG_IGNORED
+Pri FAIL_TOO_SLOW zapíš:
+
+
+
+{
+  "threshold_tps": 1.0,
+  "observed_tps": 0.83,
+  "context_length": 76288,
+  "fill_ratio": 0.9,
+  "prompt_tokens": 68659,
+  "output_tokens": 64
+}
+Krok F: hysteréza pri hranici
+Ak nameriaš 0,98 tok/s, nemalo by to okamžite zlyhať kvôli šumu.
+
+Navrhujem:
+
+
+
+PASS: median >= 1.05 tok/s
+BORDERLINE: 0.95 až 1.05 tok/s
+FAIL: median < 0.95 tok/s
+Borderline test zopakuj päťkrát a rozhodni podľa mediánu a variability.
+
+To je moje návrhové pravidlo, nie pravidlo LM Studio.
+
+5. Kontext a spomaľovanie
+Tvoje pozorovanie je správne ako praktický jav, ale optimizer musí merať zvlášť:
+
+
+
+allocated context
+used prompt tokens
+decode position
+Model načítaný na 128K, ale používaný s 200-tokenovým promptom nemusí mať rovnaký výkon ako model práve generujúci pri pozícii 100K.
+
+Preto potrebuješ túto maticu:
+
+
+
+context allocation: 8K, 32K, 64K, maximum
+fill ratio:         0%, 25%, 50%, 75%, 90%
+Nemusíš robiť plný test na každom bode. Fast režim:
+
+
+
+0%, 50%, 90%
+Detailed režim:
+
+
+
+0%, 25%, 50%, 75%, 90%, 98%
+A meraj zvlášť:
+
+prompt tok/s,
+TTFT,
+decode tok/s,
+peak VRAM,
+peak RAM.
+SDK priamo poskytuje počet generovaných tokenov, TTFT a stop reason; speculative decoding štatistiky vedia obsahovať accepted draft tokens.
+lmstudio
++1
+
+6. Benchmarkové prompty
+Jeden prompt nestačí. Zároveň nepotrebuješ dlhé odpovede pri každom load teste.
+
+Mikrobenchmarky
+Decode-only-ish
+Krátky vstup, dlhší deterministický výstup:
+
+
+
+Continue the numbered sequence from 1 to 256.
+Output exactly one integer per line and nothing else.
+Účel:
+
+stabilné generovanie,
+minimálna variabilita,
+decode TPS.
+Pozor: model môže počítanie pokaziť. Výstup musíš validovať.
+
+Prompt processing
+Dlhý syntetický text s kontrolným údajom na konci:
+
+
+
+Read the supplied records. Return only the value associated with TARGET_KEY.
+Text generuj lokálne a deterministicky. Neopakuj stále rovnakú vetu, pretože opakujúce sa tokeny nemusia reprezentovať reálny kontext.
+
+TTFT
+Fixný prompt približne 512 až 2 048 tokenov, výstup 16 tokenov.
+
+Structured output
+JSON schema so stabilnou validáciou. SDK podporuje structured prediction.
+lmstudio
++1
+
+Quality suite pre výber Bonsai vs Qwen vs Ministral
+Odporúčam minimálne:
+
+
+
+10 coding tasks
+10 exact-instruction tasks
+10 JSON extraction tasks
+10 Slovak/English translation and grammar tasks
+10 reasoning tasks
+5 long-context retrieval tasks at each fill level
+5 tool-call tasks
+Pre tvoj účel by coding časť mala obsahovať:
+
+opravu TypeScript chyby,
+Playwright locator,
+explicitné constraints,
+úpravu existujúcej funkcie bez rozbitia API,
+JSON/tool-call argumenty.
+Skóre by nemal byť subjektívny LLM judge ako jediný zdroj. Použi:
+
+
+
+unit tests
+exact match
+JSON schema validation
+compiler/type checker
+regex/AST constraints
+expected tool name and arguments
+7. Zrýchlenie bez vynechania relevantných kombinácií
+„Bez kompromisu na nevyskúšanie“ a zároveň najkratší čas sa dá dosiahnuť iba inteligentným prerezávaním preukázateľne zbytočných behov.
+
+Cache výsledkov
+Kľúč:
+
+
+
+model SHA256
+LM Studio version
+runtime version
+OS
+GPU driver
+hardware fingerprint
+requested config
+applied config
+benchmark suite version
+power/thermal profile
+Ak sa nezmení fingerprint, výsledok sa nemusí opakovať.
+
+Deduplicácia podľa applied config
+Ak dva requesty skončia s rovnakým applied_config, druhý netestuj.
+
+Failure-region pruning
+Ak pri rovnakom memory profile zlyhá:
+
+
+
+context = 80K
+potom vyššie kontexty pravdepodobne netestuj, kým nezmeníš parameter znižujúci pamäť, napríklad KV quantization alebo GPU placement.
+
+Výnimka: ak load runtime vykazuje ne-monotónne správanie, optimizer musí pruning vypnúť.
+
+Success monotonicity nepoužívaj na výkon
+To, že 64K je rýchlejšie než 80K, neznamená, že všetky body medzi nimi sú zoradené rovnako. Na maximálny kontext môžeš použiť binárne hľadanie, na najlepší výkon stále potrebuješ lokálne vzorky.
+
+Sequential halving
+Pri množstve kandidátov:
+
+všetky dostanú jeden krátky beh,
+najhoršia polovica sa vyradí,
+zvyšok dostane druhý beh,
+top kandidáti dostanú plnú validačnú sadu.
+Nevyraď kandidáta iba na základe jedného behu, ak je rozdiel v pásme meracieho šumu.
+
+Early abort
+Počas generovania zastav test, keď:
+
+
+
+po warmup intervale rolling TPS < 0.8
+OOM signal
+model prestal generovať
+RAM/VRAM prekračuje bezpečný limit
+výstup je nekonečná repetícia
+Fail sa uloží s dôvodom a čiastočnými metrikami.
+
+8. Cross-platform: Windows, Linux a macOS
+Spoločné pravidlo
+Nesnaž sa normalizovať výsledky medzi platformami ako keby boli totožné.
+
+Fingerprint musí obsahovať:
+
+
+
+OS a verzia
+LM Studio verzia
+runtime a verzia
+backend
+GPU model
+driver
+CUDA/Vulkan/Metal/MLX
+power mode
+RAM konfigurácia
+model hash
+LM Studio podporuje llama.cpp na Windows, Linuxe a macOS; na Apple Silicon podporuje aj MLX.
+lmstudio
+
+Windows
+Sleduj:
+
+dedicated GPU memory,
+shared GPU memory,
+process working set,
+commit size,
+page file activity,
+power plan,
+notebook plugged/battery stav.
+Najväčší problém: Windows môže začať používať shared GPU memory bez okamžitého OOM. Konfigurácia síce „prejde“, ale výkon prudko klesne. Preto shared VRAM usage musí byť samostatná metrika.
+
+Linux
+Sleduj:
+
+RSS/PSS,
+swap in/out,
+major page faults,
+NVIDIA/AMD GPU metrics,
+CPU governor,
+thermal throttling.
+Pre headless CI môžeš použiť llmster; LM Studio dokumentuje headless daemon a systemd prevádzku.
+lmstudio
+
+macOS Apple Silicon
+Nerozdeľuj RAM a VRAM ako na NVIDIA. Ide o unified memory.
+
+Treba evidovať:
+
+
+
+unified memory used
+memory pressure
+swap
+backend = MLX alebo llama.cpp/Metal
+Výsledky MLX a llama.cpp nesmú byť v jednej porovnávacej skupine bez označenia backendu.
+
+Teploty a napájanie
+Najmä na tvojom 5800H notebooku:
+
+
+
+AC napájanie povinné
+rovnaký power profile
+zahrievací test pred benchmarkom
+teplotný limit alebo throttle flag v logu
+náhodné/rotované poradie finalistov
+Ak GPU clock počas testov významne klesne, run označ ako thermal-contaminated a neopieraj oň konečný výber.
+
+9. Navrhovaný stavový automat
+
+
+DISCOVER
+  -> PREFLIGHT
+  -> ESTIMATE
+  -> LOAD
+  -> VERIFY_APPLIED_CONFIG
+  -> WARMUP
+  -> MICRO_BENCHMARK
+  -> QUALITY_GATE
+  -> CONTEXT_SEARCH
+  -> INTERACTION_TESTS
+  -> FINAL_VALIDATION
+  -> PARETO_RANK
+  -> SAVE_PRESET
+Každá fáza musí byť resumable.
+
+Kritické pravidlo
+Konfigurácia sa nesmie dostať do finálneho poradia, ak:
+
+
+
+load config nebol overený
+output neprešiel validátorom
+median decode TPS < 1
+kontext nebol reálne zaplnený na požadovaný pomer
+run bol ovplyvnený swapom alebo throttlingom
+10. Čo by som upravil v tvojom aktuálnom optimizéri ako prvé
+Poradie podľa návratnosti:
+
+Odstrániť odhadované TTFT a používať SDK TTFT
+Requested/applied configuration diff
+Rozlíšiť loadable, speed-acceptable a quality-usable context
+Context search ×1,5 + binárne spresnenie na 512/1024 tokenov
+Context fill ratio 0/50/90 % v fast režime
+Explicitné fail reasons vrátane FAIL_TOO_SLOW
+KV K/V quantization capabilities
+MTP/draft acceptance a speedup
+CPU thread sweep
+mmap cold/warm separácia
+Parallel throughput profil
+Fast a Detailed search engine
+Benchmark cache podľa model/runtime/hardware fingerprintu
+Model comparison medzi Bonsai/Qwen/Ministral
+Cross-platform measurement adapters
+Najdôležitejšia praktická zmena je táto:
+
+
+
+„Najväčší kontext, ktorý sa načíta“
+nie je
+„najväčší kontext, ktorý je použiteľný“.
+Tvoj report by preto mal pre každý model ukázať napríklad:
+
+
+
+Max loadable context:     98 304
+Max >= 1 tok/s context:   76 288
+Max quality-passing:      65 536
+Recommended interactive:  32 768
+Presne toto bude oveľa hodnotnejšie než klasické odporúčanie „použi 32K alebo 64K“.
+
+
+
+
+
+Favicon typeFavicon type
+Sources
+You said:
+este navod ako urcovat kvalitu atd by som chcel a mam tam aj sanbox kde mam pripravene 3 testy bud an etst jedneho modelu alebo ako duel jeden model medzi druhym dostanu rovnaky task a ktory je lepsi, jeden ej webstranka html, druhy je uz neviem co presne ci deepresearch alebo co a treti je vytvorenie 3D animacie v skripte nejak minecraft themed nejaky simple skyblock videl som take na youtue ze ludia skusaju robit 
+Copilot said:
+Presne. Tvoj Sandbox by nemal hodnotiť iba „páči sa mi výsledok A viac než B“. Potrebuješ opakovateľné, čo najviac automatické hodnotenie kvality, ktoré odlíši:
+
+kvalitu modelu,
+kvalitu runtime konfigurácie,
+rýchlosť,
+schopnosť dokončiť praktický projekt,
+dodržanie zadania,
+stabilitu medzi opakovaniami.
+Najmä pri porovnaní Bonsai 27B Q1, Qwen 3.5 4B a Ministral 3B môže extrémne kvantizovaný 27B model pôsobiť inteligentnejšie v jednej úlohe, ale robiť viac drobných chýb v inom type práce.
+
+1. Dva odlišné typy testovania
+Configuration benchmark
+Porovnávaš ten istý model s rôznymi nastaveniami:
+
+
+
+Qwen 3.5 4B IQ4
+config A vs. config B
+Vtedy musí byť všetko ostatné rovnaké:
+
+prompt,
+seed,
+sampling,
+kontext,
+systémový prompt,
+maximálny output,
+sandbox,
+dostupné nástroje.
+Cieľom je zistiť, či napríklad KV Q4 alebo MTP nezhoršili výstup.
+
+Model duel
+Porovnávaš:
+
+
+
+Bonsai 27B Q1
+vs.
+Qwen 3.5 4B
+Tu môžu mať modely svoje odporúčané sampling defaults, ale potrebuješ dva výsledky:
+
+Controlled duel: identické sampling nastavenia.
+Best-profile duel: každý model používa svoje najlepšie nájdené nastavenie.
+Controlled duel porovnáva modely. Best-profile duel porovnáva reálny používateľský zážitok.
+
+2. Ako počítať kvalitu
+Odporúčam rozdeliť kvalitu na šesť oblastí:
+
+
+
+Correctness           35 %
+Instruction following 20 %
+Completeness          15 %
+Robustness            10 %
+Efficiency            10 %
+Maintainability       10 %
+Váhy majú byť osobitné pre každý typ tasku. Napríklad deep-research potrebuje viac váhy na factuality a zdroje, zatiaľ čo 3D animácia potrebuje viac váhy na vykonateľnosť a vizuálny výsledok.
+
+Základné pravidlo
+Najprv používaj tvrdé validátory:
+
+
+
+build prešiel?
+testy prešli?
+HTML je validné?
+JSON je správny?
+skript sa spustil?
+výstupné súbory existujú?
+nevznikli runtime chyby?
+Až potom subjektívne skóre:
+
+
+
+vyzerá stránka dobre?
+je research presvedčivý?
+je animácia vizuálne kvalitná?
+LLM judge nesmie prehlasovať nefunkčný výsledok za kvalitný.
+
+3. Hard gates
+Každý task potrebuje minimálne podmienky úspechu.
+
+Príklad pre web:
+
+
+
+FAIL, ak:
+- chýba index.html,
+- HTML sa nedá načítať,
+- JavaScript končí chybou,
+- nesplnil povinnú funkcionalitu,
+- použil zakázaný framework alebo externú službu.
+Pre 3D animáciu:
+
+
+
+FAIL, ak:
+- skript sa nespustí,
+- scéna sa nevytvorí,
+- render neexistuje,
+- chýbajú povinné objekty,
+- animácia má nulovú alebo neplatnú dĺžku.
+Hard fail neznamená automaticky skóre nula vo všetkom. Ulož čiastkové skóre, ale výsledok označ:
+
+
+
+status = FAIL_FUNCTIONAL
+eligible_for_winner = false
+4. Test 1: HTML webstránka
+Toto je veľmi dobrý sandbox task, pretože vieš veľa vecí vyhodnotiť automaticky.
+
+Odporúčané zadanie
+Nerob príliš všeobecné:
+
+Vytvor peknú stránku.
+
+Použi konkrétne akceptačné kritériá:
+
+
+
+Vytvor responzívnu jednostránkovú webovú aplikáciu pre správu lokálnych
+LLM benchmarkov.
+ 
+Povinné:
+1. Dashboard so štyrmi metrikami.
+2. Zoznam najmenej troch modelov.
+3. Filtrovanie podľa statusu.
+4. Detail konfigurácie po kliknutí na model.
+5. Prepínač svetlej a tmavej témy.
+6. Responzívne zobrazenie pre 390 px a 1440 px.
+7. Bez externých API.
+8. Výsledok musí byť spustiteľný zo sandboxu.
+Názvy a hodnoty metrík vlož do fixture, aby všetky modely dostali rovnaké dáta.
+
+Automatické hodnotenie
+Build a runtime: 30 bodov
+
+
+10: stránka sa načíta bez fatálnej chyby
+5: žiadne neodchytené console errors
+5: všetky povinné súbory existujú
+5: HTML obsahuje očakávané sekcie
+5: žiadne nedovolené sieťové požiadavky
+Funkcionalita: 30 bodov
+Playwright testy:
+
+
+
+filter zmení zobrazené položky
+kliknutie otvorí detail
+theme toggle zmení tému
+refresh zachová dohodnutý stav, ak to zadanie vyžaduje
+mobilné menu alebo layout funguje
+Instruction following: 15 bodov
+Každé povinné kritérium má vlastný bod:
+
+
+
+{
+  "dashboard": true,
+  "three_models": true,
+  "filter": true,
+  "detail": true,
+  "theme": true,
+  "responsive": true
+}
+Vizuálna kvalita: 15 bodov
+Screenshoty:
+
+
+
+390 × 844
+768 × 1024
+1440 × 900
+Hodnotenie:
+
+pretekanie textu,
+prekryté komponenty,
+konzistentné rozostupy,
+kontrast,
+čitateľnosť,
+vizuálna hierarchia.
+Toto môže hodnotiť človek alebo vision judge. Nie iba samotný testovaný model.
+
+Údržba kódu: 10 bodov
+Automaticky:
+
+duplicita,
+priveľké súbory,
+inline štýly, ak ich zadanie nežiada,
+accessibility labels,
+validné tlačidlá a formuláre,
+zrozumiteľná štruktúra.
+Dôležitá metrika
+Meraj aj:
+
+
+
+time_to_first_valid_build
+number_of_repair_iterations
+total_generated_tokens
+final_build_success
+Model, ktorý vytvorí krásny web až na piaty repair, nie je automaticky lepší než model, ktorý vytvorí o trochu jednoduchší, ale funkčný web na prvý pokus.
+
+5. Test 2: Deep research
+Ak je druhý test research, musíš modelu dať kontrolovaný balík zdrojov. Ak mu dovolíš voľný internet, výsledky ovplyvní vyhľadávač, dostupnosť stránok a náhodný výber zdrojov.
+
+Dve verzie
+Closed-book research
+Model dostane napríklad 8 až 12 lokálnych dokumentov:
+
+
+
+2 oficiálne dokumenty
+2 technické články
+2 komunitné reporty
+1 zdroj so zastaranými údajmi
+1 zdroj s konfliktom
+1 irelevantný dokument
+Úloha:
+
+
+
+Porovnaj tri prístupy, identifikuj rozpory, odporuč riešenie
+a pri každom podstatnom tvrdení uveď zdroj.
+To je najlepší test research schopnosti, pretože poznáš ground truth.
+
+Open-web research
+Model má dostupné rovnaké webové nástroje a rovnaký maximálny počet dotazov. Hodnotíš aj kvalitu vyhľadávania, ale reprodukovateľnosť bude nižšia.
+
+Automatické skóre
+Factuality: 30 bodov
+Priprav si databázu tvrdení:
+
+
+
+[
+  {
+    "claim_id": "C01",
+    "expected": "Qwen3-30B-A3B has 30.5B total parameters",
+    "acceptable_sources": ["document_01"],
+    "weight": 2
+  }
+]
+Extrahuj tvrdenia z odpovede a kontroluj:
+
+podporené správnym zdrojom,
+nepodporené,
+protirečiace zdroju,
+zdroj neobsahuje dané tvrdenie.
+Citácie: 20 bodov
+
+
+citation precision:
+koľko citácií skutočne podporuje tvrdenie
+ 
+citation recall:
+koľko podstatných tvrdení má citáciu
+Pokrytie: 20 bodov
+Checklist:
+
+
+
+výkon
+pamäť
+kvalita
+obmedzenia
+konfliktné dôkazy
+odporúčanie
+riziká
+Syntéza: 15 bodov
+Hodnotí sa, či model iba zosumarizoval dokumenty, alebo spojil dôkazy do rozhodnutia.
+
+Handling conflicts: 10 bodov
+Do datasetu zámerne vlož dva konfliktné benchmarky. Model má:
+
+konflikt pomenovať,
+uviesť rozdielnu metodiku,
+nevybrať si svojvoľne pohodlnejšie číslo.
+Formát: 5 bodov
+Validácia povinných sekcií a citácií.
+
+Kritická penalizácia
+
+
+vymyslený zdroj:        -15
+neexistujúca citácia:    -10
+zásadné tvrdenie opačné: -10
+ignorovanie konfliktu:    -5
+Výsledné skóre clampni na 0 až 100.
+
+6. Test 3: 3D Minecraft/Skyblock animácia
+Toto je dobrý agentický test, pretože kombinuje:
+
+plánovanie,
+priestorovú geometriu,
+programovanie,
+dodržiavanie tém,
+spustenie skriptu,
+vizuálny výsledok.
+Najlepšie je štandardizovať jeden engine. Odporúčam Blender Python, pretože môžeš automaticky spustiť .py, uložiť .blend a vyrenderovať obrázky alebo video.
+
+Zadanie
+
+
+Pomocou Blender Python API vytvor jednoduchú Minecraft-inspired
+Skyblock scénu.
+ 
+Povinné prvky:
+1. Plávajúci blokový ostrov.
+2. Tráva, hlina a kameň ako samostatné materiály.
+3. Strom s blokovým kmeňom a korunou.
+4. Truhlica.
+5. Postava alebo jednoduchý blokový avatar.
+6. Kamera obletí ostrov.
+7. Slnko alebo hlavné svetlo.
+8. Animácia má presne stanovený počet snímok.
+9. Skript musí vytvoriť a uložiť .blend.
+10. Výsledok musí byť reprodukovateľný bez manuálnych krokov.
+Použi označenie Minecraft-inspired, nie požiadavku na kopírovanie konkrétnych chránených assetov.
+
+Automatická kontrola scény
+Blender validation script môže skontrolovať:
+
+
+
+počet objektov
+názvy povinných objektov
+počet materiálov
+existenciu kamery
+existenciu svetla
+frame_start a frame_end
+kamera má keyframes
+ostrov nie je prázdny
+render output existuje
+.blend sa dá znovu otvoriť
+Príklad výsledku:
+
+
+
+{
+  "script_exit_code": 0,
+  "blend_created": true,
+  "render_created": true,
+  "required_objects": {
+    "island": true,
+    "tree": true,
+    "chest": true,
+    "avatar": true
+  },
+  "camera_keyframes": 4,
+  "materials": 5
+}
+Skóre
+
+
+Execution and render        30
+Required scene elements     20
+Animation correctness       15
+Composition and visibility  15
+Visual quality              10
+Code quality                10
+Automatické vizuálne kontroly
+Render tri kontrolné frame-y:
+
+
+
+začiatok
+stred
+koniec
+Kontroluj:
+
+frame nie je celý čierny,
+kamera nesmeruje mimo scénu,
+scéna nie je extrémne preexponovaná,
+objekt zaberá primeranú časť obrazu,
+jednotlivé frame-y nie sú identické.
+Posledná kontrola je dôležitá: skript môže mať formálne keyframes, ale kamera sa nemusí viditeľne pohybovať.
+
+7. Duel systém
+Pri modeli A a B ich anonymizuj:
+
+
+
+Candidate X
+Candidate Y
+Judge nesmie vedieť:
+
+názov modelu,
+parameter count,
+quant,
+tok/s,
+predchádzajúce skóre.
+Inak vznikne bias v prospech väčšieho alebo známejšieho modelu.
+
+Poradie
+Polovica hodnotení:
+
+
+
+X potom Y
+Druhá polovica:
+
+
+
+Y potom X
+Výsledok duelu
+Nestačí:
+
+
+
+X vyhral
+Ulož:
+
+
+
+{
+  "winner": "X",
+  "confidence": 0.76,
+  "dimensions": {
+    "correctness": "X",
+    "instruction_following": "tie",
+    "visual_quality": "Y",
+    "maintainability": "X"
+  },
+  "critical_failures": {
+    "X": [],
+    "Y": ["theme toggle did not work"]
+  }
+}
+Remíza
+Výsledok má byť remíza, ak:
+
+
+
+rozdiel skóre < 3 body
+Pri rozdiele 3 až 7 bodov:
+
+
+
+weak win
+Nad 7 bodov:
+
+
+
+clear win
+Toto sú vhodné počiatočné pravidlá pre tvoj systém, nie univerzálny štandard.
+
+8. Ako oddeliť kvalitu modelu od náhody
+Každý model-task spusti minimálne v troch režimoch.
+
+Deterministický
+
+
+temperature: 0
+fixed seed
+Meria základnú spoľahlivosť.
+
+Odporúčaný profil modelu
+Napríklad Bonsai 27B uvádza:
+
+
+
+temperature 0.7
+top-k 20
+top-p 0.95
+thinking enabled
+
+lmstudio
+
+Meria praktickú kvalitu pri odporúčanom používaní.
+
+Robustness repeats
+Tri rozdielne seed-y:
+
+
+
+42
+1337
+2026
+Potom ulož:
+
+
+
+mean quality
+median quality
+worst-case quality
+standard deviation
+success rate
+Pre reálneho používateľa je často lepší model s výsledkami:
+
+
+
+84, 85, 83
+než model:
+
+
+
+95, 61, 88
+Aj keď druhý niekedy vytvorí krajší výsledok.
+
+9. Repair loop
+Praktické agentické modely treba hodnotiť aj podľa schopnosti opraviť chybu.
+
+Kolo 1
+Model dostane zadanie.
+
+Ak test zlyhá
+Model dostane iba:
+
+
+
+stdout
+stderr
+failing test names
+relevant screenshot, ak ho systém podporuje
+zostávajúci počet opráv
+Maximálne napríklad dve repair kolá.
+
+Skórovanie
+
+
+pass na prvý pokus: 100 % functional score
+pass po 1 oprave:    90 %
+pass po 2 opravách:  80 %
+stále fail:          partial score
+Neskrývaj však aj samostatné metriky:
+
+
+
+first_pass_success
+final_success
+repair_count
+tokens_to_success
+wall_time_to_success
+Tak sa používateľ môže rozhodnúť medzi:
+
+modelom, ktorý je presný na prvý pokus,
+modelom, ktorý sa dobre opravuje,
+modelom, ktorý síce uspeje, ale spotrebuje veľa tokenov.
+10. Odporúčané celkové skóre
+Nerobil by som iba jedno číslo. Zobraz:
+
+
+
+Quality:       87/100
+Reliability:   92/100
+Performance:   74/100
+Efficiency:    81/100
+A až potom voliteľné composite score:
+
+
+
+overall = (
+    quality * 0.50 +
+    reliability * 0.20 +
+    performance * 0.15 +
+    efficiency * 0.15
+)
+Performance
+Normalizované v rámci duelu:
+
+
+
+TTFT
+decode TPS
+prompt TPS
+total completion time
+Efficiency
+
+
+VRAM
+RAM
+generated tokens
+repair count
+energy, ak ju dokážeš merať
+Quality
+Task-specific rubrika.
+
+Reliability
+
+
+success rate
+worst-case run
+variance
+crashes
+invalid outputs
+11. Najlepší proces pre tvoje tri modely
+Pre Bonsai 27B Q1, Qwen 3.5 4B a Ministral 3B by som urobil:
+
+Kolo A: runtime baseline
+
+
+krátky kontext
+rovnaký seed
+temperature 0
+256 output tokens
+3 repetitions
+Zistíš čistý výkon a stabilitu.
+
+Kolo B: controlled Sandbox
+Každý model dostane:
+
+rovnaký web task,
+rovnaký research balík,
+rovnaký Blender task,
+rovnaké limity,
+rovnaké maximálne dva repair pokusy.
+Kolo C: recommended profile
+Každý model dostane svoje odporúčané sampling/thinking nastavenia.
+
+Kolo D: long-context
+Najprv pri 50 %, potom pri 90 % jeho odporúčaného použiteľného kontextu:
+
+research s needle retrieval,
+web task s veľkou špecifikáciou,
+úprava existujúceho Blender skriptu.
+Kolo E: blind duel
+Porovnať anonymizované výsledky a zároveň aplikovať automatické testy.
+
+12. Čo by mal Sandbox ukladať
+
+
+{
+  "run_id": "uuid",
+  "task_id": "web-dashboard-v1",
+  "task_version": "1.0.0",
+  "model_hash": "...",
+  "runtime_config_hash": "...",
+  "seed": 42,
+  "attempt": 1,
+ 
+  "input_tokens": 0,
+  "output_tokens": 0,
+  "prompt_tps": 0,
+  "decode_tps": 0,
+  "ttft_ms": 0,
+  "total_time_ms": 0,
+ 
+  "files_created": [],
+  "process_exit_code": 0,
+  "test_results": {},
+  "hard_gate_passed": true,
+ 
+  "scores": {
+    "correctness": 0,
+    "instruction_following": 0,
+    "completeness": 0,
+    "robustness": 0,
+    "maintainability": 0,
+    "visual_quality": 0
+  },
+ 
+  "judge": {
+    "type": "human|deterministic|vision|llm",
+    "version": "...",
+    "blind_candidate_id": "X"
+  }
+}
+Najdôležitejšie upozornenia
+Model nesmie hodnotiť vlastný výstup.
+LLM judge nesmie byť jediný hodnotiteľ.
+Nefunkčný projekt nemôže vyhrať iba preto, že vyzerá pekne.
+Rýchlosť nezapočítavaj do quality score.
+Controlled duel a best-profile duel musia byť oddelené.
+Testovacie zadania verziuj, pretože každá zmena promptu zneplatní historické porovnanie.
+Sandbox musí blokovať sieť a obmedziť filesystem, ak model generuje a spúšťa kód.
+Prompt nesmie obsahovať riešenie, iba akceptačné kritériá a dostupné rozhranie.
+Víťaz jedného tasku nie je celkový víťaz.
+Reportuj aj najhorší beh, nielen priemer.
+Tvoj optimizer by teda nemal vyhlásiť jednoduché „Bonsai je lepší než Qwen“. Mal by vedieť povedať napríklad:
+
+
+
+Bonsai 27B Q1
++ najvyššie research a visual skóre
++ 74 tok/s
+- vyššia variabilita
+- dve opravy pri HTML
+ 
+Qwen 3.5 4B
++ najvyššia first-pass úspešnosť
++ najlepšie instruction following
++ 78 tok/s
+- slabší komplexný research
+ 
+Ministral 3B
++  najnižší TTFT
++ najnižšia spotreba pamäte
+- slabší Blender task
+To už je odporúčanie, podľa ktorého sa dá reálne vybrať model pre konkrétny účel.
+
+potrebujem to este rozdelit, to znamena ze mat tie testy mozne zapnut aj kazdy zvalst len na rcitu vec, alebo aj kompletny optimise test, iba becnhamrky co sa tyka html, duel sandbox je zvlast, mozno este webui ktore mam trochu vylepsit
+Copilot said:
+Presne, treba to rozdeliť na samostatné režimy, nie všetko natlačiť do jedného „Optimize“ tlačidla. Runtime optimalizácia, kvalita modelu a duel medzi modelmi sú rozdielne experimenty a majú mať vlastné workflow, výsledky aj obrazovky vo Web UI.
+
+Navrhované rozdelenie aplikácie
+
+
+1. Quick Benchmark
+2. Runtime Optimizer
+3. Context Explorer
+4. Quality Lab
+5. Sandbox Tasks
+6. Model Duel
+7. Full Optimization
+8. Model Recommender
+9. Results & Presets
+Používateľ si môže spustiť ktorýkoľvek režim samostatne. Full Optimization iba orchestruje existujúce moduly, nesmie obsahovať samostatnú duplicitnú logiku.
+
+1. Quick Benchmark
+Účel:
+
+Chcem rýchlo zistiť, ako sa práve načítaný model správa.
+
+Nemení konfiguráciu a nehľadá optimum.
+
+Meria
+
+
+load/config snapshot
+prompt processing tok/s
+generation tok/s
+TTFT
+VRAM
+RAM
+stabilitu
+MTP acceptance, ak je aktívne
+Varianty
+Quick
+
+
+1 warmup
+2 merané behy
+krátky prompt
+256 output tokenov
+Standard
+
+
+1 warmup
+3 merané behy
+short/medium/long prompt
+256 až 512 output tokenov
+Detailed
+
+
+viac prompt lengths
+viac context fill ratios
+5 repetitions
+thermal/stability monitoring
+Tento režim je vhodný napríklad na okamžité porovnanie:
+
+
+
+Bonsai 27B Q1
+Qwen 3.5 4B
+Ministral 3B
+Bez optimalizácie settings.
+
+2. Runtime Optimizer
+Účel:
+
+Nájdi najlepšiu konfiguráciu pre jeden konkrétny model.
+
+Tu nemeníš model ani quant. Meníš iba runtime nastavenia.
+
+Optimalizované parametre
+
+
+GPU offload
+Flash Attention
+KV-cache placement
+K-cache quantization
+V-cache quantization
+eval batch
+CPU threads
+mmap
+MTP/draft model
+parallel predictions
+keep model in memory
+Context by som umožnil:
+
+fixný,
+rozsah,
+alebo „use Context Explorer result“.
+Režimy
+Fast
+Greedy/adaptive search, interaction checks a validácia top 3.
+
+Detailed
+Širší search space, Pareto pruning, viac opakovaní a viac interakcií.
+
+Exhaustive Supported
+Všetky platné a podporované kombinácie po odstránení:
+
+konfigurácií, ktoré runtime ignoroval,
+duplicitných applied configs,
+známych OOM oblastí,
+neplatných závislostí.
+Úplný kartézsky súčin bez prerezávania by bol zbytočný. Exhaustive nech znamená „všetky relevantné konfigurácie“, nie „opakovať rovnakú applied konfiguráciu 50-krát“.
+
+3. Context Explorer
+Context je natoľko špecifický, že si zaslúži samostatný režim.
+
+Účel:
+
+Nájdi maximálny a zároveň použiteľný kontext konkrétneho modelu a konfigurácie.
+
+Výstupy
+
+
+Max loadable context
+Max stable context
+Max context >= 1 tok/s
+Max quality-passing context
+Recommended interactive context
+Príklad:
+
+
+
+Loadable:       110 592
+Stable:          98 304
+>= 1 tok/s:      76 288
+Quality-passing: 65 536
+Recommended:     32 768
+Search strategy
+Fáza 1: rastúce kroky
+Nie iba power of two:
+
+
+
+4 096
+6 144
+9 216
+13 824
+20 736
+31 232
+46 848
+70 144
+105 216
+Hodnoty zaokrúhli na násobok 256 alebo 512.
+
+Fáza 2: bracket
+Nájdeš:
+
+
+
+posledný PASS
+prvý FAIL
+Fáza 3: binárne spresnenie
+Pokračuj až po nastaviteľnú presnosť:
+
+
+
+256
+512
+1 024 tokenov
+Tak môže byť výsledkom napríklad 76K, nie iba 64K alebo 128K.
+
+Typy context testu
+Používateľ si vyberie:
+
+
+
+Allocation only
+Performance under fill
+Retrieval quality
+Complete context validation
+Allocation only
+Model sa načíta s daným kontextom, dostane krátky prompt a vygeneruje krátku odpoveď.
+
+Performance under fill
+Testuje:
+
+
+
+0 %
+25 %
+50 %
+75 %
+90 %
+98 %
+Fast režim iba:
+
+
+
+0 %
+50 %
+90 %
+Retrieval quality
+Vloží fakty do rôznych pozícií:
+
+
+
+5 %
+25 %
+50 %
+75 %
+95 %
+Model ich musí správne nájsť.
+
+Complete
+Spojí alokáciu, výkon, stabilitu a retrieval quality.
+
+4. Quality Lab
+Účel:
+
+Otestuj kvalitu jedného modelu bez duelu.
+
+Model dostane sadu krátkych automaticky vyhodnotiteľných úloh.
+
+Kategórie
+Používateľ môže zaškrtnúť len tie, ktoré chce:
+
+
+
+Instruction following
+Coding
+Reasoning
+Structured JSON
+Tool calling
+Slovak language
+English language
+Long-context retrieval
+Summarization
+Research synthesis
+Hallucination resistance
+Výstup
+
+
+Overall quality
+Correctness
+Instruction following
+Reliability
+Worst-case score
+Pass rate
+Performance
+Tokens used
+Time to successful answer
+Dôležité
+Quality Lab nepoužíva HTML, Blender ani veľké agentické sandbox projekty. Má byť rýchlejší a prevažne deterministický.
+
+Príklady validátorov:
+
+
+
+exact match
+JSON Schema
+unit test
+TypeScript compiler
+Python tests
+regex constraint
+expected tool call
+retrieval key
+5. Sandbox Tasks
+Tvoje tri veľké testy patria sem.
+
+Každý sa dá spustiť:
+
+samostatne,
+ako vybraná skupina,
+ako kompletný Sandbox Suite.
+5.1 Web/HTML Sandbox
+Samostatné tlačidlo:
+
+
+
+Run Web Task
+Možnosti:
+
+
+
+Task template
+Framework
+Network access
+Max iterations
+Repair attempts
+Time/token budget
+Screenshot sizes
+Visual evaluation
+Výstupy:
+
+
+
+build status
+Playwright tests
+console errors
+responsive screenshots
+accessibility checks
+functional score
+visual score
+maintainability score
+first-pass success
+repair count
+5.2 Research Sandbox
+Samostatne:
+
+
+
+Run Research Task
+Typy:
+
+
+
+Closed-source package
+Open-web research
+Conflict-resolution research
+Technical comparison
+Výstupy:
+
+
+
+factual correctness
+citation precision
+citation coverage
+source quality
+conflict handling
+completeness
+unsupported claims
+Pre opakovateľný model benchmark je najlepší closed-source balík. Open web je vhodnejší ako praktický agentický test.
+
+5.3 3D Animation Sandbox
+Samostatne:
+
+
+
+Run Blender Task
+Možnosti:
+
+
+
+Scene template
+Required objects
+Frame count
+Resolution
+Render engine
+Repair attempts
+Visual judge enabled
+Výstupy:
+
+
+
+script execution
+.blend creation
+required objects
+materials
+camera animation
+render success
+visual composition
+code quality
+Spoločný Sandbox Suite
+Používateľ vyberie:
+
+
+
+☑ Web application
+☑ Research
+☑ Blender animation
+a nastaví váhy:
+
+
+
+Web:      40 %
+Research: 35 %
+Blender:  25 %
+6. Model Duel
+Model Duel nech je úplne samostatná časť. Nemá byť pod Runtime Optimizerom.
+
+Duel typy
+Micro Quality Duel
+Krátke úlohy z Quality Lab:
+
+
+
+A vs. B
+rovnaké zadania
+automatické validátory
+Sandbox Duel
+Tvoje veľké projekty:
+
+
+
+Web A vs. Web B
+Research A vs. Research B
+Blender A vs. Blender B
+Complete Duel
+
+
+Quick Benchmark
+Quality Lab
+vybrané Sandbox Tasks
+long-context test
+Controlled vs Best Profile
+Používateľ musí vidieť dve možnosti:
+
+Controlled
+
+
+rovnaká temperature
+rovnaký seed
+rovnaký context
+rovnaký max output
+rovnaké tool limity
+Best Profile
+
+
+každý model použije svoj uložený optimized preset
+Controlled odpovedá:
+
+Ktorý model je lepší za rovnakých podmienok?
+
+Best Profile odpovedá:
+
+Ktorý model je lepší pri najlepšom nastavení, ktoré som preň našiel?
+
+Blind judging
+V UI výstupy zobraz:
+
+
+
+Candidate A
+Candidate B
+Názvy modelov odkry až po hodnotení.
+
+7. Full Optimization
+Full Optimization je orchestration workflow.
+
+Používateľ si vyberie úroveň.
+
+Fast Full Optimize
+
+
+1. Hardware discovery
+2. Capability discovery
+3. Quick baseline
+4. Fast runtime optimization
+5. Fast context search
+6. Compact Quality Lab
+7. Final validation
+8. Save recommended preset
+Sandbox sa predvolene nespúšťa, pretože môže byť podstatne dlhší.
+
+Voliteľne:
+
+
+
+☐ Include Web Sandbox
+☐ Include Research Sandbox
+☐ Include Blender Sandbox
+Detailed Full Optimize
+
+
+1. Preflight and hardware fingerprint
+2. Capability discovery
+3. Memory estimation
+4. Detailed runtime optimization
+5. Detailed context exploration
+6. Full Quality Lab
+7. Selected Sandbox Tasks
+8. Interaction retest
+9. Top-3 repeated validation
+10. Pareto frontier
+11. Recommended presets
+Complete Model Evaluation
+To už nie je iba runtime optimize:
+
+
+
+Performance
+Quality
+Context
+Sandbox
+Reliability
+Efficiency
+Výsledkom nie je jeden víťaz, ale viac presetov:
+
+
+
+Fastest
+Best Balanced
+Best Quality
+Largest Usable Context
+Lowest Memory
+Best Coding
+Best Research
+Best Creative/Sandbox
+8. Model Recommender
+Toto môže byť ďalšia samostatná obrazovka.
+
+
+
+Recommend Models
+Používateľ zadá
+
+
+Use case
+Minimum acceptable tok/s
+Minimum context
+VRAM-only / hybrid allowed
+Maximum RAM
+Quality preference
+Model size preference
+Vision required
+Tool calling required
+Reasoning required
+Výstup
+
+
+GPU-resident recommendations
+Hybrid interactive recommendations
+Quality-first recommendations
+Models already installed
+Models available for download
+Confidence based on local/community data
+Potom:
+
+
+
+Benchmark recommendation
+Optimize recommendation
+Compare top 2
+Recommender iba navrhne kandidátov. Reálny lokálny benchmark rozhodnutie overí.
+
+9. Web UI, ktoré by som vylepšil
+Hlavná navigácia
+
+
+Dashboard
+Models
+Benchmark
+Optimize
+Context
+Quality
+Sandbox
+Duel
+Recommendations
+Results
+Settings
+Nedával by som všetko na jednu stránku.
+
+Dashboard
+Horné karty:
+
+
+
+LM Studio status
+Loaded model
+Current preset
+VRAM/RAM usage
+Last benchmark
+Best known configuration
+Quick actions:
+
+
+
+Quick Benchmark
+Optimize Loaded Model
+Test Maximum Context
+Run Quality Check
+Start Duel
+Recent runs
+Pri každom:
+
+
+
+mode
+model
+status
+score
+tok/s
+context
+time
+Open Report
+Resume
+Model Detail
+Po kliknutí na model:
+
+Overview
+
+
+Architecture
+Quantization
+File size
+Parameter count
+Format
+Max model context
+Capabilities
+Presets
+
+
+Current
+Fastest
+Balanced
+Quality
+Long Context
+Custom
+History
+Grafy:
+
+
+
+decode TPS vs. context
+prompt TPS vs. context
+VRAM vs. context
+quality vs. context
+quality vs. speed
+Actions
+
+
+Benchmark
+Optimize
+Context Test
+Quality Test
+Sandbox
+Add to Duel
+Experiment Builder
+Spoločný wizard pre všetky režimy.
+
+Step 1: Mode
+
+
+Quick benchmark
+Runtime optimize
+Context explore
+Quality test
+Sandbox
+Duel
+Full optimize
+Step 2: Model
+Jeden model alebo dva pri dueli.
+
+Step 3: Scope
+Checkboxy jednotlivých testov.
+
+Step 4: Budget
+Namiesto odhadu času zobraz hlavne rozsah práce:
+
+
+
+Max configurations
+Repetitions
+Max generated tokens
+Max repairs
+Stop below tok/s
+Memory safety limit
+Step 5: Review
+
+
+What will be changed
+What remains fixed
+Expected number of candidates
+Failure conditions
+Resume/checkpoint enabled
+10. Výsledky nesmú byť iba jedno číslo
+Hlavný report:
+
+
+
+Performance
+Quality
+Reliability
+Context
+Memory
+Efficiency
+Sandbox
+Pareto graf
+Napríklad:
+
+
+
+X = quality
+Y = decode TPS
+bubble size = VRAM
+color = context
+Kontextový report
+
+
+Max allocated
+Max stable
+Max >= 1 tok/s
+Max retrieval-passing
+Recommended
+Config comparison
+
+
+Requested config
+Applied config
+Difference from baseline
+Performance delta
+Memory delta
+Quality delta
+11. Odporúčaná interná architektúra
+
+
+lm_optimizer/
+├─ workflows/
+│  ├─ quick_benchmark.py
+│  ├─ runtime_optimization.py
+│  ├─ context_explorer.py
+│  ├─ quality_lab.py
+│  ├─ sandbox_suite.py
+│  ├─ model_duel.py
+│  └─ full_optimization.py
+│
+├─ quality/
+│  ├─ tasks/
+│  ├─ validators/
+│  ├─ scoring.py
+│  └─ reliability.py
+│
+├─ sandbox/
+│  ├─ web/
+│  ├─ research/
+│  ├─ blender/
+│  ├─ runner.py
+│  └─ isolation.py
+│
+├─ duel/
+│  ├─ controller.py
+│  ├─ blind_judge.py
+│  └─ comparison.py
+│
+├─ context/
+│  ├─ search.py
+│  ├─ fillers.py
+│  ├─ retrieval.py
+│  └─ thresholds.py
+│
+└─ ui/
+   ├─ dashboard/
+   ├─ experiments/
+   ├─ models/
+   ├─ results/
+   └─ settings/
+Dôležité je, aby workflow používali spoločné služby:
+
+
+
+ModelLoader
+BenchmarkRunner
+MetricsCollector
+ResultStore
+QualityValidator
+HardwareMonitor
+CheckpointManager
+Nie aby mal Duel vlastný spôsob merania TPS a Runtime Optimizer iný.
+
+12. Konkrétne profily pre UI
+Quick performance
+
+
+workflow: quick_benchmark
+warmups: 1
+repetitions: 2
+output_tokens: 256
+quality_checks: false
+sandbox: false
+Runtime fast
+
+
+workflow: runtime_optimization
+search_mode: fast
+context_mode: fixed
+context_length: 8192
+finalist_repetitions: 5
+quality_gate: compact
+Context maximum
+
+
+workflow: context_explorer
+growth_factor: 1.5
+refinement_resolution: 512
+minimum_decode_tps: 1.0
+fill_ratios: [0.0, 0.5, 0.9]
+retrieval_validation: true
+HTML only
+
+
+workflow: sandbox
+tasks:
+  - web
+repair_attempts: 2
+visual_validation: true
+functional_tests: true
+Sandbox complete
+
+
+workflow: sandbox
+tasks:
+  - web
+  - research
+  - blender
+repair_attempts: 2
+blind_evaluation: true
+Duel HTML only
+
+
+workflow: duel
+models:
+  - model_a
+  - model_b
+tasks:
+  - sandbox_web
+mode: controlled
+blind: true
+Full detailed
+
+
+workflow: full_optimization
+runtime: detailed
+context: detailed
+quality: full
+sandbox:
+  web: true
+  research: true
+  blender: true
+save_presets: true
+Najdôležitejšie produktové rozhodnutie
+Oddelil by som tri hlavné pojmy:
+
+
+
+Benchmark
+= iba meria aktuálnu konfiguráciu
+ 
+Optimize
+= hľadá lepšiu konfiguráciu jedného modelu
+ 
+Evaluate
+= meria kvalitu a praktické schopnosti modelu
+ 
+Duel
+= porovnáva dva modely alebo presets
+A Full Optimization ich iba spojí podľa zvoleného rozsahu.
+
+Tak bude môcť používateľ urobiť presne toto:
+
+
+
+„Chcem iba otestovať HTML schopnosť Bonsai.“
+„Chcem porovnať HTML Bonsai vs. Qwen.“
+„Chcem iba nájsť max context Qwen.“
+„Chcem optimalizovať runtime bez Sandboxu.“
+„Chcem kompletný test celého modelu.“
+Zároveň by som v UI premenoval dnešný všeobecný „Sandbox“ na Sandbox Lab a vnútri dal tri jasné karty:
+
+
+
+Web App
+Research
+3D Animation
+Pod nimi samostatné tlačidlá:
+
+
+
+Run Single Model
+Add to Duel
+Configure Task
+View Previous Results
+To zachová prehľadnosť a neskôr ti umožní pridať ďalšie tasky, napríklad Playwright coding, game prototype alebo data analysis, bez prerábania optimizer workflow.
+
+
+
+
+
+You said:
+a teraz z tohto celeho mi napis jeden orovsky detiaplny text co svetko sme riesili co si pisal co dam do opencode ako prilohu. uplne fakt detialne mi to daj co sme tu komplúet svetko thinkovalia  riesili a co chcem implementovat mat ako to ma fungovat atd
+Copilot said:
+Pripravím z toho jeden veľký „master specification“ dokument pre OpenCode, nie iba súhrn chatu. Zahrniem cieľ produktu, aktuálny stav, všetky režimy, LM Studio parametre, optimalizačný algoritmus, context search, quality scoring, Sandbox/Duel, Web UI, databázu, cross-platform pravidlá, stavy zlyhaní, priority implementácie aj akceptačné kritériá.
+
+
+Reasoned for 1s
+Hotovo. Vytvoril som jeden veľký master dokument v slovenčine, pripravený ako príloha pre OpenCode.
+
+Stiahnuť LM Studio Optimiser Master Specification
+
+Dokument má približne 1 760 riadkov a obsahuje:
+
+kompletnú víziu produktu,
+kontext tvojho hardvéru a modelov,
+rozdelenie Benchmark / Optimize / Evaluate / Sandbox / Duel,
+Quick, Standard, Detailed a Full režimy,
+kompletný plán LM Studio capability discovery,
+load-time a inference-time parametre,
+MTP a speculative decoding,
+requested vs. applied config,
+Fast a Detailed optimalizačný algoritmus,
+inteligentné prerezávanie search space,
+postupné testovanie parametrov a interakcií,
+hľadanie presného maximálneho kontextu, napríklad 76K namiesto iba 64K/128K,
+rozdelenie loadable, stable, speed-acceptable a quality-usable contextu,
+hranicu pod 1 tok/s a samostatný FAIL_TOO_SLOW,
+context fill testy a retrieval validáciu,
+skutočný TTFT namiesto odhadu,
+quality scoring a hard gates,
+HTML/Web Sandbox,
+Closed-book aj Open-web Research Sandbox,
+Blender/Minecraft-inspired Skyblock Sandbox,
+repair loop,
+controlled a best-profile duely,
+blind judging,
+Model Recommender,
+databázu komunitných benchmarkov a confidence triedy,
+rozdiely Windows/Linux/macOS,
+návrh Web UI,
+návrh priečinkovej architektúry,
+databázové entity,
+YAML príklady workflow,
+priority implementácie P0 až P6,
+akceptačné kritériá,
+presné pokyny pre OpenCode,
+požadovaný prvý výstup OpenCode auditu.
+Na konci dokument OpenCode výslovne usmerňuje, aby najskôr zanalyzoval existujúci repozitár aj necommitnuté zmeny, vytvoril gap analysis a implementačný plán, nie aby okamžite začal všetko prepisovať.

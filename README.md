@@ -134,6 +134,10 @@ python -m pytest -q
 |`python vram_matrix.py <model>`|12-config ctx×flash×KV fit/speed matrix|yes|
 |`resume-menu [--status] [--limit]`|interactive menu to resume paused/incomplete runs|no|
 |`judge <run_id> [--priority] [--vram-limit]`|AI-assisted model selection (second opinion)|no|
+|`lab context-explorer <model>`|1.5x context ladder + fill ratios + needle retrieval|yes|
+|`lab quality-lab <model> [--category C] [--seeds N]`|deterministic quality tasks, hard gates, reliability|yes|
+|`lab recommend [--min-tps N] [--min-context N] [--vram-only]`|model recommendations from the local fingerprint + local measurements|no|
+|`lab duel <model-a> <model-b> [--type T] [--mode M]`|controlled/best-profile duel, blind A/B judging|yes|
 
 Benchmark styles: `precise` (code/math temp 0.1), `balanced` (suite defaults),
 `creative` (summarization temp 0.9). Every command first unloads stale models and
@@ -230,6 +234,79 @@ checkpoint presence, phase/cursor, last progress and a safe-to-resume hint.
 Failed-run reports group errors by normalized signature with per-signature
 durations and a repeat-failure circuit-breaker verdict (flash-specific
 failures never trip it).
+
+**Granular test modes (v1.6.x).** One-purpose runs for quick answers, all
+following the same `*-only` pattern (`--mtp-test` / `--reasoning-sweep`
+remain accepted aliases of `--mtp-only` / `--reasoning-only`):
+
+```bash
+lm-optimizer optimize <model> --speed-only --context 16384  # only speed probes, context pinned
+lm-optimizer optimize <model> --quality-only                # quality battery on the default config
+lm-optimizer optimize <model> --mtp-only --context 16384    # only the speculative/MTP probes
+lm-optimizer optimize <model> --reasoning-only --max-context 16384  # reasoning off/low/medium/high/xhigh
+```
+
+Modes compose onto the phase-skip machinery (each `*-only` derives its
+required `--skip-phases` set automatically), so `resume` keeps the mode, the
+pre-flight summary shows the real plan and no winner is fabricated without
+the quality phase. `--context` is required with `--speed-only` / `--mtp-only`
+(it pins the probe context, clamped to the model's advertised limit);
+`--max-context` controls the quality context for `--quality-only` /
+`--reasoning-only`, which measure the default (baseline) runtime. Mutually
+exclusive with each other by design. Batch runner for whole model families:
+`python tools/granular_suite.py` (sequential, job-lock aware, per-step
+timeout plus a stall watchdog that kills a step producing no log output for
+20 minutes, then reconciles the dead run). Known limits: `--test` /
+`--test-only` are preflight API surface only (not yet CLI-exposed) and the
+web start endpoint does not accept granular flags until the UI lands.
+
+**Cleanup (v1.6.x).** `cleanup.bat` one-click maintenance:
+archives the run history first (whole `optimizer.db` snapshot plus
+`data/reports` and `data/checkpoints` moved into `data/archive/cleanup_<ts>/`),
+then deletes all run/benchmark rows from the DB, `data/logs` contents and
+Python/test caches (`__pycache__`, `.pytest_cache`, `.ruff_cache`,
+`.mypy_cache`). It keeps LM Studio models, `data/presets`, the curated
+`results/` reports, the tuned presets and settings in the DB, and the archive
+files themselves; refuses to run while the job lock is held. Variants:
+`python tools/cleanup.py --dry-run` (inspect), `--logs-only` (no DB changes,
+also as `cleanup-logs-only.bat`). LM Studio models and everything outside
+the repo are never touched.
+
+**Lab workflows (v1.6.x).** `lm-optimizer lab` groups the four workflows
+that are NOT the runtime optimizer:
+
+- `lab context-explorer <model>` - real context capacity: 1.5x geometric
+  ladder (never power-of-two), binary refinement to 512 tokens, fill ratios
+  (fast 0/50/90 %, detailed 0/25/50/75/90/98 %) and needle retrieval at
+  5/25/50/75/95 %. A context that merely ALLOCATES is not reported as
+  usable. Decode speed below 1 tok/s is `FAIL_TOO_SLOW`, kept distinct from
+  OOM, with a 0.95-1.05 hysteresis band that gets re-measured.
+- `lab quality-lab <model>` - deterministic quality tasks (instruction,
+  coding, reasoning, structured JSON, Slovak, hallucination resistance)
+  with hard gates (empty output, exit code, required files, unit tests,
+  schema, exact functionality) evaluated BEFORE scoring - a broken output
+  can never win on appearance. Reliability is reported as mean / median /
+  worst / stdev / success rate over several seeds.
+- `lab recommend` - model recommendations for the detected fingerprint. Fit
+  is decided by FILE SIZE and bits/weight, never by parameter count
+  (Bonsai 27B Q1_0 fits a 6 GB card, Q4 27B does not), MoE models are
+  estimated from their ACTIVE parameters, and local measurements in the
+  database outrank community priors.
+- `lab duel <model-a> <model-b>` - controlled (identical context, sampling,
+  seed) or best-profile duel with blind A/B judging; the judge never sees
+  the model identity and may not be one of the candidates.
+
+**Verified LM Studio capability boundaries (probed 2026-10-21).** This
+build accepts the whole `speculative_draft_*` family over REST
+(`speculative_draft_mtp`, `_simple`, `_model`, `_min_tokens`,
+`_min_continue_probability`, `_max_tokens`). KV cache quantization
+(`llama_k_cache_quantization_type` and every other spelling), CPU threads
+(`cpu_threads` / `threads` / `num_threads` / `n_threads`) and mmap
+(`try_mmap` / `keep_model_in_memory`) are **not** settable through REST
+here (400 `unrecognized_keys`) - they are runtime facts set in the GUI, so
+the optimizer records them instead of searching them. Draft-token counters
+are parsed from the chat stats when the server exposes them; when it does
+not, the MTP fields stay neutral (never fabricated).
 
 ## How it works (Phase-A strategy)
 

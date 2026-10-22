@@ -139,7 +139,9 @@ for route in ws_routes:
 
 for route in ws_router.routes:
     if not isinstance(route, APIRoute):
-        route.path = "/api" + route.path
+        # WebSocket routes keep their declared path ("/ws/optimize/{run_id}"):
+        # the UI connects to ws://host/ws/... without the /api prefix, and
+        # test_dashboard_api asserts the exact registered path.
         all_routes.append(route)
 
 # Add all routes to app
@@ -188,6 +190,12 @@ async def results_page(request: Request, run_id: str):
 async def settings_page(request: Request):
     """Settings page."""
     return templates.TemplateResponse(request, "settings.html")
+
+
+@app.get("/lab", response_class=HTMLResponse)
+async def lab_page(request: Request):
+    """Lab page: Context Explorer, Quality Lab, Recommender, Duel."""
+    return templates.TemplateResponse(request, "lab.html")
 
 
 @app.get("/results/{run_id}/configs/{config_id}", response_class=HTMLResponse)

@@ -2,6 +2,7 @@
 
 import json
 import sqlite3
+from contextlib import closing
 import tempfile
 from pathlib import Path
 from uuid import uuid4
@@ -45,7 +46,7 @@ def temp_db():
 def _create_test_run(db_path: Path, run_id: str, model_id: str = "test-model"):
     """Create a test run with configurations."""
     import json as _json
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.execute(
             """INSERT INTO runs (id, model_id, hardware_id, profile, profile_weights_json, quality_threshold,
                 status, stage, search_space_json, optimizer_version, benchmark_repetitions, validation_repetitions,
@@ -156,7 +157,7 @@ def test_get_judge_by_id(client, temp_db):
             "alternative_config_ids": [],
             "warnings": [],
         })
-        with sqlite3.connect(temp_db) as conn:
+        with closing(sqlite3.connect(temp_db)) as conn, conn:
             conn.execute(
                 "INSERT INTO judge_verdicts (id, run_ids_json, config_ids_json, use_case, custom_prompt, priority, backend, judge_model, verdict_json, prompt_tokens, completion_tokens, latency_ms, status, error_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (judge_id, '["run-1"]', '["cfg-1"]', "coding", None, "balanced", "heuristic", "heuristic", verdict_json, 1000, 500, 2000, "completed", None)
@@ -185,7 +186,7 @@ def test_get_judge_history(client, temp_db):
                 "overall_winner": {"model_id": f"model-{i}"},
                 "confidence": 0.8,
             })
-            with sqlite3.connect(temp_db) as conn:
+            with closing(sqlite3.connect(temp_db)) as conn, conn:
                 conn.execute(
                     "INSERT INTO judge_verdicts (id, run_ids_json, config_ids_json, use_case, custom_prompt, priority, backend, judge_model, verdict_json, prompt_tokens, completion_tokens, latency_ms, status, error_message, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (judge_id, f'["run-{i}"]', f'["cfg-{i}"]', "coding", None, "balanced", "heuristic", "heuristic", verdict_json, 1000, 500, 2000, "completed", None, f"2026-01-{i+1:02d}T00:00:00")

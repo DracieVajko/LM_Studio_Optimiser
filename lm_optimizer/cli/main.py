@@ -66,6 +66,12 @@ app = typer.Typer(
     add_completion=False,
 )
 
+# Lab workflows (Context Explorer, Quality Lab, Recommender, Duel) live in
+# their own module but are exposed under the same CLI.
+from lm_optimizer.cli import lab as _lab  # noqa: E402
+
+app.add_typer(_lab.app, name="lab")
+
 console = Console()
 logger = get_logger(__name__)
 
@@ -1174,17 +1180,43 @@ def _preflight_optimize(
         console.print("[red]--speed-only requires --context[/red]")
         sys.exit(2)
     if mtp_test and speed_only:
-        console.print("[red]Cannot use --mtp-test with --speed-only[/red]")
+        console.print("[red]Cannot use --mtp-only with --speed-only[/red]")
         sys.exit(2)
     if mtp_test and quality_only:
-        console.print("[red]Cannot use --mtp-test with --quality-only[/red]")
+        console.print("[red]Cannot use --mtp-only with --quality-only[/red]")
+        sys.exit(2)
+    if mtp_test and context is None:
+        console.print("[red]--mtp-only requires --context[/red]")
         sys.exit(2)
     if reasoning_sweep and speed_only:
-        console.print("[red]Cannot use --reasoning-sweep with --speed-only[/red]")
+        console.print("[red]Cannot use --reasoning-only with --speed-only[/red]")
         sys.exit(2)
-    if context is not None and not speed_only:
-        console.print("[red]--context only valid with --speed-only[/red]")
+    if reasoning_sweep and quality_only:
+        console.print("[red]Cannot use --reasoning-only with --quality-only[/red]")
         sys.exit(2)
+    if reasoning_sweep and mtp_test:
+        console.print("[red]Cannot use --reasoning-only with --mtp-only[/red]")
+        sys.exit(2)
+    if context is not None and not (speed_only or mtp_test):
+        console.print("[red]--context only valid with --speed-only or --mtp-only[/red]")
+        sys.exit(2)
+
+    # Granular test modes compose into the phase-skip machinery so the
+    # confirmation summary, the runner and the resume path share one plan.
+    granular_skips: set[str] = set()
+    if speed_only:
+        granular_skips |= {"quality", "recovery", "validation", "context"}
+    if quality_only:
+        granular_skips |= {"speed", "recovery", "validation", "context"}
+    if reasoning_sweep:
+        granular_skips |= {"speed", "recovery", "validation", "context"}
+    if mtp_test:
+        granular_skips |= {"quality", "recovery", "validation", "context"}
+    if granular_skips:
+        skips = sorted(set(skips) | granular_skips)
+    # Reasoning-only mode: the battery IS the 5-level reasoning sweep.
+    if reasoning_sweep:
+        include_categories = {"reasoning"}
 
     experimental_flags = _resolve_experimental_flags(
         enable_rope,
@@ -1344,13 +1376,17 @@ def optimize(
     ),
     mtp_test: bool = typer.Option(
         False,
+        "--mtp-only",
         "--mtp-test",
-        help="Enable speculative decoding (MTP) test",
+        help="Run only the speculative decoding (MTP) test "
+        "(--mtp-test kept as an alias)",
     ),
     reasoning_sweep: bool = typer.Option(
         False,
+        "--reasoning-only",
         "--reasoning-sweep",
-        help="Test all reasoning levels: off,low,medium,high,xhigh",
+        help="Run only the reasoning sweep (off,low,medium,high,xhigh); "
+        "--reasoning-sweep kept as an alias",
     ),
 ):
     """Optimize a model configuration."""
@@ -1418,6 +1454,11 @@ def optimize(
         skip_phases, physical_batches,
         enable_rope, enable_cpu_moe, enable_speculative,
         yes, non_interactive, dry_run,
+        speed_only=speed_only,
+        quality_only=quality_only,
+        context=context,
+        mtp_test=mtp_test,
+        reasoning_sweep=reasoning_sweep,
     )
 
     if not _preflight_confirm(effective, dry_run, yes, non_interactive):
@@ -1499,6 +1540,17 @@ def optimize(
             if effective["physical_batches"]:
                 advanced["physical_batches"] = effective["physical_batches"]
 
+            # Granular test selection must reach the service AND the persisted
+            # run: resume() rebuilds BenchmarkService from run.advanced_settings,
+            # so dropping these keys would silently turn a resumed granular run
+            # back into a full campaign.
+            advanced["speed_only"] = bool(speed_only)
+            advanced["quality_only"] = bool(quality_only)
+            advanced["mtp_test"] = bool(mtp_test)
+            advanced["reasoning_sweep"] = bool(reasoning_sweep)
+            if context is not None:
+                advanced["speed_context"] = int(context)
+
             console.print(f"[bold]Starting optimization for {model}[/bold]")
             console.print(f"  Profile: {profile}")
             console.print(f"  Quality threshold: {quality_threshold}")
@@ -1540,6 +1592,13 @@ def optimize(
                 model_info=model_info,
                 sort=report_sort,
             )
+            run_status = str(getattr(result, "status", "") or "")
+            if run_status == "failed":
+                # Hard run-level failure (no config produced usable output).
+                # Nonzero exit so unattended runners (granular suite) can
+                # distinguish it from a soft no-winner outcome (rc=0).
+                console.print("[red]Run failed; exiting with code 3.[/red]")
+                sys.exit(3)
 
             # Fail-closed post-hygiene: the host must be clean for whatever runs next.
             try:
@@ -3440,7 +3499,19 @@ def resume(
             console.print("[bold]Resuming optimization[/bold]")
             console.print(f"Completed:\n{len(completed)} configurations")
             hardware = hardware_detector.detect()
-            benchmark_service = BenchmarkService(client, style=style)
+            # Granular runs must resume as granular runs: the flags were
+            # persisted into run.advanced_settings at start.
+            adv = run.advanced_settings or {}
+            benchmark_service = BenchmarkService(
+                client,
+                style=style,
+                include_categories=adv.get("include_categories"),
+                speed_only=bool(adv.get("speed_only")),
+                quality_only=bool(adv.get("quality_only")),
+                speed_context=adv.get("speed_context"),
+                mtp_test=bool(adv.get("mtp_test")),
+                reasoning_sweep=bool(adv.get("reasoning_sweep")),
+            )
             quality_evaluator = QualityEvaluator(QualityConfig(minimum_score=run.quality_threshold))
             search_generator = SearchSpaceGenerator(client)
             optimizer = AdaptiveOptimizer(
@@ -3870,7 +3941,19 @@ def _run_resume(run_id: str, revalidate: bool, style: str, skip_phases: str | No
             console.print("[bold]Resuming optimization[/bold]")
             console.print(f"Completed:\n{len(completed)} configurations")
             hardware = hardware_detector.detect()
-            benchmark_service = BenchmarkService(client, style=style)
+            # Granular runs must resume as granular runs: the flags were
+            # persisted into run.advanced_settings at start.
+            adv = run.advanced_settings or {}
+            benchmark_service = BenchmarkService(
+                client,
+                style=style,
+                include_categories=adv.get("include_categories"),
+                speed_only=bool(adv.get("speed_only")),
+                quality_only=bool(adv.get("quality_only")),
+                speed_context=adv.get("speed_context"),
+                mtp_test=bool(adv.get("mtp_test")),
+                reasoning_sweep=bool(adv.get("reasoning_sweep")),
+            )
             quality_evaluator = QualityEvaluator(QualityConfig(minimum_score=run.quality_threshold))
             search_generator = SearchSpaceGenerator(client)
             optimizer = AdaptiveOptimizer(

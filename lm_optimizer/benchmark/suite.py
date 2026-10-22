@@ -150,8 +150,8 @@ def create_benchmark_cases(
         include_categories: Optional set of categories to include. 
             If None, includes all categories. Valid categories: 
             "instruction", "reasoning", "context", "coding", "format".
-        reasoning_sweep: If True, creates 5 variants of reasoning tests 
-            with different temperature settings (off, low, medium, high, xhigh).
+        reasoning_sweep: If True, the battery becomes ONLY reasoning tests,
+            each at 5 levels (temperature off, low, medium, high, xhigh).
     """
     # Define reasoning temperature sweep levels
     REASONING_LEVELS = {
@@ -165,7 +165,12 @@ def create_benchmark_cases(
     # If include_categories is None or empty, include all categories
     if not include_categories:
         include_categories = {"instruction", "reasoning", "context", "coding", "format"}
-    
+
+    # Reasoning-only sweep: the battery IS the 5-level reasoning sweep, so
+    # non-reasoning categories are excluded entirely (granular test mode).
+    if reasoning_sweep:
+        include_categories = {"reasoning"}
+
     cases = []
 
     for bp in BENCHMARK_SUITE:

@@ -81,21 +81,22 @@ def test_reasoning_sweep_creates_5_variants_per_base():
     assert names == expected
 
 
-def test_reasoning_sweep_all_categories():
-    """Test reasoning_sweep with all categories - only reasoning tests get variants."""
+def test_reasoning_sweep_replaces_battery():
+    """reasoning_sweep is the granular reasoning-only mode (2026-10-20 change).
+
+    Previously the flag added 5 reasoning variants ON TOP of the other
+    categories. As a granular test mode it now REPLACES the battery: only the
+    reasoning tests, each at 5 temperature levels.
+    """
     cases = create_benchmark_cases(
         4096,
-        include_categories=None,  # all categories
+        include_categories=None,  # ignored: sweep restricts to reasoning
         reasoning_sweep=True,
     )
-    # 4 normal tests + 5 reasoning variants = 9 total
-    assert len(cases) == 9
+    # 5 temperature levels (off/low/medium/high/xhigh) of the reasoning test.
+    assert len(cases) == 5
     names = {c.name for c in cases}
     expected = {
-        "short_instruction",
-        "long_context",
-        "coding_task",
-        "structured_output",
         "medium_reasoning_off",
         "medium_reasoning_low",
         "medium_reasoning_medium",
@@ -103,6 +104,7 @@ def test_reasoning_sweep_all_categories():
         "medium_reasoning_xhigh",
     }
     assert names == expected
+    assert all(c.category == "reasoning" for c in cases)
 
 
 def test_reasoning_sweep_temperature_per_level():

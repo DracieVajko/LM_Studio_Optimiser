@@ -579,6 +579,13 @@ class ConfigurationRepository:
                     "output_text": m.output_text,
                     "thinking_text": m.thinking_text,
                     "prompt": m.prompt,
+                    "draft_tokens_proposed": m.draft_tokens_proposed,
+                    "draft_tokens_accepted": m.draft_tokens_accepted,
+                    "acceptance_rate": m.acceptance_rate,
+                    "speedup_ratio": m.speedup_ratio,
+                    "draft_vram_delta_mb": m.draft_vram_delta_mb,
+                    "draft_ram_delta_mb": m.draft_ram_delta_mb,
+                    "draft_ttft_delta_ms": m.draft_ttft_delta_ms,
                 }
                 for m in config.metrics
             ]

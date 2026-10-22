@@ -47,6 +47,10 @@ CHAT_TIMEOUT_FLOOR_S = 300.0
 
 # Candidate load keys with type-correct probe values (reasoning_budget_message
 # is a string; numbers are rejected with invalid_type, not unrecognized_keys).
+#
+# Speculative/MTP keys: probed with values that pass validation so a
+# "recognized key" (404 model_not_found) is distinguishable from a
+# "recognized key, bad value" (400 invalid_request) - both mean supported.
 _PROBE_VALUES: dict[str, object] = {
     "context_length": 512,
     "flash_attention": True,
@@ -58,6 +62,11 @@ _PROBE_VALUES: dict[str, object] = {
     "reasoning_budget_message": "",
     "num_experts": 8,
     "speculative_draft_max_tokens": 8,
+    "speculative_draft_min_tokens": 0,
+    "speculative_draft_min_continue_probability": 0.0,
+    "speculative_draft_mtp": True,
+    "speculative_draft_simple": False,
+    "speculative_draft_model": "",
     "gpu_ratio": 0.5,
     "rope_freq_base": 10000.0,
     "rope_freq_scale": 1.0,
@@ -278,6 +287,17 @@ class LMStudioClient:
         caps.supports_context_checkpoints = "context_checkpoints" in accepted
         caps.supports_num_experts = "num_experts" in accepted
         caps.supports_rope_scaling = "rope_freq_base" in accepted
+        caps.supports_speculative_draft = bool(
+            accepted
+            & {
+                "speculative_draft_max_tokens",
+                "speculative_draft_min_tokens",
+                "speculative_draft_min_continue_probability",
+                "speculative_draft_simple",
+                "speculative_draft_model",
+            }
+        )
+        caps.supports_speculative_mtp = "speculative_draft_mtp" in accepted
 
     async def _probe_load_parameters(self) -> None:
         """Probe which load parameters are supported.

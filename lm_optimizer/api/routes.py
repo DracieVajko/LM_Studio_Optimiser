@@ -2,6 +2,7 @@
 
 import asyncio
 import sqlite3
+import statistics
 from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException
@@ -1858,6 +1859,221 @@ async def judge_history(limit: int = 20):
                 overall_winner_model=verdict.get("overall_winner", {}).get("model_id"),
             ))
         return results
+
+
+# --- Lab workflows (P2-P5) ------------------------------------------------
+
+
+@router.get("/lab/recommend")
+async def lab_recommend(
+    min_tps: float = 5.0,
+    min_context: int = 8192,
+    vram_only: bool = False,
+    use_case: str = "general",
+):
+    """Model recommendations for the detected hardware.
+
+    Fit is decided by file size and bits/weight (never parameter count) and
+    local measurements in the database outrank community priors.
+    """
+    from lm_optimizer.services.recommender import (
+        Confidence,
+        HardwareFingerprint,
+        ModelCatalogEntry,
+        ModelRecommender,
+        RecommenderRequest,
+        UseCase,
+    )
+    from lm_optimizer.services.hardware import hardware_detector
+
+    try:
+        hw_info = hardware_detector.detect()
+    except Exception:
+        hw_info = None
+
+    gpu = None
+    if hw_info is not None and getattr(hw_info, "gpus", None):
+        gpu = max(hw_info.gpus, key=lambda g: getattr(g, "vram_gb", 0) or 0)
+
+    hardware = HardwareFingerprint(
+        gpu_name=(getattr(gpu, "name", "") or ""),
+        vram_gb=float(getattr(gpu, "vram_gb", 0) or 0),
+        gpu_bandwidth_gbps=float(getattr(gpu, "bandwidth_gbps", 0) or 0),
+        gpu_tdp_w=float(getattr(gpu, "tdp_w", 0) or 0),
+        cpu_name=(getattr(hw_info, "cpu_name", "") or ""),
+        physical_cores=int(getattr(hw_info, "cpu_cores_physical", 0) or 0),
+        logical_threads=int(getattr(hw_info, "cpu_cores_logical", 0) or 0),
+        ram_gb=float(getattr(hw_info, "total_ram_gb", 0) or 0),
+        ram_channels=int(getattr(hw_info, "ram_channels", 1) or 1),
+        disk_type=(getattr(hw_info, "disk_type", "") or ""),
+        os_name=(getattr(hw_info, "os", "") or ""),
+    )
+
+    catalog = _lab_catalog()
+    recommender = ModelRecommender(catalog=catalog)
+    for model_id, (tps, run_id, ctx) in _local_measurements().items():
+        recommender.add_local_measurement(model_id, tps, run_ids=[run_id], context_length=ctx)
+
+    try:
+        use = UseCase(use_case)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Unknown use case: {use_case}")
+
+    request = RecommenderRequest(
+        hardware=hardware,
+        use_case=use,
+        min_tps=min_tps,
+        min_context=min_context,
+        vram_only=vram_only,
+    )
+    results = recommender.recommend(request)
+    return {
+        "hardware": hardware.as_dict(),
+        "recommendations": [r.as_dict() for r in results],
+    }
+
+
+@router.get("/lab/quality-tasks")
+async def lab_quality_tasks():
+    """The deterministic quality task library (P3)."""
+    from lm_optimizer.services.quality_lab import default_tasks
+
+    return {
+        "tasks": [
+            {
+                "id": t.id,
+                "category": t.category.value,
+                "prompt": t.prompt,
+                "validators": [v.kind.value for v in t.validators],
+                "hard_gates": [g.kind.value for g in t.hard_gates],
+                "max_tokens": t.max_tokens,
+            }
+            for t in default_tasks()
+        ]
+    }
+
+
+@router.get("/lab/duel-types")
+async def lab_duel_types():
+    """Available duel types and their task sets (P4)."""
+    from lm_optimizer.services.duel import DUEL_TASKS, DuelType
+
+    return {
+        "types": [
+            {"id": t.value, "tasks": list(DUEL_TASKS[t])} for t in DuelType
+        ]
+    }
+
+
+def _local_measurements() -> dict[str, tuple[float, str, int | None]]:
+    """Latest measured median tok/s per model (local evidence).
+
+    The context the measurement was taken at is returned as well: a 9 tok/s
+    result at 4096 tokens is NOT comparable with a 9 tok/s result at 16384.
+    """
+    import json
+    import sqlite3
+
+    from lm_optimizer.config import config
+
+    db_path = config.storage.database_path
+    if not db_path or not db_path.exists():
+        return {}
+    out: dict[str, tuple[float, str, int | None]] = {}
+    try:
+        con = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True)
+        con.row_factory = sqlite3.Row
+        runs = con.execute(
+            "SELECT id, model_id, created_at FROM runs "
+            "WHERE status IN ('completed_no_validated_winner','success','completed') "
+            "ORDER BY created_at DESC"
+        ).fetchall()
+        seen: set[str] = set()
+        for run in runs:
+            model_id = run["model_id"]
+            if model_id in seen:
+                continue
+            speeds: list[float] = []
+            contexts: list[int] = []
+            for cfg in con.execute(
+                "SELECT metrics_json, context_length FROM configurations "
+                "WHERE run_id=? AND status='passed'",
+                (run["id"],),
+            ):
+                raw = cfg["metrics_json"]
+                if raw:
+                    try:
+                        for t in json.loads(raw):
+                            g = t.get("generation_tok_s")
+                            if isinstance(g, (int, float)) and t.get("category") == "speed":
+                                speeds.append(g)
+                    except Exception:
+                        continue
+                if cfg["context_length"]:
+                    contexts.append(int(cfg["context_length"]))
+            if len(speeds) >= 4:
+                ctx = max(contexts) if contexts else None
+                out[model_id] = (statistics.median(speeds), run["id"], ctx)
+                seen.add(model_id)
+        con.close()
+    except Exception as e:  # noqa: BLE001
+        logger.debug("lab local measurement load failed", error=str(e))
+    return out
+
+
+def _lab_catalog() -> list:
+    """Curated catalog for the recommender (mirrors the CLI catalogue)."""
+    from lm_optimizer.services.recommender import Confidence, ModelCatalogEntry
+
+    def entry(**kw):
+        base = dict(
+            repository="",
+            filename="",
+            architecture="qwen35",
+            quant="",
+            bits_per_weight=4.0,
+            file_size_gb=0.0,
+            total_params_b=0.0,
+            max_context=262144,
+            capabilities=["chat", "tools"],
+            confidence=Confidence.C,
+        )
+        base.update(kw)
+        return ModelCatalogEntry(**base)
+
+    return [
+        entry(repository="lmstudio-community", filename="bonsai-q1_0.gguf", quant="Q1_0",
+              bits_per_weight=1.0, file_size_gb=4.4, total_params_b=27.0,
+              model_id="prism-ml/bonsai-27b",
+              capabilities=["chat", "tools", "vision"]),
+        entry(repository="empero-ai", filename="qwen3.8-9b-q4_km.gguf", quant="Q4_K_M",
+              bits_per_weight=4.0, file_size_gb=5.8, total_params_b=9.0,
+              model_id="qwen3.8-9b-distill"),
+        entry(repository="bartowski", filename="Qwen3.8-27B-IQ3_XS.gguf", quant="IQ3_XS",
+              bits_per_weight=3.0, file_size_gb=12.8, total_params_b=27.0,
+              model_id="swift-qwen3.8-27b",
+              capabilities=["chat", "tools", "vision"]),
+        entry(repository="openai", filename="gpt-oss-20b-mxfp4.gguf", quant="MXFP4",
+              bits_per_weight=4.0, file_size_gb=12.1, total_params_b=21.0,
+              active_params_b=3.6, max_context=131072,
+              model_id="openai/gpt-oss-20b",
+              capabilities=["chat", "tools", "reasoning"]),
+        entry(repository="mradermacher", filename="gpt-oss-20b-heretic-q4_ks.gguf",
+              quant="Q4_K_S", bits_per_weight=4.0, file_size_gb=14.7, total_params_b=21.0,
+              active_params_b=3.6, max_context=131072,
+              model_id="openai-gpt-oss-20b-claude-4.5-opus-heretic-uncensored-i1",
+              capabilities=["chat", "tools", "reasoning"]),
+        entry(repository="qwen", filename="qwen3-coder-30b-q4_km.gguf", quant="Q4_K_M",
+              bits_per_weight=4.0, file_size_gb=18.6, total_params_b=30.5,
+              active_params_b=3.3, architecture="qwen3moe",
+              model_id="qwen/qwen3-coder-30b",
+              capabilities=["chat", "tools"]),
+        entry(repository="qwen", filename="qwen3.6-35b-a3b-q4_km.gguf", quant="Q4_K_M",
+              bits_per_weight=4.0, file_size_gb=22.1, total_params_b=35.0,
+              active_params_b=3.0, architecture="qwen35moe",
+              model_id="qwen/qwen3.6-35b-a3b",
+              capabilities=["chat", "tools"]),
+    ]
 
 
 # Import logger

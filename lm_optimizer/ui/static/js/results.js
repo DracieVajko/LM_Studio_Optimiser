@@ -1203,7 +1203,7 @@ const ResultsPage = {
             });
         });
 
-        
+    },
 
     async loadGenerationProfiles() {
         const box = document.getElementById('gen-profiles');

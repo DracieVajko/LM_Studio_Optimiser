@@ -235,6 +235,27 @@ def phase_skips_of(advanced_settings) -> set[str]:
         return set()
 
 
+def granular_quality_frontier(
+    skips: set[str], advanced: dict | None, baseline_result
+) -> dict:
+    """Frontier for quality-only / reasoning-only runs (speed phase skipped).
+
+    Granular quality modes have no speed frontier; the baseline (anchor)
+    config becomes the single candidate so the quality battery still measures
+    something meaningful. Returns the frontier dict (empty finalists when no
+    baseline is available).
+    """
+    frontier = {"winner": None, "finalists": [], "contrarian": None}
+    if "speed" not in skips:
+        return frontier
+    adv = advanced or {}
+    if not (adv.get("quality_only") or adv.get("reasoning_sweep")):
+        return frontier
+    if baseline_result is not None:
+        frontier["finalists"] = [baseline_result]
+    return frontier
+
+
 def run_skip_phases(run) -> set[str]:
     """Skip set for a persisted run: memory first, DB fallback.
 
@@ -1546,6 +1567,8 @@ class AdaptiveOptimizer:
         ):
             logger.info("Skipping flash-off config (server requires flash)")
             return None
+        if self._unverified_unload_block():
+            return None
         t0 = time.perf_counter()
 
         def _stamp(res: ConfigurationResult) -> ConfigurationResult:
@@ -2124,6 +2147,30 @@ class AdaptiveOptimizer:
             flash_required=bool(self.state.flash_required),
         )
 
+    async def _granular_baseline_or_none(
+        self, model: ModelIdentity, baseline_config, skips: set[str]
+    ):
+        """Anchor config for the run; granular fallback keeps quality modes alive.
+
+        A cold server (nothing loaded) yields no capturable baseline; plain
+        campaigns survive because the speed plan seeds from defaults. Granular
+        quality modes (quality-only / reasoning-only) have no speed phase, so
+        with no anchor they would end instantly with an empty frontier
+        (n=0, Run FAILED). Fail-safe: use the S0 default anchor as baseline.
+        """
+        if baseline_config is not None:
+            return baseline_config
+        captured = await self._capture_baseline_config(model)
+        if captured is not None:
+            return captured
+        if "speed" in skips:
+            self._log_event(
+                "Baseline fallback",
+                "model not loaded; S0 default anchor used as quality baseline",
+            )
+            return self._default_anchor()
+        return None
+
     def _default_anchor(self) -> LoadConfiguration:
         """S0 anchor: captured as-loaded config, else server defaults."""
         ctx = self.state.speed_context or 2048
@@ -2149,6 +2196,39 @@ class AdaptiveOptimizer:
     @staticmethod
     def _candidate_key(cfg: LoadConfiguration) -> tuple:
         return tuple(sorted((k, v) for k, v in cfg.to_dict().items()))
+
+    def _unverified_unload_block(self) -> bool:
+        """Cancel BEFORE the next load when the previous unload is unverified.
+
+        Fail-closed: a leftover model that could not be verified unloaded is
+        still holding memory (or the endpoint state is unverifiable). Loading
+        another memory-heavy candidate would repeat the resource-guardrail
+        cascade (observed as load-failed storm in the Fable 27B campaign).
+        ``cancel()`` checkpoints everything measured so far; results, errors
+        and the checkpoint file are preserved for resume/inspection.
+        """
+        flag = getattr(self.benchmark, "last_unverified_unload", None)
+        if not (isinstance(flag, str) and flag):
+            return False
+        model = flag
+        try:
+            self.benchmark.last_unverified_unload = None
+        except Exception:
+            pass
+        self._log_event(
+            "UNLOAD_UNVERIFIED",
+            f"model={model} unload could not be verified; stopping before "
+            "next memory-heavy load (results checkpointed)",
+        )
+        try:
+            self.state.errors.append(
+                f"unload_not_verified: {model} still occupying memory; "
+                "refusing further memory-heavy loads"
+            )
+        except Exception:
+            pass
+        self.cancel()
+        return True
 
     async def _record_probe_result(
         self, result: ConfigurationResult, context_length: int
@@ -2198,6 +2278,8 @@ class AdaptiveOptimizer:
             self._log_event(
                 "RESUME_SKIP probe_completed", f"key attempts exhausted for {item.stage}"
             )
+            return None
+        if self._unverified_unload_block():
             return None
         # Same host guard as the full-suite path: a foreign load poisons a
         # speed probe just as badly as a quality run.
@@ -2296,6 +2378,20 @@ class AdaptiveOptimizer:
         anchor = self._default_anchor()
         caps = self._speed_caps()
         plan, notes = build_speed_plan(anchor, speed_ctx, caps)
+        if getattr(self.benchmark, "mtp_test", None) is True:
+            # MTP-only mode: keep S0 (budget classification) plus the
+            # speculative/MTP probes; everything else is out of scope.
+            plan = plan[:1] + [
+                p for p in plan[1:] if str(p.stage).upper().startswith(("S1", "S2"))
+            ]
+            notes = list(notes)
+            spec_n = len(plan) - 1
+            notes.append(
+                f"MTP-only mode: {spec_n} speculative probe(s) retained"
+                if spec_n
+                else "MTP-only mode: no draft model discovered - S0 only, "
+                "speculative path not auto-probed"
+            )
         self.state.excluded_notes = notes
         self.state.planned_total = len(plan) + 2
         # Checkpoint BEFORE DB save so checkpoint phase >= DB stage on crash
@@ -2980,7 +3076,18 @@ class AdaptiveOptimizer:
 
         model = self.state.run.model
         user_cap = (advanced_settings or {}).get("max_context")
-        speed_ctx = speed_context_for(user_cap, model.context_limit)
+        # Granular modes may pin the speed context explicitly (--speed-only /
+        # --mtp-only --context N). An explicit value wins over the derived one
+        # and is clamped to the model's advertised context limit.
+        explicit_speed = (advanced_settings or {}).get("speed_context")
+        if explicit_speed:
+            try:
+                limit = int(getattr(model, "context_limit", 0) or 0)
+                speed_ctx = min(max(256, int(explicit_speed)), limit or int(explicit_speed))
+            except (TypeError, ValueError):
+                speed_ctx = speed_context_for(user_cap, model.context_limit)
+        else:
+            speed_ctx = speed_context_for(user_cap, model.context_limit)
         quality_ctx = quality_context_for(user_cap, model.context_limit, speed_ctx)
         self.state.speed_context = speed_ctx
         self.state.quality_context = quality_ctx
@@ -2993,7 +3100,8 @@ class AdaptiveOptimizer:
         run_repo.save(self.state.run)
 
         # Anchor source only (no expensive baseline benchmark; S0 is the anchor).
-        captured = baseline_config or await self._capture_baseline_config(model)
+        skips = phase_skips_of(advanced_settings)
+        captured = await self._granular_baseline_or_none(model, baseline_config, skips)
         if captured is not None and self.state.baseline_result is None:
             self.state.baseline_result = ConfigurationResult(
                 config=captured,
@@ -3004,7 +3112,6 @@ class AdaptiveOptimizer:
             "Phase A contexts frozen", f"speed={speed_ctx} quality={quality_ctx}"
         )
 
-        skips = phase_skips_of(advanced_settings)
         if skips:
             self._log_event(
                 "Phase skips active", f"skipped: {', '.join(sorted(skips))}"
@@ -3012,7 +3119,14 @@ class AdaptiveOptimizer:
 
         if "speed" in skips:
             self._log_event("Phase SPEED skipped", "--skip-phases")
-            frontier = {"winner": None, "finalists": [], "contrarian": None}
+            frontier = granular_quality_frontier(
+                skips, advanced_settings, self.state.baseline_result
+            )
+            if frontier["finalists"]:
+                self._log_event(
+                    "QUALITY candidates from baseline",
+                    "granular mode without speed phase: baseline config only",
+                )
         else:
             frontier = await self._phase_speed()
         if self.state.should_cancel:
@@ -3756,7 +3870,14 @@ class AdaptiveOptimizer:
             )
         if "speed" in skips:
             self._log_event("Phase SPEED skipped", "--skip-phases")
-            frontier = {"winner": None, "finalists": [], "contrarian": None}
+            frontier = granular_quality_frontier(
+                skips, self.state.run.advanced_settings, self.state.baseline_result
+            )
+            if frontier["finalists"]:
+                self._log_event(
+                    "QUALITY candidates from baseline",
+                    "granular mode without speed phase: baseline config only",
+                )
         else:
             frontier = await self._phase_speed()
         if self.state.should_cancel:

@@ -2,6 +2,7 @@
 
 import json
 import sqlite3
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -47,7 +48,7 @@ class JudgeService:
 
         run_ids_quoted = ",".join(f"'{r}'" for r in run_ids)
 
-        with sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True) as conn:
+        with closing(sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)) as conn, conn:
             conn.row_factory = sqlite3.Row
 
             # Get run metadata
@@ -202,7 +203,7 @@ class JudgeService:
         """Save verdict to database."""
         verdict_id = str(uuid4())
 
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
             conn.execute(
                 """
                 INSERT INTO judge_verdicts (
