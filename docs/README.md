@@ -31,17 +31,27 @@
 
 ## Not yet implemented (honest list)
 
-- **Browser/Blender sandbox execution**: the task definitions, acceptance
-  criteria, repair loop and the isolated-workdir runner exist
-  (`sandbox_lab.py`, `sandbox_runner.py`, CLI `lab sandbox`), but the
-  Playwright functional tests, the responsive screenshots and the Blender
-  render validation are not wired up yet - the web task is validated by
-  static criteria only.
-- **Populated community benchmark database**: the schema, the confidence
-  grades and 20+ curated records ship in `community_benchmarks.py`; there
-  is no import path for a larger crawl.
+- **Real browser rendering**: the web sandbox validates the produced HTML
+  statically (stdlib `html.parser` + `node --check`): viewport, title,
+  single h1, media queries, external resources, image alt text, input
+  labels and inline JS syntax (`web_validator.py`, wired into
+  `sandbox_runner.py`). Actual layout rendering, screenshots, computed
+  contrast and click-through functional tests need a browser engine
+  (Playwright) which the project deliberately does not depend on.
+- **Blender render validation**: the task definition and acceptance
+  criteria exist (`sandbox_lab.BLENDER_TASK`), and the runner executes a
+  `blender --background --python` command when Blender is on PATH; the
+  artifact inspection (non-black frames, camera visibility, keyframe
+  deltas) is not implemented.
+- **Open-web research sandbox**: the closed-package research task ships
+  with primary/technical/outdated/conflicting/irrelevant sources; the
+  agentic open-web variant would need network access and a query budget.
+- **Model SHA256 hashing**: the catalog schema carries a `sha256` field but
+  the hashes are not computed (the file bytes are not hashed on import).
+- **Artifact retention**: `SandboxPolicy.artifact_retention` is recorded but
+  no pruning is applied yet.
+- **Model catalogue scraping**: the recommender ships a curated catalogue
+  of ~10 entries for this hardware class; there is no crawler.
 - **KV cache quantization / CPU threads / mmap search** - impossible on this
   LM Studio build over REST (probed: 400 `unrecognized_keys`); they are
   recorded as runtime facts instead.
-- **Model catalogue is curated, not scraped**: ~10 candidate entries for this
-  hardware class instead of a full model database.
