@@ -21,7 +21,9 @@
 | gemma-4-26b-a4b | Q4_0, 15.6 GB | 🔄 beží | – | – | – | – |
 | qwen3-coder-30b | Q4_K_M, 18.6 GB | ⏳ | – | – | – | – |
 | qwen3.6-35b-a3b | Q4_K_M, 22.1 GB | ⏳ | – | – | – | – |
-| **swift IQ4_XS / IQ3_XS / IQ2_XS** | (sťahujú sa) | ⏳ | – | – | – | – |
+| **swift@iq2_xs** | IQ2_XS | 10.2 GB | **1.18** | 0.92 | 2.54 | 17 |
+| **swift@iq3_xs** | IQ3_XS | 13.9 GB | **0.78** | 0.68 | 1.27 | 17 |
+| **swift@iq4_xs** | IQ4_XS | 16.6 GB | 🔄 beží | – | – | – |
 
 **Kľúčové zistenia:**
 - **mirothinker 30B (Q2_K_S, 10.7 GB) = 10.08 tok/s @16K** — rýchlejší než gpt-oss, reasoning model, 30B-A3B MoE
