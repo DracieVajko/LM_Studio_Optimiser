@@ -193,3 +193,26 @@ def test_format_report_contains_required_rows():
 
 def test_min_decode_tps_is_one():
     assert MIN_DECODE_TPS == 1.0
+
+
+def test_min_tps_is_configurable():
+    """The interactive floor is a *default user limit* (spec 8.2), not a law.
+
+    On a loaded host the absolute tok/s is low; the caller can lower the
+    floor so the fill/retrieval paths still execute.
+    """
+    # Default floor: 0.5 tok/s is too slow.
+    assert classify_point(0.5) is PointVerdict.FAIL_TOO_SLOW
+    # Lowered floor: the same measurement passes.
+    assert classify_point(0.5, min_tps=0.2) is PointVerdict.PASS
+    # Hysteresis scales with the floor: 0.2 +/- 0.01.
+    assert classify_point(0.2, min_tps=0.2) is PointVerdict.BORDERLINE
+    assert classify_point(0.19, min_tps=0.2) is PointVerdict.BORDERLINE
+    assert classify_point(0.18, min_tps=0.2) is PointVerdict.FAIL_TOO_SLOW
+
+
+def test_min_tps_does_not_mask_load_failures():
+    assert classify_point(None, ok=False, error="CUDA out of memory",
+                          min_tps=0.2) is PointVerdict.FAIL_OOM
+    assert classify_point(None, ok=False, error="timeout",
+                          min_tps=0.2) is PointVerdict.FAIL_TIMEOUT

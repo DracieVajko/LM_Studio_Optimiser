@@ -89,6 +89,11 @@ def context_explorer(
     flash: bool = typer.Option(True, "--flash/--no-flash"),
     batch: int = typer.Option(2048, "--batch"),
     repetitions: int = typer.Option(1, "--repetitions"),
+    min_tps: float = typer.Option(
+        1.0,
+        "--min-tps",
+        help="Interactive speed floor for PASS (spec 8.2 default 1.0 tok/s)",
+    ),
 ):
     """Explore the real context capacity of one model (P2).
 
@@ -133,7 +138,7 @@ def context_explorer(
                     else:
                         err = error
                 median = statistics.median(speeds) if speeds else None
-                verdict = classify_point(median, ok=ok, error=err)
+                verdict = classify_point(median, ok=ok, error=err, min_tps=min_tps)
                 point = ContextPoint(
                     ctx=ctx,
                     verdict=verdict,

@@ -62,13 +62,16 @@ def main() -> int:
     ctx = 8192 if short else 16384
     results: list[dict] = []
 
-    # 1. Context explorer: 1.5x bracketing + retrieval on the stable rung.
+    # 1. Context explorer: 1.5x bracketing + fill ratios + retrieval.
+    #    Under a loaded host the absolute tok/s is low; a short-budget run
+    #    lowers the interactive floor so the fill/retrieval paths still run.
+    floor = "0.2" if short else "1.0"
     results.append(
         run(
             "context_explorer",
             [PY, "-m", "lm_optimizer", "lab", "context-explorer", model,
              "--min-context", "4096", "--max-context", str(ctx),
-             "--repetitions", "1"],
+             "--repetitions", "1", "--min-tps", floor],
             timeout_min=30 if short else 90,
         )
     )

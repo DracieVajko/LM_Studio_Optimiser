@@ -50,11 +50,14 @@ def classify_point(
     median_tok_s: float | None,
     ok: bool = True,
     error: str = "",
+    min_tps: float = MIN_DECODE_TPS,
 ) -> PointVerdict:
     """Classify one measured context point.
 
     A load/OOM/timeout failure is NOT "too slow" - the two must stay
     distinguishable (spec: "this result must not be labelled as OOM").
+    `min_tps` is the user's interactive floor (spec 8.2 calls it a
+    *default user limit*); the hysteresis band scales with it.
     """
     if not ok:
         text = (error or "").lower()
@@ -69,9 +72,11 @@ def classify_point(
         return PointVerdict.FAIL_LOAD
     if median_tok_s is None:
         return PointVerdict.FAIL_LOAD
-    if median_tok_s >= BORDERLINE_HIGH:
+    floor = max(0.0, float(min_tps))
+    band = max(0.05 * floor, 0.01)
+    if median_tok_s >= floor + band:
         return PointVerdict.PASS
-    if median_tok_s >= BORDERLINE_LOW:
+    if median_tok_s >= max(0.0, floor - band):
         return PointVerdict.BORDERLINE
     return PointVerdict.FAIL_TOO_SLOW
 
