@@ -1985,6 +1985,133 @@ async def lab_duel_types():
     }
 
 
+@router.get("/lab/sandbox-tasks")
+async def lab_sandbox_tasks():
+    """Sandbox task definitions with their acceptance criteria (P4)."""
+    from lm_optimizer.services.sandbox_lab import SANDBOX_TASKS
+
+    return {
+        "tasks": [
+            {
+                "id": task.id,
+                "kind": task.kind.value,
+                "title": task.title,
+                "prompt": task.prompt,
+                "checks": [
+                    {
+                        "name": check.name,
+                        "kind": check.kind,
+                        "critical": check.critical,
+                        "negate": check.negate,
+                    }
+                    for check in task.checks
+                ],
+                "max_repair_attempts": task.max_repair_attempts,
+                "timeout_s": task.timeout_s,
+                "network_allowed": task.network_allowed,
+                "artifacts": list(task.artifacts),
+            }
+            for task in SANDBOX_TASKS.values()
+        ]
+    }
+
+
+@router.post("/lab/sandbox-run")
+async def lab_sandbox_run(payload: dict, background: BackgroundTasks):
+    """Start a sandbox task in the background (P4).
+
+    Body: {"task": "web_dashboard", "model": "publisher/model"}.
+    Returns a job id; poll GET /lab/sandbox-run/{job_id}.
+    """
+    import uuid as _uuid
+
+    from lm_optimizer.services.sandbox_lab import SANDBOX_TASKS
+
+    task_id = str(payload.get("task") or "")
+    model = str(payload.get("model") or "")
+    if task_id not in SANDBOX_TASKS:
+        raise HTTPException(status_code=400, detail=f"Unknown sandbox task: {task_id}")
+    if not model:
+        raise HTTPException(status_code=400, detail="model is required")
+
+    job_id = str(_uuid.uuid4())
+    _sandbox_jobs[job_id] = {"status": "pending", "result": None, "error": None}
+    background.add_task(_run_sandbox_job, job_id, task_id, model)
+    return {"job_id": job_id, "status": "pending", "poll_url": f"/lab/sandbox-run/{job_id}"}
+
+
+@router.get("/lab/sandbox-run/{job_id}")
+async def lab_sandbox_status(job_id: str):
+    """Poll a sandbox job."""
+    job = _sandbox_jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Unknown job id")
+    return {"job_id": job_id, **job}
+
+
+async def _run_sandbox_job(job_id: str, task_id: str, model: str) -> None:
+    """Background worker: run the sandbox task with the repair loop."""
+    from datetime import datetime as _dt
+
+    from lm_optimizer.services.sandbox_lab import SANDBOX_TASKS, SandboxPolicy
+    from lm_optimizer.services.sandbox_runner import SandboxRunner, apply_retention
+
+    definition = SANDBOX_TASKS[task_id]
+    stamp = _dt.now().strftime("%Y%m%d_%H%M%S")
+    base_dir = Path("results") / "sandbox" / task_id
+    workdir = base_dir / stamp
+    policy = SandboxPolicy(
+        workdir=workdir,
+        network_enabled=False,
+        timeout_s=definition.timeout_s,
+        allowed_executables=definition.allowed_executables,
+    )
+    runner = SandboxRunner(task=definition, policy=policy, workdir=workdir)
+    client = None
+    try:
+        _sandbox_jobs[job_id]["status"] = "running"
+        client = await get_lm_client(echo_probe=False)
+
+        async def _generate(feedback: str) -> str:
+            prompt = definition.prompt
+            if feedback:
+                prompt = feedback + "\n\n" + definition.prompt
+            response = await client.chat_completion(
+                model=model,
+                input_text=prompt,
+                temperature=0.2,
+                max_output_tokens=2048,
+            )
+            choices = response.get("choices") or []
+            if not choices:
+                return ""
+            return choices[0].get("message", {}).get("content", "") or ""
+
+        result = await runner.run(_generate)
+        apply_retention(base_dir, policy)
+        _sandbox_jobs[job_id] = {
+            "status": "completed",
+            "result": result.as_dict(),
+            "error": None,
+        }
+    except Exception as e:  # noqa: BLE001
+        _sandbox_jobs[job_id] = {
+            "status": "failed",
+            "result": None,
+            "error": f"{type(e).__name__}: {e}"[:300],
+        }
+    finally:
+        if client is not None:
+            try:
+                await client.close()
+            except Exception:
+                pass
+
+
+#: In-memory sandbox jobs (same lifetime semantics as the judge jobs).
+_sandbox_jobs: dict[str, dict] = {}
+
+
 def _local_measurements() -> dict[str, tuple[float, str, int | None]]:
     """Latest measured median tok/s per model (local evidence).
 

@@ -52,6 +52,7 @@
                 <button class="btn btn-outline lab-tab" data-tab="recommend">Recommender</button>
                 <button class="btn btn-outline lab-tab" data-tab="tasks">Quality tasks</button>
                 <button class="btn btn-outline lab-tab" data-tab="duels">Duel types</button>
+                <button class="btn btn-outline lab-tab" data-tab="sandbox">Sandbox</button>
             </div>
 
             <!-- Recommender -->
@@ -117,6 +118,35 @@
                         Run them with <code class="font-mono">lm-optimizer lab duel &lt;a&gt; &lt;b&gt;</code>.
                     </p>
                     <div id="lab-duels-result" class="text-sm text-gray-500">Loading...</div>
+                </div></div>
+            </section>
+
+            <!-- Sandbox -->
+            <section id="lab-panel-sandbox" class="lab-panel hidden">
+                <div class="card"><div class="card-body">
+                    <h2 class="font-semibold mb-1">Sandbox tasks</h2>
+                    <p class="text-sm text-gray-500 mb-4">
+                        The model writes a solution into an isolated workdir; the acceptance
+                        criteria are checked automatically and a failed attempt gets
+                        evidence-only feedback for the repair loop. The artifacts land in
+                        <code class="font-mono">results/sandbox/&lt;task&gt;/&lt;timestamp&gt;/</code>
+                        for you to inspect.
+                    </p>
+                    <div class="grid md:grid-cols-3 gap-4 mb-4">
+                        <div>
+                            <label class="text-sm font-medium">Task</label>
+                            <select id="lab-sandbox-task" class="input w-full mt-1"></select>
+                        </div>
+                        <div>
+                            <label class="text-sm font-medium">Model</label>
+                            <select id="lab-sandbox-model" class="input w-full mt-1"></select>
+                        </div>
+                        <div class="flex items-end">
+                            <button id="lab-sandbox-run" class="btn btn-primary">Run task</button>
+                        </div>
+                    </div>
+                    <div id="lab-sandbox-checks" class="text-xs text-gray-500 mb-4"></div>
+                    <div id="lab-sandbox-result" class="text-sm text-gray-500"></div>
                 </div></div>
             </section>
         </main>

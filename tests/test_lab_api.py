@@ -54,6 +54,27 @@ def test_lab_duel_types_endpoint(client):
         assert t["tasks"]
 
 
+def test_lab_sandbox_tasks_endpoint(client):
+    response = client.get("/api/lab/sandbox-tasks")
+    assert response.status_code == 200, response.text
+    tasks = response.json()["tasks"]
+    ids = {t["id"] for t in tasks}
+    assert {"web_dashboard", "research_synthesis", "blender_skyblock"} == ids
+    for task in tasks:
+        assert task["checks"]
+        assert task["max_repair_attempts"] >= 1
+        assert task["network_allowed"] is False
+
+
+def test_lab_sandbox_run_validates_input(client):
+    assert client.post("/api/lab/sandbox-run", json={"task": "nope", "model": "m"}).status_code == 400
+    assert client.post("/api/lab/sandbox-run", json={"task": "web_dashboard"}).status_code == 400
+
+
+def test_lab_sandbox_unknown_job(client):
+    assert client.get("/api/lab/sandbox-run/not-a-job").status_code == 404
+
+
 def test_lab_page_renders(client):
     response = client.get("/lab")
     assert response.status_code == 200, response.text

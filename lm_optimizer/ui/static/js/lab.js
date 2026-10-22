@@ -50,6 +50,9 @@
                 if (name === "duels" && !el("lab-duels-result").dataset.loaded) {
                     loadDuelTypes();
                 }
+                if (name === "sandbox" && !el("lab-sandbox-result").dataset.loaded) {
+                    loadSandbox();
+                }
             });
         });
     }
@@ -176,10 +179,123 @@
         init();
     }
 
+    /* --- sandbox --- */
+    let sandboxTasks = {};
+
+    async function loadSandbox() {
+        const taskSelect = el("lab-sandbox-task");
+        const modelSelect = el("lab-sandbox-model");
+        try {
+            const payload = await getJSON(API + "/lab/sandbox-tasks");
+            sandboxTasks = {};
+            taskSelect.innerHTML = "";
+            (payload.tasks || []).forEach(function (task) {
+                sandboxTasks[task.id] = task;
+                const option = document.createElement("option");
+                option.value = task.id;
+                option.textContent = task.kind + " \u2014 " + task.title;
+                taskSelect.appendChild(option);
+            });
+            renderSandboxChecks();
+        } catch (err) {
+            taskSelect.innerHTML = "<option value=''>Failed to load tasks</option>";
+        }
+        try {
+            const payload = await getJSON(API + "/models");
+            const models = payload.models || payload;
+            modelSelect.innerHTML = "<option value=''>Select a model...</option>";
+            (models || []).forEach(function (m) {
+                const option = document.createElement("option");
+                option.value = m.id;
+                option.textContent = m.id;
+                modelSelect.appendChild(option);
+            });
+        } catch (err) {
+            modelSelect.innerHTML = "<option value=''>Failed to load models</option>";
+        }
+        el("lab-sandbox-result").dataset.loaded = "1";
+    }
+
+    function renderSandboxChecks() {
+        const task = sandboxTasks[el("lab-sandbox-task").value];
+        if (!task) {
+            el("lab-sandbox-checks").textContent = "";
+            return;
+        }
+        const checks = (task.checks || [])
+            .map(function (c) {
+                return (c.critical ? "* " : "") + c.name + (c.negate ? " (must NOT match)" : "");
+            })
+            .join(", ");
+        el("lab-sandbox-checks").textContent =
+            "Acceptance criteria (* = critical): " + checks +
+            " | repair attempts: " + task.max_repair_attempts +
+            " | timeout: " + task.timeout_s + "s";
+    }
+
+    async function runSandbox() {
+        const task = el("lab-sandbox-task").value;
+        const model = el("lab-sandbox-model").value;
+        const target = el("lab-sandbox-result");
+        const button = el("lab-sandbox-run");
+        if (!task || !model) {
+            target.textContent = "Select a task and a model first.";
+            return;
+        }
+        button.disabled = true;
+        target.innerHTML = "<p class='text-gray-500'>Starting...</p>";
+        try {
+            const response = await fetch(API + "/lab/sandbox-run", {
+                method: "POST",
+                headers: { "Content-Type": "application/json", Accept: "application/json" },
+                body: JSON.stringify({ task: task, model: model }),
+            });
+            const payload = await response.json();
+            if (!response.ok) throw new Error(payload.detail || "HTTP " + response.status);
+            await pollSandbox(payload.job_id);
+        } catch (err) {
+            target.innerHTML = "<p class='text-red-600'>Failed: " + esc(err.message) + "</p>";
+        } finally {
+            button.disabled = false;
+        }
+    }
+
+    async function pollSandbox(jobId) {
+        const target = el("lab-sandbox-result");
+        for (let attempt = 0; attempt < 120; attempt++) {
+            await new Promise(function (resolve) { setTimeout(resolve, 5000); });
+            const payload = await getJSON(API + "/lab/sandbox-run/" + encodeURIComponent(jobId));
+            if (payload.status === "completed") {
+                const result = payload.result || {};
+                target.innerHTML =
+                    "<p><strong>Result:</strong> " +
+                    (result.final_success ? "PASS" : "FAIL") +
+                    " &middot; first pass: " + (result.first_pass_success ? "yes" : "no") +
+                    " &middot; repairs: " + (result.repair_count || 0) +
+                    " &middot; score: " + fmt(result.final_score, 3) +
+                    " (penalized " + fmt(result.penalized_score, 3) + ")</p>" +
+                    "<pre class='text-xs bg-gray-100 p-2 rounded mt-2'>" +
+                    esc(JSON.stringify(result, null, 2)) + "</pre>";
+                return;
+            }
+            if (payload.status === "failed") {
+                target.innerHTML =
+                    "<p class='text-red-600'>Failed: " + esc(payload.error || "unknown") + "</p>";
+                return;
+            }
+            target.innerHTML = "<p class='text-gray-500'>Running (" + payload.status + ")...</p>";
+        }
+        target.innerHTML = "<p class='text-yellow-600'>Still running after 10 minutes; check the CLI.</p>";
+    }
+
     function init() {
         initTabs();
         const button = el("lab-run-recommend");
         if (button) button.addEventListener("click", runRecommend);
+        const sandboxButton = el("lab-sandbox-run");
+        if (sandboxButton) sandboxButton.addEventListener("click", runSandbox);
+        const taskSelect = el("lab-sandbox-task");
+        if (taskSelect) taskSelect.addEventListener("change", renderSandboxChecks);
         runRecommend();
     }
 })();
