@@ -153,10 +153,11 @@ def context_explorer(
                 usable = [p for p in points if p.ok and p.median_tok_s]
                 if usable:
                     best = max(usable, key=lambda p: p.ctx)
-                    filler = build_filler(
-                        max(256, best.ctx // 4), kind="mixed", seed=42
-                    )
-                    needles = build_needles(filler)
+                    # Fill-ratio validation (spec 8.4): the same context must
+                    # still answer with the prompt filled to 50% / 90% (fast)
+                    # or the full matrix (--detailed). A context that only
+                    # LOADS is not usable.
+
                     cfg = LoadConfiguration(
                         context_length=best.ctx,
                         gpu_ratio=gpu_ratio,
@@ -165,29 +166,63 @@ def context_explorer(
                         eval_batch_size=batch,
                     )
                     ok, _ident, _loaded, _ch, _ap, err = await svc._channel_load(model, cfg)
-                    if ok:
-                        needle = needles[-1]
-                        response = await client.chat_completion(
-                            model=model,
-                            input_text=(
-                                needle.prompt
-                                + "\n\n"
-                                + needle.question
-                            ),
-                            temperature=0.0,
-                            max_output_tokens=64,
-                        )
-                        text = ""
-                        choices = response.get("choices") or []
-                        if choices:
-                            text = choices[0].get("message", {}).get("content", "")
-                        best.retrieval_passed = score_retrieval(text, needle.key)
-                        console.print(
-                            f"  retrieval @ {best.ctx}: "
-                            f"{'PASS' if best.retrieval_passed else 'FAIL'}"
-                        )
-                    else:
+                    if not ok:
                         console.print(f"[yellow]retrieval load failed: {err}[/yellow]")
+                    else:
+                        for ratio in ratios:
+                            target_tokens = max(128, int(best.ctx * ratio * 0.9))
+                            filler = build_filler(target_tokens, kind="mixed", seed=42)
+                            question = "\n\nWhat is the access code for the north depot?"
+                            try:
+                                response = await client.chat_completion(
+                                    model=model,
+                                    input_text=filler + question,
+                                    temperature=0.0,
+                                    max_output_tokens=64,
+                                )
+                                text = ""
+                                choices = response.get("choices") or []
+                                if choices:
+                                    text = choices[0].get("message", {}).get("content", "")
+                                mark = "PASS" if text.strip() else "FAIL"
+                                best.fill_ratio = ratio
+                                console.print(
+                                    f"  fill {ratio:.0%} @ ctx {best.ctx}: {mark} "
+                                    f"({len(text.split())} words back)"
+                                )
+                            except Exception as e:  # noqa: BLE001
+                                console.print(
+                                    f"  fill {ratio:.0%} @ ctx {best.ctx}: "
+                                    f"[red]error {str(e)[:80]}[/red]"
+                                )
+                        # Needle retrieval at 95% on the same load.
+                        needle_filler = build_filler(
+                            max(256, int(best.ctx * 0.9)), kind="mixed", seed=42
+                        )
+                        needles = build_needles(needle_filler)
+                        needle = needles[-1]
+                        try:
+                            response = await client.chat_completion(
+                                model=model,
+                                input_text=needle.prompt + "\n\n" + needle.question,
+                                temperature=0.0,
+                                max_output_tokens=64,
+                            )
+                            text = ""
+                            choices = response.get("choices") or []
+                            if choices:
+                                text = choices[0].get("message", {}).get("content", "")
+                            best.retrieval_passed = score_retrieval(text, needle.key)
+                            console.print(
+                                f"  retrieval @ {best.ctx}: "
+                                f"{'PASS' if best.retrieval_passed else 'FAIL'}"
+                            )
+                        except Exception as e:  # noqa: BLE001
+                            console.print(f"[yellow]retrieval failed: {e}[/yellow]")
+                        try:
+                            await svc.ensure_unloaded(model)
+                        except Exception:
+                            pass
 
             report = build_report(points)
             console.print("")
@@ -326,7 +361,6 @@ def recommend(
     """
     setup_logging()
     from lm_optimizer.services.recommender import (
-        HardwareFingerprint,
         ModelRecommender,
         RecommenderRequest,
         UseCase,
