@@ -325,6 +325,7 @@ async def _run_optimization(
         mtp_test=advanced.get("mtp_test", False),
         reasoning_sweep=advanced.get("reasoning_sweep", False),
         quality_lab=advanced.get("quality_lab", False),
+        test_names=advanced.get("test_names") or None,
     )
     quality_evaluator = QualityEvaluator(QualityConfig(minimum_score=quality_threshold))
     search_generator = SearchSpaceGenerator(client)
@@ -1214,6 +1215,10 @@ def _preflight_optimize(
         granular_skips |= {"speed", "recovery", "validation", "context"}
     if mtp_test:
         granular_skips |= {"quality", "recovery", "validation", "context"}
+    if test_only:
+        # --test-only runs ONLY the selected tests: skip speed discovery and
+        # every downstream phase (same contract as quality-only).
+        granular_skips |= {"speed", "recovery", "validation", "context"}
     if granular_skips:
         skips = sorted(set(skips) | granular_skips)
     # Reasoning-only mode: the battery IS the 5-level reasoning sweep.
@@ -1249,6 +1254,7 @@ def _preflight_optimize(
         "mtp_test": mtp_test,
         "reasoning_sweep": reasoning_sweep,
         "quality_lab": quality_lab,
+        "test_names": list(test or []),
     }
 
 
@@ -1559,6 +1565,8 @@ def optimize(
             advanced["mtp_test"] = bool(mtp_test)
             advanced["reasoning_sweep"] = bool(reasoning_sweep)
             advanced["quality_lab"] = bool(quality_lab)
+            if test:
+                advanced["test_names"] = list(test)
             if context is not None:
                 advanced["speed_context"] = int(context)
 
@@ -3599,6 +3607,7 @@ def resume(
                 mtp_test=bool(adv.get("mtp_test")),
                 reasoning_sweep=bool(adv.get("reasoning_sweep")),
                 quality_lab=bool(adv.get("quality_lab")),
+                test_names=adv.get("test_names") or None,
             )
             quality_evaluator = QualityEvaluator(QualityConfig(minimum_score=run.quality_threshold))
             search_generator = SearchSpaceGenerator(client)
@@ -4042,6 +4051,7 @@ def _run_resume(run_id: str, revalidate: bool, style: str, skip_phases: str | No
                 mtp_test=bool(adv.get("mtp_test")),
                 reasoning_sweep=bool(adv.get("reasoning_sweep")),
                 quality_lab=bool(adv.get("quality_lab")),
+                test_names=adv.get("test_names") or None,
             )
             quality_evaluator = QualityEvaluator(QualityConfig(minimum_score=run.quality_threshold))
             search_generator = SearchSpaceGenerator(client)

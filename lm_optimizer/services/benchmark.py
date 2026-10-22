@@ -214,6 +214,7 @@ class BenchmarkService:
         mtp_test: bool = False,
         reasoning_sweep: bool = False,
         quality_lab: bool = False,
+        test_names: list[str] | None = None,
     ):
         self.client = client
         self.config = benchmark_config or BenchmarkConfig(
@@ -237,6 +238,8 @@ class BenchmarkService:
         # P3: run the deterministic Quality Lab tasks on every quality
         # finalist and enforce its hard gates before a winner is declared.
         self.quality_lab = quality_lab
+        # --test / --test-only: exact case names to run.
+        self.test_names = [str(n) for n in (test_names or []) if str(n).strip()]
         # Set (model id) only when the trailing ensure_unloaded of an attempt
         # could NOT verify the model left the host. The optimizer reads this
         # between candidates and refuses to load another memory-heavy config.
@@ -439,7 +442,25 @@ class BenchmarkService:
             include_categories=self.include_categories,
             reasoning_sweep=self.reasoning_sweep
         )
-        
+
+        # --test / --test-only: restrict the suite to the named tests. Names
+        # are the exact case names (short_instruction, medium_reasoning,
+        # long_context, coding_task, structured_output). Unknown names are
+        # kept out with a warning so a typo cannot silently run everything.
+        names = getattr(self, "test_names", None)
+        if names:
+            wanted = [str(n).strip().lower() for n in names if str(n).strip()]
+            selected = [c for c in cases if c.name.lower() in wanted]
+            missing = sorted(set(wanted) - {c.name.lower() for c in selected})
+            if missing:
+                logger.warning("Unknown --test name(s) ignored", missing=missing)
+            if not selected:
+                # Never silently fall back to the full suite.
+                raise ValueError(
+                    f"None of the requested tests exist: {missing or names}"
+                )
+            cases = selected
+
         return [
             BenchmarkCase(
                 name=c.name,
