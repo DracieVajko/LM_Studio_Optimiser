@@ -55,3 +55,5 @@ Thumbs.db
 
 # Exported LM Studio preset files (generated, machine-specific)
 lmstudio-presets/
+
+# Runtime data (DB, logs, reports, checkpoints)\ndata/
