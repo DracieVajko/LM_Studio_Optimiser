@@ -157,7 +157,17 @@ def main() -> int:
     print(f"\n{ok}/{len(results)} workflows passed")
     out = REPO / "results" / "live-validation.json"
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps({"model": model, "results": results}, indent=2), encoding="utf-8")
+    payload = {
+        "model": model,
+        "budget": args.budget,
+        "note": (
+            "Purpose: prove the workflows work end-to-end, not to measure clean "
+            "speed. Any background load (ffmpeg/upscale) depresses the numbers; "
+            "see docs/MEASUREMENT_CONTAMINATION.md."
+        ),
+        "results": results,
+    }
+    out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     print(f"Report: {out}")
     return 0 if ok == len(results) else 1
 
