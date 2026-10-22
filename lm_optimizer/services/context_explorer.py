@@ -211,8 +211,14 @@ _STRUCTURED_LINES = (
 
 
 def _token_estimate(text: str) -> int:
-    """Rough token count (word + punctuation split). Good enough for a filler."""
-    return len(re.findall(r"\S+", text))
+    """Rough token count close enough for a filler budget.
+
+    Counts word-ish runs AND standalone punctuation, because structured
+    lines ("id=0001 host=alpha") are ~3x more tokens than whitespace words.
+    A plain word count under-estimated the 90% fill and overflowed an 8192
+    context on the live run (HTTP 500).
+    """
+    return len(re.findall(r"[A-Za-z0-9_]+|[^\sA-Za-z0-9_]", text))
 
 
 def build_filler(

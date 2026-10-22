@@ -113,9 +113,13 @@ def test_filler_seed_changes_content():
 
 
 def test_filler_respects_token_target():
+    from lm_optimizer.services.context_explorer import _token_estimate
+
     text = build_filler(120, kind="mixed", seed=42)
-    words = len(text.split())
-    assert 100 <= words <= 200
+    tokens = _token_estimate(text)
+    # The loop stops once the estimated tokens reach the target; a line may
+    # overshoot, so allow a small margin above 120.
+    assert 100 <= tokens <= 180
 
 
 def test_filler_empty_target():
