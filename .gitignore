@@ -57,3 +57,4 @@ Thumbs.db
 lmstudio-presets/
 
 # Runtime data (DB, logs, reports, checkpoints)\ndata/
+data/archive/
