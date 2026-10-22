@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import os
 import shlex
+import shutil
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -121,6 +122,32 @@ def run_command(
             duration_s=time.perf_counter() - started,
             error=f"{type(e).__name__}: {e}"[:200],
         )
+
+
+def apply_retention(base_dir: Path, policy: SandboxPolicy) -> list[Path]:
+    """Prune old run directories per the policy (spec §13.5).
+
+    `artifact_retention` is "keep_last_N" (default keep_last_10). Returns the
+    directories that were removed. The newest N runs are always kept.
+    """
+    removed: list[Path] = []
+    if not base_dir.is_dir():
+        return removed
+    try:
+        keep = int(str(policy.artifact_retention).split("_")[-1])
+    except (TypeError, ValueError):
+        keep = 10
+    if keep < 0:
+        keep = 10
+    dirs = [p for p in base_dir.iterdir() if p.is_dir()]
+    dirs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    for stale in dirs[keep:]:
+        try:
+            shutil.rmtree(stale)
+            removed.append(stale)
+        except OSError:
+            continue
+    return removed
 
 
 def read_workdir_files(workdir: Path, limit: int = 50) -> dict[str, str]:

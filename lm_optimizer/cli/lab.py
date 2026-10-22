@@ -732,7 +732,11 @@ def sandbox(
         console.print("Available: " + ", ".join(sorted(SANDBOX_TASKS)))
         sys.exit(2)
 
-    workdir = Path("results") / "sandbox" / task
+    from datetime import datetime
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base_dir = Path("results") / "sandbox" / task
+    workdir = base_dir / stamp
     policy = SandboxPolicy(
         workdir=workdir,
         network_enabled=False,
@@ -760,6 +764,12 @@ def sandbox(
     import asyncio
 
     result = asyncio.run(runner.run(_generate))
+    # Artifact retention: keep the newest N runs per task (spec §13.5).
+    from lm_optimizer.services.sandbox_runner import apply_retention
+
+    removed = apply_retention(base_dir, policy)
+    if removed:
+        console.print(f"[dim]retention: pruned {len(removed)} old sandbox run(s)[/dim]")
     console.print(json.dumps(result.as_dict(), indent=2, ensure_ascii=False))
     path = _write_json(f"sandbox-{task}.json", result.as_dict())
     console.print(f"\nReport saved: {path}")
@@ -876,6 +886,102 @@ def full_optimize(
     for name, rc in results.items():
         status = "[green]ok[/green]" if rc == 0 else f"[red]rc={rc}[/red]"
         console.print(f"  {name}: {status}")
+
+
+@app.command("hash-model")
+def hash_model(
+    model: str = typer.Argument(..., help="Model id (publisher/name)"),
+    refresh: bool = typer.Option(False, "--refresh", help="Recompute even if cached"),
+):
+    """Compute the SHA256 of a model's GGUF file (spec §16.3).
+
+    The hash is cached by path + size + mtime, so hashing a 16 GB file is a
+    one-time cost per model version.
+    """
+    setup_logging()
+    from lm_optimizer.services.model_hash import model_sha256
+
+    result = model_sha256(model, refresh=refresh)
+    if result["sha256"]:
+        console.print(f"{model}")
+        console.print(f"  path:   {result['path']}")
+        console.print(f"  size:   {result['size_bytes'] / 1e9:.2f} GB")
+        console.print(f"  sha256: {result['sha256']}")
+        console.print(f"  cached: {result['cached']}")
+    else:
+        console.print(f"[red]{model}: {result['error']}[/red]")
+        sys.exit(1)
+
+
+@app.command("hash-all")
+def hash_all():
+    """Hash every model currently listed by LM Studio."""
+    setup_logging()
+    import asyncio as _asyncio
+
+    from lm_optimizer.services.model_hash import hash_all_models
+
+    client = _client()
+
+    async def _list():
+        await client.connect()
+        try:
+            return [m.id for m in await client.list_models()]
+        finally:
+            try:
+                await client.close()
+            except Exception:
+                pass
+
+    ids = _asyncio.run(_list())
+    results = hash_all_models(ids)
+    for result in results:
+        if result["sha256"]:
+            console.print(
+                f"  {result['model_id'][:52]:52s} {result['sha256'][:16]}... "
+                f"{'cached' if result['cached'] else 'new'}"
+            )
+        else:
+            console.print(f"  {result['model_id'][:52]:52s} [yellow]no file[/yellow]")
+
+
+@app.command("catalogue-sync")
+def catalogue_sync(
+    query: str = typer.Option("qwen gguf", "--query", help="HuggingFace search query"),
+    limit: int = typer.Option(20, "--limit", help="Max repos to inspect"),
+    output: Path = typer.Option(
+        Path("results") / "hf-catalogue.json", "--output", help="Where to write the catalogue"
+    ),
+):
+    """Discover GGUF models on HuggingFace and add them to the catalogue (spec §16.3).
+
+    Discovered entries are marked source=huggingface and confidence D: they
+    are a PRIOR, never evidence. A local measurement upgrades them.
+    """
+    setup_logging()
+    import json as _json
+
+    from lm_optimizer.services.hf_catalog import sync_catalogue
+
+    try:
+        result = sync_catalogue(query=query, existing=_default_catalog(), limit=limit)
+    except Exception as e:  # noqa: BLE001
+        console.print(f"[red]Discovery failed: {e}[/red]")
+        sys.exit(1)
+
+    for error in result.errors[:10]:
+        console.print(f"[yellow]{error}[/yellow]")
+    console.print(
+        f"Discovered {result.discovered} repo(s): {len(result.added)} new, "
+        f"{result.skipped} skipped."
+    )
+    payload = {
+        "query": query,
+        "entries": [entry.as_dict() for entry in result.added],
+    }
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(_json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    console.print(f"Catalogue written: {output}")
 
 
 if __name__ == "__main__":

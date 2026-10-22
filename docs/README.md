@@ -31,22 +31,22 @@
 
 ## Not yet implemented (honest list)
 
-- **Real browser rendering**: the web sandbox validates the produced HTML
-  statically (stdlib `html.parser` + `node --check`): viewport, title,
-  single h1, media queries, external resources, image alt text, input
-  labels and inline JS syntax (`web_validator.py`, wired into
-  `sandbox_runner.py`). Actual layout rendering, screenshots, computed
-  contrast and click-through functional tests need a browser engine
-  (Playwright) which the project deliberately does not depend on.
-- **Blender render validation**: the task definition and acceptance
-  criteria exist (`sandbox_lab.BLENDER_TASK`), and the runner executes a
-  `blender --background --python` command when Blender is on PATH; the
-  artifact inspection (non-black frames, camera visibility, keyframe
-  deltas) is not implemented.
+### Out of scope by decision (2026-10-22)
+
+- **Browser rendering / Playwright** and **Blender render validation** were
+  dropped on purpose: the sandbox writes its artifacts into
+  `results/sandbox/<task>/`, so the user inspects the produced page or 3D
+  scene directly. Automating a browser engine and Blender would add heavy
+  dependencies for a judgement the user makes better by looking at the
+  result. The static validators that DO ship (`web_validator.py`,
+  `sandbox_lab.score_attempt`) still catch structural breakage.
+
+### Still genuinely missing
+
 - **Open-web research sandbox**: the closed-package research task ships
   with primary/technical/outdated/conflicting/irrelevant sources; the
   agentic open-web variant would need network access and a query budget.
-- **Model SHA256 hashing**: the catalog schema carries a `sha256` field but
+- **SHA256 model hashing**: the catalog schema carries a `sha256` field but
   the hashes are not computed (the file bytes are not hashed on import).
 - **Artifact retention**: `SandboxPolicy.artifact_retention` is recorded but
   no pruning is applied yet.

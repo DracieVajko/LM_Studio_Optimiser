@@ -32,14 +32,23 @@ Nové testovacie súbory:
 
 ## Čo ešte zostáva (honest list)
 
+### Mimo rozsahu — rozhodnutie používateľa (2026-10-22)
+
 | Položka | Dôvod |
 |---|---|
-| **Playwright browser rendering** | zámerne žiadne nové závislosti; statický HTML validátor pokrýva dosiahnuteľnú časť |
-| **Blender render validácia** | vyžaduje Blender na PATH; runner ho vie spustiť, ale inšpekcia artefaktov (non-black frames, camera visibility) chýba |
-| **Open-web research sandbox** | vyžaduje sieť + agentický loop; closed-package verzia je hotová |
-| **SHA256 model hash** | pole existuje, hash sa nepočíta |
-| **Artifact retention** | pole existuje, pruning sa neaplikuje |
-| **Model catalogue scraping** | curated katalóg (~10 entries) namiesto crawlera |
+| **Playwright / browser rendering** | sandbox zapisuje artefakty do `results/sandbox/<task>/<timestamp>/` — používateľ si výsledok pozrie sám; automatizácia prehliadača by pridala ťažkú závislosť za úsudok, ktorý človek spraví lepšie |
+| **Blender render validácia** | rovnaký dôvod; Blender navyše nie je nainštalovaný |
+
+### Doplnené v druhej vlne (2026-10-22 večer)
+
+| Položka | Riešenie | Testy |
+|---|---|---|
+| **SHA256 model hash** | `model_hash.py` (streaming, cache podľa path+size+mtime, fuzzy resolve LM Studio cesty) + CLI `lab hash-model` / `lab hash-all` | 8 |
+| **Artifact retention** | `apply_retention()` v `sandbox_runner.py` (keep_last_N, default 10) + timestampované run dirs v `lab sandbox` | 5 |
+| **Open-web research sandbox** | `research_web.py` — fetch zdrojov, extrakcia textu, citation precision/recall, penalizácia vymyslených citácií | 11 |
+| **HF katalóg discovery** | `hf_catalog.py` — search GGUF repos, parsovanie params/quant, odhad veľkosti, merge s curated katalógom + CLI `lab catalogue-sync` | 19 |
+
+### Už nie je "missing"
 
 ## Commity (vetva `feat/single-model-guard`)
 
