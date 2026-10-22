@@ -374,12 +374,12 @@ class ContextReport:
         }
 
 
-def build_report(points: list[ContextPoint]) -> ContextReport:
+def build_report(points: list[ContextPoint], min_tps: float = MIN_DECODE_TPS) -> ContextReport:
     """Assemble the report from measured points (spec 8.1 separation).
 
     - max loadable: largest context that LOADED at all
     - max stable:   largest context that passed the speed threshold
-    - max usable:   largest context that is stable AND above MIN_DECODE_TPS
+    - max usable:   largest context that is stable AND above `min_tps`
     - max retrieval: largest context that also passed the needle test
     - recommended:  largest usable context (falls back to the fastest)
     """
@@ -396,7 +396,7 @@ def build_report(points: list[ContextPoint]) -> ContextReport:
         for p in points
         if p.verdict is PointVerdict.PASS
         and p.median_tok_s is not None
-        and p.median_tok_s >= MIN_DECODE_TPS
+        and p.median_tok_s >= min_tps
     ]
     report.max_usable_context = max((p.ctx for p in usable), default=None)
 

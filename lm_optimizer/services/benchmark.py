@@ -258,8 +258,29 @@ class BenchmarkService:
         Returns (ok, identifier_or_error, loaded_config, channel, applied,
         load_error). CLI is used only for gpu_ratio REST cannot express and
         only when enabled + available; CLI failure falls back to REST.
+
+        A pre-load unload guarantees that a slow unload under host load can
+        never leave the previous instance alive and make this load a SECOND
+        instance of the same model (observed live 2026-10-22: two copies of
+        one LLM in LM Studio).
         """
         from lm_optimizer.services import control_adapter as _ca
+
+        try:
+            if not await self.client.ensure_unloaded(model_id):
+                self.last_unverified_unload = model_id
+                return (
+                    False,
+                    None,
+                    None,
+                    "precheck",
+                    None,
+                    "model is still loaded after an unload attempt; refusing to "
+                    "stack a second instance",
+                )
+            self.last_unverified_unload = None
+        except Exception as e:  # noqa: BLE001 - a failed precheck must not crash the run
+            logger.warning("Pre-load unload check failed", model=model_id, error=str(e)[:160])
 
         if (
             self.gpu_via_cli

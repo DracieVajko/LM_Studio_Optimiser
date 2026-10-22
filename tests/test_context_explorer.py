@@ -216,3 +216,20 @@ def test_min_tps_does_not_mask_load_failures():
                           min_tps=0.2) is PointVerdict.FAIL_OOM
     assert classify_point(None, ok=False, error="timeout",
                           min_tps=0.2) is PointVerdict.FAIL_TIMEOUT
+
+
+def test_report_uses_the_same_floor_as_the_classifier():
+    """The report must not contradict the verdicts.
+
+    With --min-tps 0.2 a 0.28 tok/s rung is a PASS; the report's 'usable'
+    row must count it too (it used the hardcoded 1.0 floor before).
+    """
+    points = [
+        ContextPoint(ctx=8192, verdict=PointVerdict.PASS, median_tok_s=0.28),
+    ]
+    default_report = build_report(points)
+    assert default_report.max_usable_context is None
+
+    lowered = build_report(points, min_tps=0.2)
+    assert lowered.max_usable_context == 8192
+    assert lowered.recommended_interactive_context == 8192

@@ -174,9 +174,15 @@ def context_explorer(
                     if not ok:
                         console.print(f"[yellow]retrieval load failed: {err}[/yellow]")
                     else:
+                        # Reserve room for the question + the answer: a filler
+                        # sized at ctx*ratio with the naive word estimate
+                        # (~1.33 tokens per word) overflowed an 8192 context at
+                        # the 90% rung and the server answered HTTP 500.
+                        reserve = 512
                         for ratio in ratios:
-                            target_tokens = max(128, int(best.ctx * ratio * 0.9))
-                            filler = build_filler(target_tokens, kind="mixed", seed=42)
+                            budget = max(128, int((best.ctx - reserve) * ratio))
+                            target_words = max(128, int(budget * 0.75))
+                            filler = build_filler(target_words, kind="mixed", seed=42)
                             question = "\n\nWhat is the access code for the north depot?"
                             try:
                                 response = await client.chat_completion(
@@ -201,8 +207,9 @@ def context_explorer(
                                     f"[red]error {str(e)[:80]}[/red]"
                                 )
                         # Needle retrieval at 95% on the same load.
+                        needle_words = max(128, int((best.ctx - reserve) * 0.9 * 0.75))
                         needle_filler = build_filler(
-                            max(256, int(best.ctx * 0.9)), kind="mixed", seed=42
+                            needle_words, kind="mixed", seed=42
                         )
                         needles = build_needles(needle_filler)
                         needle = needles[-1]
@@ -229,7 +236,7 @@ def context_explorer(
                         except Exception:
                             pass
 
-            report = build_report(points)
+            report = build_report(points, min_tps=min_tps)
             console.print("")
             console.print(format_report(report, model))
             path = _write_json(
