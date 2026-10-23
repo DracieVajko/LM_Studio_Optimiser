@@ -1403,6 +1403,16 @@ def optimize(
         help="Run the deterministic Quality Lab tasks on every quality finalist "
         "(hard gates can veto the winner)",
     ),
+    flash: bool = typer.Option(
+        True,
+        "--flash/--no-flash",
+        help="Enable Flash Attention (required for V cache quantization)",
+    ),
+    kv_gpu: bool = typer.Option(
+        True,
+        "--kv-gpu/--kv-cpu",
+        help="Offload KV cache to GPU (requires Flash Attention when V cache quant enabled)",
+    ),
 ):
     """Optimize a model configuration."""
     setup_logging()
@@ -1569,6 +1579,8 @@ def optimize(
                 advanced["test_names"] = list(test)
             if context is not None:
                 advanced["speed_context"] = int(context)
+            advanced["flash"] = flash
+            advanced["kv_gpu"] = kv_gpu
 
             console.print(f"[bold]Starting optimization for {model}[/bold]")
             console.print(f"  Profile: {profile}")

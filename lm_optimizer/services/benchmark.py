@@ -215,6 +215,8 @@ class BenchmarkService:
         reasoning_sweep: bool = False,
         quality_lab: bool = False,
         test_names: list[str] | None = None,
+        flash_attention: bool = True,
+        offload_kv_cache_to_gpu: bool = True,
     ):
         self.client = client
         self.config = benchmark_config or BenchmarkConfig(
@@ -235,8 +237,6 @@ class BenchmarkService:
         self.speed_context = speed_context
         self.mtp_test = mtp_test
         self.reasoning_sweep = reasoning_sweep
-        # P3: run the deterministic Quality Lab tasks on every quality
-        # finalist and enforce its hard gates before a winner is declared.
         self.quality_lab = quality_lab
         # --test / --test-only: exact case names to run.
         self.test_names = [str(n) for n in (test_names or []) if str(n).strip()]
@@ -249,6 +249,9 @@ class BenchmarkService:
         # chat endpoint exposes reasoning off/low/medium/high/on; default off
         # keeps outputs deterministic and scorable.
         self.reasoning = reasoning
+        # MTP / KV cache settings
+        self.flash_attention = flash_attention
+        self.offload_kv_cache_to_gpu = offload_kv_cache_to_gpu
 
     async def _channel_load(
         self, model_id: str, cfg: LoadConfiguration
