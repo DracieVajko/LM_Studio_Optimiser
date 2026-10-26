@@ -508,12 +508,43 @@ class BenchmarkService:
         context_length: int,
         style: str | None = None,
         reasoning: str | None = None,
+        keep_loaded: bool = False,
+        assume_loaded: bool = False,
     ) -> ConfigurationResult:
         """Run full benchmark suite for a configuration."""
         cases = self.create_cases_for_context(context_length, style=style or self.style)
         return await self.run_cases(
-            model_id, load_config, context_length, cases, style=style, reasoning=reasoning
+            model_id,
+            load_config,
+            context_length,
+            cases,
+            style=style,
+            reasoning=reasoning,
+            keep_loaded=keep_loaded,
+            assume_loaded=assume_loaded,
         )
+
+    async def _already_loaded_matches(
+        self, model_id: str, load_config: LoadConfiguration
+    ) -> bool:
+        """True when the server already has this exact config loaded.
+
+        Compares only the keys we would send; server-side defaults for other
+        keys are irrelevant. Used by final validation to avoid re-loading the
+        same winner between repetitions (loads dominate slow models).
+        """
+        try:
+            instances = await self.client.get_loaded_instances()
+        except Exception:
+            return False
+        requested = load_config.to_api_params()
+        for inst in instances:
+            if inst.get("model") != model_id:
+                continue
+            echo = inst.get("config") or {}
+            if all(echo.get(k) == v for k, v in requested.items()):
+                return True
+        return False
 
     async def run_cases(
         self,
@@ -525,12 +556,18 @@ class BenchmarkService:
         warmup_repetitions: int | None = None,
         style: str | None = None,
         reasoning: str | None = None,
+        keep_loaded: bool = False,
+        assume_loaded: bool = False,
     ) -> ConfigurationResult:
         """Run an explicit case list (full suite or a recovery subset).
 
         Same load → verify → preheat → measured → unload skeleton as the
         former run_benchmark body; only the case list varies. `warmup=0`
         disables preheat chats (measured runs still execute).
+
+        `assume_loaded` skips the load when the server already reports the same
+        config; `keep_loaded` skips the trailing unload (caller must unload).
+        Both default off, so legacy behaviour is unchanged.
         """
         from uuid import uuid4
 
@@ -551,21 +588,34 @@ class BenchmarkService:
         logger.info("Starting benchmark", config_id=str(config_id), model=model_id)
 
         load_time_ms = 0.0
+        loaded_ok = False
         try:
             # Load model inside try: any failure from here on still unloads.
             from lm_optimizer.services import control_adapter as _ca
 
-            load_start = time.perf_counter()
-            ok, _ident, loaded_cfg, channel, applied, load_err = await self._channel_load(
-                model_id, load_config
-            )
-            load_time_ms = (time.perf_counter() - load_start) * 1000
+            if assume_loaded and await self._already_loaded_matches(model_id, load_config):
+                # Warm path: the exact config is already loaded, so skip the
+                # load (and the pre-load unload) and reuse the server state.
+                ok, loaded_cfg, channel, applied, load_err = (
+                    True,
+                    load_config,
+                    "warm",
+                    load_config.to_api_params(),
+                    None,
+                )
+            else:
+                load_start = time.perf_counter()
+                ok, _ident, loaded_cfg, channel, applied, load_err = await self._channel_load(
+                    model_id, load_config
+                )
+                load_time_ms = (time.perf_counter() - load_start) * 1000
 
             if not ok:
                 result.status = "failed"
                 result.error = load_err
                 result.tested_at = datetime.now()
                 return result
+            loaded_ok = True
 
             # Use actual loaded config
             actual_config = loaded_cfg or load_config
@@ -643,19 +693,25 @@ class BenchmarkService:
             result.status = "failed"
             result.error = str(e)
         finally:
-            # Always unload and verify server state; an unverified leftover
-            # flags the host dirty (the optimizer stops before its next load).
-            try:
-                if await self.client.ensure_unloaded(model_id):
-                    self.last_unverified_unload = None
-                else:
+            if keep_loaded and loaded_ok:
+                # Caller keeps the winner loaded for warm validation and is
+                # responsible for the final verified unload. Not marking it
+                # dirty is correct: the model is intentionally still loaded.
+                self.last_unverified_unload = None
+            else:
+                # Always unload and verify server state; an unverified leftover
+                # flags the host dirty (the optimizer stops before its next load).
+                try:
+                    if await self.client.ensure_unloaded(model_id):
+                        self.last_unverified_unload = None
+                    else:
+                        self.last_unverified_unload = model_id
+                        logger.warning("Model may still be loaded", model=model_id)
+                except Exception as e:
                     self.last_unverified_unload = model_id
-                    logger.warning("Model may still be loaded", model=model_id)
-            except Exception as e:
-                self.last_unverified_unload = model_id
-                logger.warning(
-                    "Unload verification failed", model=model_id, error=str(e)[:160]
-                )
+                    logger.warning(
+                        "Unload verification failed", model=model_id, error=str(e)[:160]
+                    )
 
         logger.info("Benchmark complete", config_id=str(config_id), status=result.status)
         return result

@@ -2008,6 +2008,8 @@ class AdaptiveOptimizer:
         context_length: int,
         score_context: bool | None = None,
         min_speed: float = 0.0,
+        keep_loaded: bool = False,
+        assume_loaded: bool = False,
     ) -> ConfigurationResult | None:
         """Test a single configuration through the strict phase machine.
 
@@ -2053,7 +2055,11 @@ class AdaptiveOptimizer:
             guard = await self.guard_host()
             self._log_event("LOAD_REQUESTED", f"ctx={context_length}")
             result = await self.benchmark.run_benchmark(
-                self.state.run.model.id, load_config, context_length
+                self.state.run.model.id,
+                load_config,
+                context_length,
+                keep_loaded=keep_loaded,
+                assume_loaded=assume_loaded,
             )
             result.run_id = self.state.run.id
             try:
@@ -3501,23 +3507,46 @@ class AdaptiveOptimizer:
             "Final validation", f"reps={reps} bounds={vmin}..{vmax}"
         )
         validated: list[ConfigurationResult] = []
-        for _i in range(reps):
-            if self.state.should_cancel:
-                break
-            data = {k: v for k, v in best.config.to_dict().items()}
-            vcfg = LoadConfiguration(
-                **{k: v for k, v in data.items() if hasattr(LoadConfiguration, k)}
-            )
-            # Winner invariant: validation must run at the OUTER context
-            # (best.context_length). The nested config copy can lag behind
-            # (e.g. speed 4096 vs quality 32768 winner) — never validate stale ctx.
-            vcfg.context_length = best.context_length
-            result = await self._test_config(vcfg, best.context_length, score_context=False, min_speed=self.state.run.advanced_settings.get("min_speed", 0.0))
-            if result is not None and result.status == ConfigurationStatus.PASSED:
-                self._tag_phase(result, OptimizationPhase.FINAL_VALIDATION.value)
-                validated.append(result)
-                if result.id not in [c.id for c in self.state.tested_configs]:
-                    self.state.tested_configs.append(result)
+        warm = False
+        try:
+            for _i in range(reps):
+                if self.state.should_cancel:
+                    break
+                data = {k: v for k, v in best.config.to_dict().items()}
+                vcfg = LoadConfiguration(
+                    **{k: v for k, v in data.items() if hasattr(LoadConfiguration, k)}
+                )
+                # Winner invariant: validation must run at the OUTER context
+                # (best.context_length). The nested config copy can lag behind
+                # (e.g. speed 4096 vs quality 32768 winner) — never validate stale ctx.
+                vcfg.context_length = best.context_length
+                result = await self._test_config(
+                    vcfg,
+                    best.context_length,
+                    score_context=False,
+                    min_speed=self.state.run.advanced_settings.get("min_speed", 0.0),
+                    # Warm validation: keep the winner loaded between reps and
+                    # reuse it when the echo matches (saves one load per rep).
+                    keep_loaded=True,
+                    assume_loaded=warm,
+                )
+                if result is not None and result.status == ConfigurationStatus.PASSED:
+                    warm = True
+                    self._tag_phase(result, OptimizationPhase.FINAL_VALIDATION.value)
+                    validated.append(result)
+                    if result.id not in [c.id for c in self.state.tested_configs]:
+                        self.state.tested_configs.append(result)
+        finally:
+            # Always verify the host is clean after validation: a failed
+            # warm-load attempt must not leave a model behind.
+            try:
+                if not await self.client.ensure_unloaded(self.state.run.model.id):
+                    logger.warning(
+                        "Warm validation left model loaded",
+                        model=self.state.run.model.id,
+                    )
+            except Exception as e:
+                logger.warning("Warm validation unload failed", error=str(e))
         if validated:
             self.state.best_config = self._median_result(validated)
             self.state.run.best_config_id = self.state.best_config.id
