@@ -169,6 +169,22 @@ def test_policy_sanitizes_displayed_command(tmp_path):
     assert "Program Files" not in shown
 
 
+def test_policy_sanitizes_posix_path_too(tmp_path):
+    policy = SandboxPolicy(workdir=tmp_path, allowed_executables=("blender",))
+    shown = policy.sanitize_command('"/usr/local/bin/blender" --background --python x.py')
+    assert shown.startswith("blender")
+    assert "/usr/local/bin" not in shown
+
+
+def test_policy_accepts_both_path_styles(tmp_path):
+    # Policy checks must not depend on the host that happens to run them.
+    policy = SandboxPolicy(workdir=tmp_path, allowed_executables=("blender",))
+    assert policy.is_command_allowed(
+        '"C:\\Program Files\\Blender\\blender.exe" --background'
+    )
+    assert policy.is_command_allowed("/usr/local/bin/blender --background")
+
+
 def test_policy_defaults_are_restrictive(tmp_path):
     policy = SandboxPolicy(workdir=tmp_path)
     assert policy.network_enabled is False

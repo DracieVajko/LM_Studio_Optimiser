@@ -332,6 +332,17 @@ def validate_custom_prompt(spec: dict) -> dict:
 # --- 13.5 Security --------------------------------------------------------
 
 
+def _basename_any(path_token: str) -> str:
+    """Basename for both Windows and POSIX path styles.
+
+    ``Path(...).name`` is host-dependent: on POSIX a Windows-style path is a
+    single filename, so separators must be handled explicitly. This keeps
+    policy checks and display sanitisation identical on every CI runner.
+    """
+    cleaned = str(path_token).strip().strip('"').strip("'")
+    return re.split(r"[\\/]", cleaned)[-1]
+
+
 @dataclass
 class SandboxPolicy:
     """Isolation and resource policy (spec 13.5)."""
@@ -356,7 +367,7 @@ class SandboxPolicy:
             return False
         if not parts:
             return False
-        exe = Path(parts[0].strip('"')).name.lower()
+        exe = _basename_any(parts[0]).lower()
         if exe.endswith(".exe"):
             exe = exe[: -len(".exe")]
         return exe in {e.lower().removesuffix(".exe") for e in self.allowed_executables}
@@ -369,7 +380,7 @@ class SandboxPolicy:
             return "<unparsable command>"
         if not parts:
             return ""
-        exe = Path(parts[0].strip('"')).name
+        exe = _basename_any(parts[0])
         return " ".join([exe, *parts[1:]])
 
 
