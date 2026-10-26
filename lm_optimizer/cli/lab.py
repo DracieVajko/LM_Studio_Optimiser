@@ -1031,3 +1031,32 @@ def catalogue_sync(
 
 if __name__ == "__main__":
     app()
+
+
+@app.command("export-config")
+def export_config(
+    run_id: str = typer.Argument(..., help="Run ID with a validated winner"),
+    out: Path | None = typer.Option(None, "--out", help="Write JSON to this file (default: stdout)"),
+    fmt: str = typer.Option("json", "--format", help="json (full export) or vllm (engine config only)"),
+):
+    """Export the validated winner as a reusable load-config JSON."""
+    from lm_optimizer.database.repositories import run_repo
+    from lm_optimizer.services.config_export import build_load_config_export
+
+    run = run_repo.get(run_id)
+    if not run:
+        console.print(f"[red]Run not found: {run_id}[/red]")
+        sys.exit(1)
+    try:
+        data = build_load_config_export(run)
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        sys.exit(1)
+    payload = data["vllm_engine_config"] if fmt == "vllm" else data
+    text = json.dumps(payload, indent=2)
+    if out:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(text, encoding="utf-8")
+        console.print(f"Saved: {out}")
+    else:
+        console.print_json(text)

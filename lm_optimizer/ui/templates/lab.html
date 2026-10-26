@@ -7,8 +7,8 @@
     <script src="https://cdn.tailwindcss.com"></script>
     <link rel="stylesheet" href="/static/css/app.css">
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%232563eb' stroke-width='2'%3E%3Cpath stroke-linecap='round' stroke-linejoin='round' d='M13 10V3L4 14h7v7l9-11h-7z'/%3E%3C/svg%3E">
-    <script src="/static/js/theme.js?v=12"></script>
-    <script src="/static/js/navstatus.js?v=12"></script>
+    <script src="/static/js/theme.js?v=13"></script>
+    <script src="/static/js/navstatus.js?v=13"></script>
 </head>
 <body class="bg-gray-50 min-h-screen">
     <div id="app">
@@ -51,7 +51,8 @@
                 <button class="btn btn-outline lab-tab" data-tab="recommend" title="Model fit for this hardware (size and bits/weight)">Recommender</button>
                 <button class="btn btn-outline lab-tab" data-tab="tasks" title="Deterministic quality tasks with hard gates">Quality tasks</button>
                 <button class="btn btn-outline lab-tab" data-tab="duels" title="Blind A/B model duels with a judge">Duel types</button>
-                <button class="btn btn-outline lab-tab" data-tab="sandbox">Sandbox</button>
+                <button class="btn btn-outline lab-tab" data-tab="sandbox" title="Isolated artifact tasks with automatic acceptance checks">Sandbox</button>
+                <button class="btn btn-outline lab-tab" data-tab="experiments" title="Experiment Builder: mode -> model -> budget -> review -> run">Experiments</button>
             </div>
 
             <!-- Recommender -->
@@ -148,6 +149,9 @@
                     <div id="lab-sandbox-result" class="text-sm text-gray-500"></div>
                 </div></div>
             </section>
+                    <section id="lab-panel-experiments" class="lab-panel hidden">
+                <iframe src="/experiments?embed=1" class="w-full border rounded bg-white" style="height:82vh" title="Experiment Builder"></iframe>
+            </section>
         </main>
     </div>
     <script>
@@ -175,6 +179,6 @@
         console.error('Unhandled rejection:', reason);
     });
     </script>
-    <script src="/static/js/lab.js?v=12"></script>
+    <script src="/static/js/lab.js?v=13"></script>
 </body>
 </html>

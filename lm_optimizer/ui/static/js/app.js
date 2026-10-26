@@ -1,9 +1,9 @@
 // LM Studio Auto Optimizer - Main Application
 
-import { API } from './api.js?v=12';
-import { UI } from './ui.js?v=12';
-import { Charts } from './charts.js?v=12';
-import { WebSocketManager } from './websocket.js?v=12';
+import { API } from './api.js?v=13';
+import { UI } from './ui.js?v=13';
+import { Charts } from './charts.js?v=13';
+import { WebSocketManager } from './websocket.js?v=13';
 
 // Application State
 const App = {

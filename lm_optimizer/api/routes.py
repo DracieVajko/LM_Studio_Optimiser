@@ -1302,51 +1302,16 @@ async def update_settings(settings: SettingsSchema):
 
 @router.get("/runs/{run_id}/export-config")
 async def export_lmstudio_config(run_id: UUID):
-    """Export the validated winner as a reusable load-config JSON.
+    """Export the validated winner as a reusable load-config JSON."""
+    from lm_optimizer.services.config_export import build_load_config_export
 
-    Includes the flat REST parameters, a vLLM engine-config variant (the only
-    engine type whose CLI accepts --engine-config-file), and explicit
-    instructions for LM Studio's per-model defaults (GUI-only for llama.cpp).
-    """
     run = run_repo.get(str(run_id))
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
-    best = run.get_best_config()
-    if best is None:
-        raise HTTPException(status_code=404, detail="No validated winner in this run")
-    cfg = best.config
-    params = cfg.to_api_params()
-    vllm = {
-        "name": f"{run.model.name or run.model.id} optimized",
-        "load_params": {
-            "n_ctx": cfg.context_length,
-            "n_batch": cfg.eval_batch_size,
-            "flash_attn": cfg.flash_attention,
-            "no_kv_offload": (
-                None if cfg.offload_kv_cache_to_gpu is None
-                else not cfg.offload_kv_cache_to_gpu
-            ),
-            "rope_freq_base": cfg.rope_freq_base,
-            "rope_freq_scale": cfg.rope_freq_scale,
-        },
-    }
-    vllm["load_params"] = {k: v for k, v in vllm["load_params"].items() if v is not None}
-    return {
-        "run_id": str(run.id),
-        "model_id": run.model.id,
-        "config_id": str(best.id),
-        "config": params,
-        "vllm_engine_config": vllm,
-        "lmstudio_load_body": {"model": run.model.id, **params},
-        "instructions": [
-            "llama.cpp/GGUF: lm Studio has no public API to write per-model "
-            "defaults; open My Models -> gear and paste the values from 'config'.",
-            "vLLM: save 'vllm_engine_config' to a .json file and run "
-            "`lms load <model> --engine-config-file <file>`.",
-            "Any engine: POST /api/v1/models/load with 'lmstudio_load_body'.",
-        ],
-        "generated_at": datetime.now().isoformat(timespec="seconds"),
-    }
+    try:
+        return build_load_config_export(run)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from None
 
 
 @router.get("/runs/{run_id}/export")
