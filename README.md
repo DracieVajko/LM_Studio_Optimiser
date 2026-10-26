@@ -149,12 +149,15 @@ verifies empty state; every load/unload is server-state verified.
 python -m lm_optimizer.web_main   # http://127.0.0.1:8080
 ```
 
-Pages: **Dashboard** (optimize form, live status), **History** (runs + sandbox duels,
-config counts, stale flags, delete/abandon), **Results** (winner card, alternatives,
-charts, per-test Prompt/Thinking/Output, full JSON page), **Sandbox** (text/HTML/3D
-duels with presets), **Settings**. API under single `/api` prefix + websocket progress.
-Dark mode follows the OS (toggle in nav). Read endpoints are load-free and degrade
-gracefully when LM Studio is down.
+Pages: **Dashboard** (optimize form, live status, plain model dropdown, custom
+priorities 0.00-1.00 + hard speed target), **History** (runs + sandbox duels,
+config counts, stale flags, per-row checkboxes with bulk delete / re-run /
+compare, abandon), **Results** (winner card, alternatives, charts, per-test
+Prompt/Thinking/Output, full JSON page, Apply Best Config and Save LM Studio
+config), **Sandbox** (text/HTML/3D duels with presets), **Brewery** (Lab +
+Experiment Builder under one entry), **Settings**. API under single `/api` prefix
++ websocket progress. Dark mode follows the OS (toggle in nav). Read endpoints
+are load-free and degrade gracefully when LM Studio is down.
 
 **Pause/Resume (v1.5.2):** Running and paused runs show **Pause** / **Resume** buttons
 on the Results page. History page has **Resume All Pending** to bulk-resume paused runs.

@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- **Presets** (`quick`, `standard`, `thorough`, `custom`) with frozen budgets persisted in `benchmark_params.resolved_settings`; resume restores them verbatim
+- **Speed floor** (`--min-generation-tok-s`, default 2.0; `--no-enforce-min-generation-speed`) with explicit `NO_CONFIG_MEETS_SPEED_FLOOR` and a visible fastest diagnostic candidate
+- **Stage selection** (`--stage`, custom preset) with dependency warnings; `--optimize-context` wins over a preset without the context stage
+- **Context strategies** (`winner`, `gpu_resident`, `model_first_kv_cpu`, `system_spillover`) gated by capability/CLI channel
+- **Scheduled artifact test** (`--artifact-test <builtin|custom:path>`): runs last on the exact winner, records applied config/echo, score only with checks, exposed for history/compare
+- **Config export**: `GET /api/runs/{id}/export-config` and `lab export-config` (REST params, vLLM engine config, llama.cpp instructions)
+- **Web UI**: single Brewery nav (Lab + Experiments), history bulk select/delete/re-run/compare, Ask Judge enabled, Save LM Studio config button, dashboard model dropdown, custom priorities 0.00-1.00 + hard speed target
+
+### Fixed
+- Variant models failed to load with HTTP 404 (`selected_variant` used as the load id instead of the LM Studio key)
+- `max_speed_probes`, `validation_repetitions_min/max` and preset benchmark repetitions were stored but never applied
+- Empty CLI lists (e.g. `--stage` unset) overrode preset stage/strategy defaults
+- `no_winner_reason` was memory-only; now persisted in `benchmark_params`
+- Unload verification cancelled live runs on a stale inventory entry (now 3 attempts with settle delays)
+- `final_recommendation()` could promote a scoreless speed probe
+- Reasoning-sweep levels were unscored (`0/0 checks`); unknown tests no longer score 1.0
+- Sandbox presets aborted the page script (`renderPresets` before `PRESETS`); charts rendered twice; Ask Judge permanently disabled
+- `Path(...).name` failed cross-platform for foreign path styles (CI)
+- Python 3.12 annotation NameErrors missed locally on 3.14
+
 ## [1.6.0] - 2026-10-11
 
 ### Added

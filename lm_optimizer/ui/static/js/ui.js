@@ -204,7 +204,7 @@ export const UI = {
                         ${this.renderProfileOption('balanced', 'Balanced', 'Best compromise: speed, context, memory, correctness', '⚖️', true)}
                         ${this.renderProfileOption('context', 'Context', 'Maximize stable context (25% weight)', '📏')}
                         ${this.renderProfileOption('quality', 'Quality', 'Prioritize correctness (0.99) & stability', '✨')}
-                        ${this.renderProfileOption('custom', 'Custom', 'Edit weights manually (must total 100%)', '🎛️')}
+                        ${this.renderProfileOption('custom', 'Custom', 'Set your own priorities (0.00-1.00, auto-normalized)', '🎛️')}
                     </div>
                     <div id="custom-weights" class="hidden mt-4 p-4 bg-gray-50 rounded-lg border">
                         <p class="text-sm font-medium mb-1">Custom priorities (0.00 – 1.00)</p>
@@ -273,17 +273,6 @@ export const UI = {
                 </div>
             </div>
         `;
-    },
-
-    filterModels(query) {
-        const sel = document.getElementById('model-select');
-        if (!sel) return;
-        const q = query.toLowerCase();
-        for (const opt of sel.options) {
-            if (!opt.value) continue;
-            const txt = opt.textContent.toLowerCase();
-            opt.hidden = q && !txt.includes(q);
-        }
     },
 
     updateModelMeta(modelId, models) {

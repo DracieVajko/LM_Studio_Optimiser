@@ -2,6 +2,14 @@
 (function () {
     "use strict";
 
+    // Embedded in the Brewery tab: hide the duplicate nav chrome.
+    if (/[?&]embed=1/.test(window.location.search)) {
+        const nav = document.querySelector("nav");
+        if (nav) nav.style.display = "none";
+        const main = document.querySelector("main");
+        if (main) main.style.paddingTop = "0.5rem";
+    }
+
     const API = "/api";
 
     const MODE_HINTS = {
@@ -42,6 +50,8 @@
         const advanced = {
             min_context: 2048,
             max_context: parseInt(el("ex-maxctx").value, 10) || 32768,
+            quality_context: parseInt(el("ex-quality-ctx").value, 10) || 8192,
+            min_generation_tok_s: parseFloat(el("ex-min-tps").value) || 2.0,
             skip_phases: MODE_SKIP[currentMode].slice(),
             quality_lab: el("ex-quality-lab").checked,
         };
@@ -60,6 +70,7 @@
             model_id: el("ex-model").value,
             profile: el("ex-profile").value,
             quality_threshold: parseFloat(el("ex-threshold").value) || 0.97,
+            min_generation_tok_s: parseFloat(el("ex-min-tps").value) || 2.0,
             advanced_settings: advanced,
         };
     }
@@ -129,7 +140,8 @@
         document.querySelectorAll('input[name="ex-mode"]').forEach(function (input) {
             input.addEventListener("change", renderReview);
         });
-        ["ex-model", "ex-profile", "ex-threshold", "ex-maxctx", "ex-speedctx", "ex-quality-lab"].forEach(
+        ["ex-model", "ex-profile", "ex-threshold", "ex-maxctx", "ex-min-tps",
+         "ex-quality-ctx", "ex-speedctx", "ex-quality-lab"].forEach(
             function (id) {
                 const node = el(id);
                 if (node) {

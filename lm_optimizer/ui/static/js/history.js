@@ -1,7 +1,7 @@
 // LM Studio Auto Optimizer - History Page
 
-import { API } from './api.js?v=14';
-import { UI } from './ui.js?v=14';
+import { API } from './api.js?v=15';
+import { UI } from './ui.js?v=15';
 
 const HistoryPage = {
     state: {
