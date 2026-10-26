@@ -1,9 +1,9 @@
 // LM Studio Auto Optimizer - Results Page
 
-import { API } from './api.js?v=9';
-import { UI } from './ui.js?v=9';
-import { Charts } from './charts.js?v=9';
-import { WebSocketManager } from './websocket.js?v=9';
+import { API } from './api.js?v=10';
+import { UI } from './ui.js?v=10';
+import { Charts } from './charts.js?v=10';
+import { WebSocketManager } from './websocket.js?v=10';
 
 const ResultsPage = {
     state: {

@@ -188,8 +188,7 @@ export const UI = {
                     <label class="form-label flex items-center justify-between">
                         Model <span class="text-xs text-red-500">*required — select one</span>
                     </label>
-                    <input type="text" id="model-search" placeholder="Search models..." class="form-input mb-2" oninput="UI.filterModels(this.value)">
-                    <select id="model-select" class="form-input form-select" required size="6" style="height:auto; min-height: 140px;">
+                    <select id="model-select" class="form-input form-select" required>
                         <option value="" disabled selected>— Choose a model —</option>
                         ${modelOptions}
                     </select>
