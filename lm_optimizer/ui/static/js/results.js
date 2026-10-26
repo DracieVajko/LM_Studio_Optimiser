@@ -1,9 +1,9 @@
 // LM Studio Auto Optimizer - Results Page
 
-import { API } from './api.js?v=8';
-import { UI } from './ui.js?v=8';
-import { Charts } from './charts.js?v=8';
-import { WebSocketManager } from './websocket.js?v=8';
+import { API } from './api.js?v=9';
+import { UI } from './ui.js?v=9';
+import { Charts } from './charts.js?v=9';
+import { WebSocketManager } from './websocket.js?v=9';
 
 const ResultsPage = {
     state: {
@@ -182,17 +182,15 @@ const ResultsPage = {
                 ${this.renderLiveSection()}
                 ${this.renderHeader()}
                 ${this.renderTabs()}
-                <div id="tab-content" class="card">
-                    <div class="card-body" id="tab-panel">
-                        ${this.renderChartTab()}
-                    </div>
-                </div>
                 ${this.renderConfigTable()}
             </div>
         `;
 
-        // Render initial chart
-        setTimeout(() => this.renderChart(), 100);
+        // Render initial chart (single container: #tab-panels)
+        setTimeout(() => {
+            this.attachChartEvents();
+            this.renderChart();
+        }, 100);
     },
 
     renderHeader() {
@@ -394,7 +392,7 @@ const ResultsPage = {
                     <button class="tab" data-tab="comparison">⚖️ Comparison</button>
                 </div>
                 <div class="card-body">
-                    <div id="tab-panels"></div>
+                    <div id="tab-panels">${this.renderChartTab()}</div>
                 </div>
             </div>
         `;
@@ -424,7 +422,7 @@ const ResultsPage = {
                     <canvas id="pareto-chart"></canvas>
                 </div>
                 <div class="mt-4">
-                    <h4 class="font-medium mb-2">Pareto Configurations</div>
+                    <h4 class="font-medium mb-2">Pareto Configurations</h4>
                     <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3" id="pareto-cards">
                         ${this.state.paretoConfigs.map(c => this.renderParetoCard(c)).join('')}
                     </div>
@@ -517,7 +515,7 @@ const ResultsPage = {
                         <p class="text-xs text-gray-500">Debug reveals the exact prompt, reasoning trace and model output of every test.</p>
                     </div>
                     <div class="flex items-center gap-2">
-                        <button id="ask-judge-btn" class="btn btn-primary" disabled title="Select configurations or leave empty to evaluate all">
+                        <button id="ask-judge-btn" class="btn btn-primary" title="Select configurations or leave empty to evaluate all">
                             <svg class="w-4 h-4 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z"></path></svg>
                             Ask Judge
                         </button>
@@ -1135,6 +1133,12 @@ const ResultsPage = {
         document.querySelectorAll('.chart-type-btn').forEach(btn => {
             btn.addEventListener('click', () => this.switchChart(btn.dataset.chart));
         });
+
+        // Judge: always available; empty selection means "evaluate all".
+        const askJudgeBtn = document.getElementById('ask-judge-btn');
+        if (askJudgeBtn) {
+            askJudgeBtn.addEventListener('click', () => this.openJudgeModal());
+        }
 
         // Pause/Resume buttons
         const pauseBtn = document.getElementById('pause-run-btn');

@@ -1,7 +1,7 @@
 // LM Studio Auto Optimizer - Settings Page
 
-import { API } from './api.js?v=8';
-import { UI } from './ui.js?v=8';
+import { API } from './api.js?v=9';
+import { UI } from './ui.js?v=9';
 
 const SettingsPage = {
     state: {
