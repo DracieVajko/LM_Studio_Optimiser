@@ -17,6 +17,8 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from lm_optimizer.services.context_explorer import MIN_DECODE_TPS
+
 ProbeFn = Callable[[int], Awaitable[dict[str, Any]]]
 
 
@@ -105,6 +107,7 @@ async def sweep(
     max_ctx: int = 65536,
     step: int = 1000,
     precheck=None,
+    min_tps: float = MIN_DECODE_TPS,
 ) -> dict:
     """Full sweep: geometric phase then refinement. Returns report dict.
 
@@ -130,7 +133,7 @@ async def sweep(
                 break
         res = await probe(ctx)
         phase1.append({"ctx": ctx, **res})
-        if res.get("ok"):
+        if res.get("ok") and (res.get("tok_s", 0) or 0) >= min_tps:
             last_pass = ctx
         else:
             first_fail = ctx
@@ -147,7 +150,7 @@ async def sweep(
         max_stable, failed_boundary = None, first_fail
 
     # Capacity vs recommendation split over ALL passing points.
-    passing = [p for p in (phase1 + refinement) if p.get("ok")]
+    passing = [p for p in (phase1 + refinement) if p.get("ok") and (p.get("tok_s", 0) or 0) >= min_tps]
     perf_optimal = None
     balanced = None
     peak = 0.0

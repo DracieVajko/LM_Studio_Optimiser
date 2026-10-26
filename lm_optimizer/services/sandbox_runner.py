@@ -283,14 +283,23 @@ class SandboxRunner:
         return result
 
     def _materialise(self, produced: str) -> None:
-        """Write the model output into the isolated workdir."""
+        """Write the model output into the isolated workdir.
+
+        Artifact names are untrusted input: a name that resolves outside the
+        sandbox root is rejected (never written) and falls back to output.txt.
+        """
         self.workdir.mkdir(parents=True, exist_ok=True)
         text = produced or ""
         # A model may answer with a single file; the task decides the name.
         primary = self.task.artifacts[0] if self.task.artifacts else "output.txt"
         if primary.endswith("/"):
             primary = primary.rstrip("/") + "/output.txt"
-        target = self.workdir / primary
+        root = self.workdir.resolve()
+        try:
+            target = (self.workdir / primary).resolve()
+            target.relative_to(root)  # raises ValueError when escaping
+        except (ValueError, OSError):
+            target = root / "output.txt"
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(text, encoding="utf-8")
 
@@ -302,3 +311,227 @@ def build_command_for(task: SandboxTask) -> str:
     if task.kind.value == "web":
         return ""
     return ""
+
+
+async def run_manual_prompt(
+    client,
+    model_id: str,
+    load_config,
+    prompt: str,
+    run_id: str = "",
+    base_dir: Path | None = None,
+    max_output_tokens: int = 2048,
+    temperature: float = 0.2,
+    timeout_s: float = 300.0,
+) -> dict:
+    """Generate one custom prompt under the exact optimizer config.
+
+    No checks => no score (spec §6.3): the output is recorded for human review
+    with timing only. The model is unloaded in ``finally``.
+    """
+    import time as _time
+    from datetime import datetime as _dt
+
+    stamp = _dt.now().strftime("%Y%m%d_%H%M%S")
+    root = base_dir or (Path("results") / "sandbox")
+    safe_run = str(run_id or "adhoc").replace("/", "_").replace("\\", "_")
+    workdir = root / safe_run / "custom" / stamp
+    workdir.mkdir(parents=True, exist_ok=True)
+
+    requested = load_config.to_dict()
+    applied: dict | None = None
+    echo_mismatches: dict | None = None
+    output = ""
+    error: str | None = None
+    unloaded = False
+    started = _time.perf_counter()
+
+    try:
+        try:
+            await client.ensure_unloaded(model_id)
+        except Exception:
+            pass
+        loaded = await client.load_model(model_id, load_config)
+        if not getattr(loaded, "success", False):
+            error = f"load failed: {getattr(loaded, 'error', None) or 'unknown'}"
+        else:
+            if getattr(loaded, "loaded_config", None) is not None:
+                applied = loaded.loaded_config.to_dict()
+            echo_mismatches = getattr(loaded, "echo_mismatches", None)
+            response = await client.chat_completion(
+                model=model_id,
+                input_text=prompt,
+                temperature=temperature,
+                max_output_tokens=max_output_tokens,
+            )
+            choices = response.get("choices") or []
+            if choices:
+                output = str((choices[0].get("message") or {}).get("content") or "")
+    except Exception as e:  # noqa: BLE001
+        error = f"{type(e).__name__}: {e}"[:200]
+    finally:
+        try:
+            await client.ensure_unloaded(model_id)
+            unloaded = True
+        except Exception:
+            unloaded = False
+
+    elapsed = max(_time.perf_counter() - started, 1e-6)
+    try:
+        (workdir / "output.txt").write_text(output, encoding="utf-8")
+    except OSError:
+        pass
+
+    return {
+        "task_id": "custom",
+        "task_kind": "text",
+        "success": error is None and bool(output),
+        "manual_review_only": True,
+        "quality_score": None,  # never synthesise a score without criteria
+        "output_text": output,
+        "output_chars": len(output),
+        "elapsed_s": round(elapsed, 2),
+        "config_requested": requested,
+        "config_applied": applied,
+        "echo_mismatches": echo_mismatches,
+        "run_id": str(run_id or ""),
+        "workdir": str(workdir),
+        "error": error,
+        "unloaded": unloaded,
+    }
+
+
+async def run_sandbox_task(
+    client,
+    model_id: str,
+    load_config,
+    task: "SandboxTask",
+    run_id: str = "",
+    base_dir: Path | None = None,
+    max_output_tokens: int = 4096,
+    temperature: float = 0.2,
+) -> dict:
+    """Run one sandbox task against the EXACT optimizer configuration.
+
+    Contract (spec §6.2):
+    - the model is loaded through the same verified client used by the
+      optimizer, with the provided LoadConfiguration;
+    - the applied (echoed) configuration is recorded next to the result so a
+      sandbox run can never be mistaken for proof of a different config;
+    - the model is unloaded in a ``finally`` block and the clean-hood state is
+      reported (``unloaded``);
+    - artifacts stay inside an isolated per-run/per-task workdir.
+
+    Returns a JSON-serializable dict (never raises for task-level failures).
+    """
+    import time as _time
+    from datetime import datetime as _dt
+
+    from lm_optimizer.services.sandbox_lab import SandboxPolicy
+
+    stamp = _dt.now().strftime("%Y%m%d_%H%M%S")
+    root = base_dir or (Path("results") / "sandbox")
+    safe_run = str(run_id or "adhoc").replace("/", "_").replace("\\", "_")
+    workdir = root / safe_run / task.id / stamp
+    workdir.mkdir(parents=True, exist_ok=True)
+
+    policy = SandboxPolicy(
+        workdir=workdir,
+        network_enabled=False,
+        timeout_s=task.timeout_s,
+        allowed_executables=task.allowed_executables,
+    )
+    runner = SandboxRunner(
+        task=task,
+        policy=policy,
+        workdir=workdir,
+        command=build_command_for(task),
+    )
+
+    requested = load_config.to_dict()
+    applied: dict | None = None
+    echo_mismatches: dict | None = None
+    started = _time.perf_counter()
+    out: dict
+
+    try:
+        # Never stack a second instance of the same model.
+        try:
+            await client.ensure_unloaded(model_id)
+        except Exception:
+            pass
+
+        loaded = await client.load_model(model_id, load_config)
+        if not getattr(loaded, "success", False):
+            load_error = getattr(loaded, "error", None) or "load failed"
+            out = {
+                "task_id": task.id,
+                "task_kind": task.kind.value,
+                "success": False,
+                "error": f"load failed: {load_error}"[:200],
+                "config_requested": requested,
+                "config_applied": None,
+                "echo_mismatches": None,
+                "run_id": str(run_id or ""),
+                "workdir": str(workdir),
+            }
+        else:
+            if getattr(loaded, "loaded_config", None) is not None:
+                applied = loaded.loaded_config.to_dict()
+            echo_mismatches = getattr(loaded, "echo_mismatches", None)
+
+            async def _generate(feedback: str) -> str:
+                prompt = task.prompt
+                if feedback:
+                    prompt = (
+                        f"{task.prompt}\n\n"
+                        "Your previous attempt failed these checks. Use the evidence "
+                        f"to fix it (do not ask for the solution):\n{feedback}"
+                    )
+                response = await client.chat_completion(
+                    model=model_id,
+                    input_text=prompt,
+                    temperature=temperature,
+                    max_output_tokens=max_output_tokens,
+                )
+                choices = response.get("choices") or []
+                if not choices:
+                    return ""
+                message = choices[0].get("message") or {}
+                return str(message.get("content") or "")
+
+            result = await runner.run_async(_generate)
+            out = {
+                "task_id": task.id,
+                "task_kind": task.kind.value,
+                "success": bool(result.final_success),
+                "result": result.as_dict(),
+                "config_requested": requested,
+                "config_applied": applied,
+                "echo_mismatches": echo_mismatches,
+                "run_id": str(run_id or ""),
+                "workdir": str(workdir),
+            }
+    except Exception as e:  # noqa: BLE001 - task failure must not kill the run
+        out = {
+            "task_id": task.id,
+            "task_kind": task.kind.value,
+            "success": False,
+            "error": f"{type(e).__name__}: {e}"[:200],
+            "config_requested": requested,
+            "config_applied": applied,
+            "echo_mismatches": echo_mismatches,
+            "run_id": str(run_id or ""),
+            "workdir": str(workdir),
+        }
+    finally:
+        # Guaranteed unload; the flag is reported on the result below.
+        try:
+            await client.ensure_unloaded(model_id)
+            unloaded = True
+        except Exception:
+            unloaded = False
+
+    out["unloaded"] = unloaded
+    out["duration_s"] = round(_time.perf_counter() - started, 1)
+    return out

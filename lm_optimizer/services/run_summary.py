@@ -139,7 +139,14 @@ def final_recommendation(configs: list, run: Any | None) -> Any | None:
     """
     if run is not None:
         best = run.get_best_config() if hasattr(run, "get_best_config") else None
-        if best is not None and _status_of(best) == "passed":
+        # The architectural best only wins when it is passed AND scored.
+        # Speed probes are deliberately scoreless (see _recompute_all_scores),
+        # so a scoreless probe can never become the final recommendation.
+        if (
+            best is not None
+            and _status_of(best) == "passed"
+            and getattr(best, "score", None) is not None
+        ):
             return best
     evidenced = [
         c

@@ -135,6 +135,197 @@ def apply_experimental_mark(run: OptimizationRun, flags: dict | None) -> Optimiz
 EXPERIMENTAL_FLAGS = ("enable_rope", "enable_cpu_moe", "enable_speculative")
 
 
+# ============================================================
+# Preset Definitions (spec §4.2)
+# ============================================================
+
+PRESET_DEFINITIONS: dict[str, dict] = {
+    "quick": {
+        "max_speed_probes": 12,
+        "max_finalists": 2,
+        "benchmark_repetitions": 1,
+        "validation_repetitions_min": 2,
+        "validation_repetitions_max": 2,
+        "recovery_budget": 1,
+        "selected_stages": ["speed", "quality", "validation"],
+        "context_strategy_modes": ["winner"],
+        "final_sandbox_mode": "off",
+    },
+    "standard": {
+        "max_speed_probes": 25,
+        "max_finalists": 4,
+        "benchmark_repetitions": 3,
+        "validation_repetitions_min": 2,
+        "validation_repetitions_max": 5,
+        "recovery_budget": 3,
+        "selected_stages": ["speed", "quality", "recovery", "validation"],
+        "context_strategy_modes": ["winner", "model_first_kv_cpu"],
+        "final_sandbox_mode": "off",
+    },
+    "thorough": {
+        "max_speed_probes": 40,
+        "max_finalists": 6,
+        "benchmark_repetitions": 3,
+        "validation_repetitions_min": 3,
+        "validation_repetitions_max": 5,
+        "recovery_budget": 5,
+        "selected_stages": ["speed", "quality", "recovery", "validation", "context"],
+        "context_strategy_modes": [
+            "winner",
+            "gpu_resident",
+            "model_first_kv_cpu",
+            "system_spillover",
+        ],
+        "final_sandbox_mode": "all",
+    },
+    "custom": {
+        # User-defined values - no defaults, must be provided
+    },
+}
+
+VALID_PRESETS = frozenset(PRESET_DEFINITIONS.keys())
+VALID_STAGES = frozenset(
+    [
+        "preflight",
+        "speed",
+        "quality",
+        "recovery",
+        "validation",
+        "context",
+        "sandbox",
+        "experimental",
+    ]
+)
+VALID_CONTEXT_STRATEGIES = frozenset(
+    [
+        "winner",  # frozen runtime from Phase A
+        "gpu_resident",  # GPU-resident weights + KV on GPU
+        "model_first_kv_cpu",  # model on GPU, KV on CPU
+        "system_spillover",  # partial GPU offload (if CLI channel available)
+    ]
+)
+VALID_SANDBOX_MODES = frozenset(["off", "one", "all", "custom"])
+
+
+def resolve_preset(
+    preset: str, overrides: dict | None = None
+) -> tuple[dict, list[str]]:
+    """Resolve a preset to concrete budgets, applying user overrides.
+
+    Returns (resolved_settings, warnings).
+    """
+    if preset not in VALID_PRESETS:
+        raise ValueError(
+            f"Unknown preset: {preset}. Valid: {', '.join(sorted(VALID_PRESETS))}"
+        )
+
+    base = PRESET_DEFINITIONS[preset].copy()
+    overrides = overrides or {}
+    warnings: list[str] = []
+
+    # Apply overrides. Custom mode accepts any documented key (it has no
+    # defaults of its own); named presets only extend their own keys.
+    _known_keys = {
+        "max_speed_probes",
+        "max_finalists",
+        "benchmark_repetitions",
+        "validation_repetitions_min",
+        "validation_repetitions_max",
+        "recovery_budget",
+        "selected_stages",
+        "context_strategy_modes",
+        "final_sandbox_mode",
+        "final_sandbox_preset_ids",
+        "final_sandbox_custom_prompts",
+        "sandbox_compare_baseline",
+    }
+    if preset == "custom":
+        base = {k: v for k, v in overrides.items() if k in _known_keys}
+    else:
+        for key, value in overrides.items():
+            if key in base:
+                base[key] = value
+            elif key in _known_keys:
+                # A documented budget the preset did not define: accept it.
+                base[key] = value
+            else:
+                warnings.append(f"Unknown preset override: {key}")
+
+    # Validate stage dependencies
+    stage_warnings = validate_stage_dependencies(base.get("selected_stages", []))
+    warnings.extend(stage_warnings)
+
+    # Validate context strategies
+    for strat in base.get("context_strategy_modes", []):
+        if strat not in VALID_CONTEXT_STRATEGIES:
+            warnings.append(f"Unknown context strategy: {strat}")
+
+    # Validate sandbox mode
+    sandbox_mode = base.get("final_sandbox_mode", "off")
+    if sandbox_mode not in VALID_SANDBOX_MODES:
+        warnings.append(f"Unknown sandbox mode: {sandbox_mode}")
+
+    return base, warnings
+
+
+def validate_stage_dependencies(selected_stages: list[str]) -> list[str]:
+    """Validate stage dependencies and return warnings.
+
+    Rules:
+    - preflight is mandatory (safety + context baseline)
+    - quality requires speed (or a user-selected compatible saved config)
+    - recovery requires quality failure + safe rollback reference
+    - validation requires quality-passing candidate (or explicit prior config)
+    - context requires a selected runtime config
+    - sandbox requires a valid selected config
+    - experimental requires explicit opt-in
+    """
+    warnings: list[str] = []
+    stages = set(selected_stages)
+
+    # preflight is always implied
+    if "preflight" not in stages:
+        warnings.append("'preflight' is mandatory for safety; implicitly added")
+        stages.add("preflight")
+
+    if "quality" in stages and "speed" not in stages:
+        warnings.append(
+            "'quality' requires 'speed' phase (or a compatible saved config); "
+            "results will be marked 'quality not verified'"
+        )
+
+    if "recovery" in stages:
+        if "quality" not in stages:
+            warnings.append(
+                "'recovery' requires 'quality' phase; will be skipped if no quality failure"
+            )
+
+    if "validation" in stages:
+        if "quality" not in stages:
+            warnings.append(
+                "'validation' normally requires 'quality-passing' candidate; "
+                "without it, labeled 'benchmark-retested but quality not verified'"
+            )
+
+    if "context" in stages:
+        if not stages & {"speed", "quality", "validation"}:
+            warnings.append(
+                "'context' requires a selected runtime config from a prior phase"
+            )
+
+    if "sandbox" in stages:
+        if not stages & {"validation", "context"}:
+            warnings.append(
+                "'sandbox' runs against a validated config; "
+                "without prior validation, labeled 'unvalidated config'"
+            )
+
+    if "experimental" in stages:
+        warnings.append("'experimental' runs only with explicit opt-in and is marked experimental")
+
+    return warnings
+
+
 def build_experimental_detail(
     requested_raw: dict | None,
     resolved: dict | None,
@@ -291,6 +482,51 @@ def run_skip_phases(run) -> set[str]:
     return phase_skips_of(getattr(run, "benchmark_params", None))
 
 
+#: Run fields frozen at start and restored verbatim on resume (spec §9).
+PERSISTED_RUN_SETTINGS = (
+    "min_generation_tok_s",
+    "enforce_min_generation_speed",
+    "run_preset",
+    "selected_stages",
+    "max_speed_probes",
+    "max_finalists",
+    "benchmark_repetitions_override",
+    "validation_repetitions_min",
+    "validation_repetitions_max",
+    "recovery_budget",
+    "context_strategy_modes",
+    "final_sandbox_mode",
+    "final_sandbox_preset_ids",
+    "final_sandbox_custom_prompts",
+    "sandbox_compare_baseline",
+)
+
+
+def build_resolved_settings(run) -> dict:
+    """Snapshot of every frozen run setting (persisted in benchmark_params)."""
+    return {key: getattr(run, key, None) for key in PERSISTED_RUN_SETTINGS}
+
+
+def apply_persisted_run_settings(run):
+    """Restore frozen settings on resume; legacy runs keep safe defaults.
+
+    New fields are not DB columns (no migration). They are persisted as
+    ``benchmark_params["resolved_settings"]`` so a resumed run keeps its
+    original meaning even when global defaults changed meanwhile.
+    """
+    params = getattr(run, "benchmark_params", None) or {}
+    saved = params.get("resolved_settings")
+    if not isinstance(saved, dict):
+        return run
+    for key in PERSISTED_RUN_SETTINGS:
+        if key in saved and saved[key] is not None:
+            try:
+                setattr(run, key, saved[key])
+            except Exception:
+                continue
+    return run
+
+
 @dataclass
 class OptimizationState:
     """Current state of optimization run."""
@@ -425,9 +661,45 @@ class AdaptiveOptimizer:
         advanced_settings = advanced_settings or {}
         self.benchmark.style = style
 
-        # Experimental tail opt-ins - ALL DISABLED by default.
-        # RoPE / CPU-MoE / speculative probes run only as a tail after the
-        # FINAL winner, never inside the main sweep.
+        # --- Resolve preset and apply budgets (spec §2, §4.2) ---
+        preset = advanced_settings.get("run_preset", "standard")
+
+        def _override(key):
+            """Explicit non-empty override only; empty CLI lists are 'unset'."""
+            value = advanced_settings.get(key)
+            if isinstance(value, (list, tuple)) and not value:
+                return None
+            return value
+
+        preset_overrides = {
+            k: _override(k)
+            for k in (
+                "max_speed_probes",
+                "max_finalists",
+                "benchmark_repetitions",
+                "validation_repetitions_min",
+                "validation_repetitions_max",
+                "recovery_budget",
+                "selected_stages",
+                "context_strategy_modes",
+                "final_sandbox_mode",
+                "final_sandbox_preset_ids",
+                "final_sandbox_custom_prompts",
+                "sandbox_compare_baseline",
+            )
+            if _override(k) is not None
+        }
+        resolved_preset, preset_warnings = resolve_preset(preset, preset_overrides)
+        for w in preset_warnings:
+            logger.warning("Preset resolution", warning=w)
+
+        # --- Speed floor (spec §3) ---
+        min_generation_tok_s = advanced_settings.get("min_generation_tok_s", 2.0)
+        enforce_min_generation_speed = advanced_settings.get(
+            "enforce_min_generation_speed", True
+        )
+
+        # --- Experimental tail opt-ins ---
         requested_raw = {k: advanced_settings.get(k) for k in EXPERIMENTAL_FLAGS}
         exp_flags = parse_experimental_flags(
             enable_rope=advanced_settings.get("enable_rope", False),
@@ -436,7 +708,6 @@ class AdaptiveOptimizer:
         )
         advanced_settings.update(exp_flags)
         if exp_flags["enable_rope"]:
-            # RoPE requires stronger quality validation
             quality_threshold = max(quality_threshold, 0.98)
             logger.warning(
                 "RoPE experimental enabled - applying stronger quality validation",
@@ -444,7 +715,6 @@ class AdaptiveOptimizer:
             )
 
         # Use profile's default threshold if not explicitly overridden
-        # Profiles have intentional thresholds: speed 0.95, balanced 0.97, context/quality higher
         if quality_threshold is None:
             from lm_optimizer.profiles.registry import ProfileRegistry
 
@@ -472,6 +742,59 @@ class AdaptiveOptimizer:
         else:
             weights_dict = {}
 
+        # Compose phase skips from preset + granular flags
+        ordered_stages: list[str] = []
+        # Custom mode: an explicit stage list is the authority (--stage).
+        if preset == "custom":
+            explicit = (
+                advanced_settings.get("selected_stages")
+                or resolved_preset.get("selected_stages")
+                or []
+            )
+            ordered_stages = [s for s in explicit if s in VALID_STAGES]
+        else:
+            ordered_stages = list(resolved_preset.get("selected_stages", []))
+        preset_stages = set(ordered_stages)
+        # An explicit --optimize-context opt-in wins over a preset that does
+        # not list the context stage (granular flags can still skip it).
+        if advanced_settings.get("optimize_context") and "context" not in preset_stages:
+            preset_stages.add("context")
+            ordered_stages.append("context")
+        granular_skips = set(compose_granular_skips(advanced_settings))
+        if preset_stages:
+            # Preset stages define what TO run; convert to skip set.
+            all_stages = {"speed", "quality", "recovery", "validation", "context"}
+            preset_skips = sorted(all_stages - preset_stages)
+            final_skips = sorted(set(preset_skips) | granular_skips)
+        else:
+            # No stage plan: granular skips + explicit skip_phases only.
+            explicit_skips = set(phase_skips_of(advanced_settings))
+            final_skips = sorted(explicit_skips | granular_skips)
+
+        # Resolve budget parameters from preset (explicit overrides win).
+        def _budget(key: str):
+            value = advanced_settings.get(key)
+            if value is None:
+                value = resolved_preset.get(key)
+            return value
+
+        max_speed_probes = _budget("max_speed_probes")
+        max_finalists = _budget("max_finalists")
+        benchmark_repetitions = _budget("benchmark_repetitions")
+        validation_repetitions_min = _budget("validation_repetitions_min")
+        validation_repetitions_max = _budget("validation_repetitions_max")
+        recovery_budget = _budget("recovery_budget")
+
+        # Apply the resolved repetition budget to the benchmark service so a
+        # preset actually changes the workload (previously it was only stored).
+        try:
+            if benchmark_repetitions is not None and getattr(
+                self.benchmark, "config", None
+            ) is not None:
+                self.benchmark.config.repetitions = max(1, int(benchmark_repetitions))
+        except (TypeError, ValueError) as e:
+            logger.warning("Invalid benchmark_repetitions override", error=str(e))
+
         # Create run
         run = OptimizationRun(
             model=model,
@@ -485,8 +808,10 @@ class AdaptiveOptimizer:
             experimental_reason=None,
             advanced_settings=advanced_settings or {},
             benchmark_params={
-                "benchmark_repetitions": config.optimization.benchmark_runs,
-                "validation_repetitions": 5,
+                "benchmark_repetitions": benchmark_repetitions,
+                "validation_repetitions": validation_repetitions_max,
+                "validation_repetitions_min": validation_repetitions_min,
+                "validation_repetitions_max": validation_repetitions_max,
                 "warmup_runs": config.optimization.warmup_runs,
                 "seed": 42,
                 "deterministic": True,
@@ -496,17 +821,45 @@ class AdaptiveOptimizer:
                 "selection_threshold": float(advanced_settings.get("selection_threshold", 0.05)),
                 "workload_type": str(advanced_settings.get("workload_type", "interactive")).lower(),
                 "speed_probe_repetitions": advanced_settings.get("speed_probe_repetitions"),
-                "recovery_budget": advanced_settings.get("recovery_budget", 3),
-                "quality_finalist_limit": advanced_settings.get("quality_finalist_limit"),
+                "recovery_budget": recovery_budget,
+                "quality_finalist_limit": max_finalists,
+                "max_speed_probes": max_speed_probes,
                 "optimize_context": bool(advanced_settings.get("optimize_context", False)),
-                "skip_phases": sorted(phase_skips_of(advanced_settings)),
+                "skip_phases": final_skips,
+                # Preset metadata
+                "run_preset": preset,
+                "resolved_preset": resolved_preset,
             },
+            # Speed floor
+            min_generation_tok_s=min_generation_tok_s,
+            enforce_min_generation_speed=enforce_min_generation_speed,
+            # Preset
+            run_preset=preset,
+            # Stage selection
+            selected_stages=ordered_stages,
+            max_speed_probes=max_speed_probes,
+            max_finalists=max_finalists,
+            benchmark_repetitions_override=benchmark_repetitions,
+            validation_repetitions_min=validation_repetitions_min,
+            validation_repetitions_max=validation_repetitions_max,
+            recovery_budget=recovery_budget,
+            # Context strategies
+            context_strategy_modes=resolved_preset.get("context_strategy_modes", []),
+            # Sandbox
+            final_sandbox_mode=resolved_preset.get("final_sandbox_mode", "off"),
+            final_sandbox_preset_ids=resolved_preset.get("final_sandbox_preset_ids", []),
+            final_sandbox_custom_prompts=resolved_preset.get("final_sandbox_custom_prompts", []),
+            sandbox_compare_baseline=resolved_preset.get("sandbox_compare_baseline", False),
+            # Resolved preset for reporting
+            resolved_preset=resolved_preset,
         )
         # Any experimental opt-in marks the run (single marking path).
         apply_experimental_mark(run, exp_flags)
         run.benchmark_params["experimental_detail"] = build_experimental_detail(
             requested_raw, exp_flags, advanced_settings
         )
+        # Freeze every resolved setting for resume/reporting (spec §9).
+        run.benchmark_params["resolved_settings"] = build_resolved_settings(run)
 
         # Compute and store fingerprint for this run
         from lm_optimizer.services import lms_cli as _lms_cli
@@ -2415,6 +2768,25 @@ class AdaptiveOptimizer:
                 else "MTP-only mode: no draft model discovered - S0 only, "
                 "speculative path not auto-probed"
             )
+
+        # Preset/user probe cap (spec §4.2): bound the number of model loads.
+        # The plan is priority-ordered (S0, high-impact toggles first), so the
+        # cap drops the lowest-value tail rather than random probes.
+        probe_cap = (self.state.run.benchmark_params or {}).get("max_speed_probes")
+        try:
+            probe_cap = int(probe_cap) if probe_cap is not None else None
+        except (TypeError, ValueError):
+            probe_cap = None
+        if probe_cap is not None:
+            probe_cap = max(1, probe_cap)
+            if len(plan) > probe_cap:
+                notes = list(notes)
+                notes.append(
+                    f"probe cap {probe_cap}: {len(plan) - probe_cap} "
+                    "lower-priority probe(s) skipped"
+                )
+                plan = plan[:probe_cap]
+
         self.state.excluded_notes = notes
         self.state.planned_total = len(plan) + 2
         # Checkpoint BEFORE DB save so checkpoint phase >= DB stage on crash
@@ -2448,16 +2820,19 @@ class AdaptiveOptimizer:
             await self._pause_point()
             await self._safe_probe(item, speed_ctx, tested_keys)
 
-        # S5: interactions of the strongest settings only.
+        # S5: interactions of the strongest settings only, within the probe cap.
         passed = [c for c in self.state.tested_configs if c.status == ConfigurationStatus.PASSED]
         if passed:
             from lm_optimizer.services.speed_search import build_interaction_probes
 
             top = sorted(passed, key=lambda r: r.get_avg_generation_tok_s(), reverse=True)[:2]
             s5_items = build_interaction_probes([t.config for t in top], speed_ctx)
+            s5_budget = None if probe_cap is None else max(0, probe_cap - len(plan))
             s5_new = 0
             for item in s5_items:
                 if self.state.should_cancel:
+                    break
+                if s5_budget is not None and s5_new >= s5_budget:
                     break
                 await self._pause_point()
                 if self._candidate_key(item.config) in tested_keys:
@@ -2467,7 +2842,9 @@ class AdaptiveOptimizer:
             self._log_event(
                 "S5 interactions",
                 f"generated={len(s5_items)} already-tested={len(s5_items) - s5_new} "
-                f"new={s5_new} (duplicates never re-run)",
+                f"new={s5_new} (duplicates never re-run"
+                + (f"; cap={probe_cap}" if probe_cap is not None else "")
+                + ")",
             )
 
         probed = [
@@ -3009,6 +3386,11 @@ class AdaptiveOptimizer:
             and c.get_avg_generation_tok_s() > 0
         ]
         reps = self.state.run.validation_repetitions or 5
+        try:
+            vmin = max(1, int(getattr(self.state.run, "validation_repetitions_min", 2) or 2))
+            vmax = max(vmin, int(getattr(self.state.run, "validation_repetitions_max", 5) or 5))
+        except (TypeError, ValueError):
+            vmin, vmax = 2, 5
         if len(speeds) >= 2:
             import statistics as _stats
 
@@ -3020,9 +3402,12 @@ class AdaptiveOptimizer:
             stability = getattr(best, "stability_score", 0.0) or 0.0
         if len(speeds) >= 2 or getattr(best, "stability_score", None):
             reps = 2 if stability >= 0.95 else (3 if stability >= 0.85 else reps)
-        reps = max(2, min(reps, 5))
+        # Preset bounds (spec §2): never fewer than min, never more than max.
+        reps = max(vmin, min(reps, vmax))
         self.state.planned_total += reps  # one unit per validation repetition
-        self._log_event("Final validation", f"reps={reps}")
+        self._log_event(
+            "Final validation", f"reps={reps} bounds={vmin}..{vmax}"
+        )
         validated: list[ConfigurationResult] = []
         for _i in range(reps):
             if self.state.should_cancel:
@@ -3296,11 +3681,61 @@ class AdaptiveOptimizer:
         if self.state.best_config and self.state.best_config.status != ConfigurationStatus.PASSED:
             self.state.best_config = None
             self.state.run.best_config_id = None
+
+        # --- Speed floor enforcement (spec §3) ---
+        speed_floor = getattr(self.state.run, "min_generation_tok_s", 2.0)
+        enforce_floor = getattr(self.state.run, "enforce_min_generation_speed", True)
+        speed_floor_met = False
+        diagnostic_candidate = None
+        diagnostic_speed = None
+        if self.state.best_config:
+            diagnostic_candidate = self.state.best_config
+            diagnostic_speed = self.state.best_config.get_avg_generation_tok_s()
+            speed_floor_met = diagnostic_speed >= speed_floor
+            if enforce_floor and not speed_floor_met:
+                # The fastest candidate stays visible as a diagnostic result;
+                # it is simply not eligible to be the recommended winner.
+                self.state.best_config = None
+                self.state.run.best_config_id = None
+                self.state.run.no_winner_reason = "NO_CONFIG_MEETS_SPEED_FLOOR"
+                self._log_event(
+                    "Speed floor not met",
+                    f"best={diagnostic_speed:.2f} tok/s < floor={speed_floor:.2f} tok/s (enforced)",
+                )
+            elif not enforce_floor and not speed_floor_met:
+                self._log_event(
+                    "Speed floor not met (informational)",
+                    f"best={diagnostic_speed:.2f} tok/s < floor={speed_floor:.2f} tok/s (not enforced)",
+                )
+
         if self.state.best_config:
             self.state.run.best_config_id = self.state.best_config.id
+
         # Record run-level pruning for reports (no schema change: search_space JSON)
         if self.state.flash_required:
             self.state.run.search_space["flash_pruned"] = True
+        # Record speed floor status
+        self.state.run.search_space["speed_floor"] = {
+            "value": speed_floor,
+            "enforced": enforce_floor,
+            "met": speed_floor_met,
+            # Diagnostic fastest candidate stays visible even when it is not
+            # eligible as a winner (spec §3.3 "never fabricate a passing winner").
+            "fastest_candidate_id": (
+                str(diagnostic_candidate.id) if diagnostic_candidate is not None else None
+            ),
+            "fastest_tok_s": (
+                round(float(diagnostic_speed), 3)
+                if diagnostic_speed is not None
+                else None
+            ),
+        }
+        # Persist the explicit no-winner reason (no DB column: benchmark_params
+        # JSON is the durable carrier, so resume/reports keep the same meaning).
+        if self.state.run.no_winner_reason:
+            self.state.run.benchmark_params["no_winner_reason"] = (
+                self.state.run.no_winner_reason
+            )
 
         # Calculate percentage changes vs baseline if available
         if self.state.run.baseline_metrics and self.state.best_config:
@@ -3345,8 +3780,17 @@ class AdaptiveOptimizer:
                 pass
 
         # Explicit terminal state: SUCCESS / PARTIAL_SUCCESS / FAILED.
-        final_status = final_status_for_run(self.state.run)
-        self.state.run.status = final_status
+        # If speed floor enforced and not met, use a special status
+        if enforce_floor and not speed_floor_met:
+            self.state.run.status = RunStatus.COMPLETED_NO_WINNER
+            self._log_event(
+                "Run completed: no config meets speed floor",
+                f"floor={speed_floor:.2f} tok/s enforced",
+            )
+        else:
+            final_status = final_status_for_run(self.state.run)
+            self.state.run.status = final_status
+
         # Keep COMPLETED readable in legacy UIs: stage is always COMPLETE here.
         self.state.run.stage = OptimizationStage.COMPLETE
         state_name, info = classify_run(list(self.state.tested_configs), self.state.run)
@@ -3358,6 +3802,28 @@ class AdaptiveOptimizer:
         run_repo.save(self.state.run)
         self._checkpoint(f"final:{state_name}")
         await self._broadcast({"stage": "complete", "event": "complete", "final": state_name})
+
+        # --- Context strategies (spec §5) ---
+        # Gated by the run's skip plan: granular modes (--reasoning-only,
+        # --speed-only, --quality-only, --skip-phases context) must not run
+        # extra context sweeps after the run (observed 2026-10-26: a
+        # reasoning-only resume spent ~2x40 min on unintended strategies).
+        _skips = run_skip_phases(self.state.run)
+        if (
+            self.state.best_config
+            and self.state.run.context_strategy_modes
+            and "context" not in _skips
+        ):
+            await self._run_context_strategies(self.state.best_config)
+        elif self.state.run.context_strategy_modes and "context" in _skips:
+            self._log_event(
+                "Context strategies skipped",
+                "context phase skipped by the run plan",
+            )
+
+        # --- Final sandbox (spec §6) ---
+        if self.state.best_config and self.state.run.final_sandbox_mode != "off":
+            await self._run_final_sandbox(self.state.best_config)
 
     def pause(self) -> None:
         """Pause optimization."""
@@ -3554,6 +4020,9 @@ class AdaptiveOptimizer:
         # Rebuild in-memory state from DB (source of truth for results).
         full = run_repo.get(str(run_id))
         assert full is not None
+        # Restore the frozen settings before anything reads them (legacy runs
+        # without the snapshot keep safe defaults).
+        apply_persisted_run_settings(full)
         space = self._rebuild_resume_space(full, ckpt)
         # Restore model/hardware identity for scoring.
         model = full.model
@@ -4092,6 +4561,324 @@ class AdaptiveOptimizer:
             fastest = max(all_safe, key=lambda r: r.get_avg_generation_tok_s())
             self.state.best_config = fastest
             self.state.run.best_config_id = fastest.id
+
+    # ============================================================
+    # Context Strategies (spec §5)
+    # ============================================================
+
+    async def _run_context_strategies(self, winner: ConfigurationResult) -> None:
+        """Run multiple context strategies on the winner config (spec §5.1).
+
+        Each strategy produces a separate configuration/result that is recorded
+        independently. The user can then choose which strategy's recommendation
+        to prefer.
+        """
+        from lm_optimizer.services.context_sweep import sweep, geometric_contexts
+        from lm_optimizer.services.context_explorer import MIN_DECODE_TPS
+
+        strategies = getattr(self.state.run, "context_strategy_modes", [])
+        if not strategies:
+            return
+
+        model = self.state.run.model
+        model_limit = getattr(model, "context_limit", 0) or 65536
+        min_ctx = getattr(self.state.run, "min_context", 2048) or 2048
+        max_ctx = getattr(self.state.run, "max_context", model_limit) or model_limit
+        min_tps = getattr(self.state.run, "min_generation_tok_s", 2.0)
+
+        base_config = winner.config
+        results: dict[str, dict] = {}
+
+        for strat_name in strategies:
+            if self.state.should_cancel:
+                break
+            if strat_name not in VALID_CONTEXT_STRATEGIES:
+                self._log_event("Context strategy skipped", f"unknown: {strat_name}")
+                continue
+
+            self._log_event("Context strategy started", f"strategy={strat_name}")
+            await self._pause_point()
+
+            # Build strategy-specific config
+            strat_config = await self._build_strategy_config(base_config, strat_name, model)
+            if strat_config is None:
+                self._log_event("Context strategy unavailable", f"{strat_name} (capability gate)")
+                results[strat_name] = {"available": False, "reason": "capability not supported"}
+                continue
+
+            # Probe function for this strategy
+            async def _probe_at(ctx: int, _cfg=strat_config) -> dict:
+                try:
+                    res = await self._test_config(_cfg, ctx, min_speed=min_tps)
+                    if res is None or res.status != ConfigurationStatus.PASSED:
+                        return {"ok": False, "tok_s": 0.0, "error": res.error if res else "load failed"}
+                    return {
+                        "ok": True,
+                        "tok_s": res.get_avg_generation_tok_s(),
+                        "retrieval_passed": getattr(res, "retrieval_passed", False),
+                    }
+                except Exception as e:
+                    return {"ok": False, "tok_s": 0.0, "error": str(e)[:160]}
+
+            try:
+                sweep_result = await sweep(
+                    _probe_at,
+                    min_ctx=min_ctx,
+                    max_ctx=max_ctx,
+                    min_tps=min_tps,
+                )
+                results[strat_name] = {
+                    "available": True,
+                    "config": strat_config.to_dict(),
+                    **sweep_result,
+                }
+                self._log_event(
+                    "Context strategy complete",
+                    f"{strat_name}: max_stable={sweep_result.get('max_stable_context')}, "
+                    f"max_usable={sweep_result.get('max_usable_context')}",
+                )
+            except Exception as e:
+                logger.error("Context strategy sweep failed", strategy=strat_name, error=str(e))
+                results[strat_name] = {"available": False, "reason": f"sweep failed: {e}"}
+
+        # Store all strategy results
+        self.state.run.phase_b_result = {
+            **(self.state.run.phase_b_result or {}),
+            "context_strategies": results,
+        }
+        self._sync_phase_params()
+        run_repo.save(self.state.run)
+        self._checkpoint("phase:context_strategies:complete")
+        await self._broadcast({"stage": "context_strategies", "event": "context_strategies_complete"})
+
+    async def _build_strategy_config(
+        self, base: LoadConfiguration, strategy: str, model: ModelIdentity
+    ) -> LoadConfiguration | None:
+        """Build a strategy-specific load configuration (spec §5.1).
+
+        Gates modes through live LM Studio capability registry.
+        """
+        from lm_optimizer.services.lm_studio import LMStudioClient
+
+        # Check capabilities
+        caps = getattr(self.client, "_capabilities", None)
+        if caps is None:
+            # Best effort - assume supported
+            pass
+
+        data = {k: v for k, v in base.to_dict().items()}
+
+        if strategy == "winner":
+            # Frozen runtime from Phase A - no changes
+            pass
+
+        elif strategy == "gpu_resident":
+            # GPU-resident weights + KV on GPU
+            data["offload_kv_cache_to_gpu"] = True
+            data["gpu_ratio"] = 1.0
+            # Verify capability
+            if caps and not caps.supports_kv_cache_placement:
+                return None
+
+        elif strategy == "model_first_kv_cpu":
+            # Model on GPU, KV on CPU
+            data["offload_kv_cache_to_gpu"] = False
+            # Keep model layers on GPU as much as possible
+            if data.get("gpu_ratio") is None or data.get("gpu_ratio", 0) < 1.0:
+                data["gpu_ratio"] = 1.0
+            if caps and not caps.supports_kv_cache_placement:
+                return None
+
+        elif strategy == "system_spillover":
+            # Partial GPU offload requires the verified CLI channel (REST
+            # cannot set gpu_ratio).
+            try:
+                from lm_optimizer.services import lms_cli as _lms_cli
+
+                cli_channel = bool(
+                    getattr(self.benchmark, "gpu_via_cli", False)
+                    and _lms_cli.lms_available()
+                )
+            except Exception:
+                cli_channel = False
+            if not cli_channel:
+                return None
+            data["gpu_ratio"] = 0.5
+            data["offload_kv_cache_to_gpu"] = False
+
+        # Create LoadConfiguration with only valid fields
+        valid_fields = {k: v for k, v in data.items() if hasattr(LoadConfiguration, k) and v is not None}
+        return LoadConfiguration(**valid_fields)
+
+    # ============================================================
+    # Final Sandbox (spec §6)
+    # ============================================================
+
+    async def _run_final_sandbox(self, winner: ConfigurationResult) -> None:
+        """Run sandbox tasks against the actual optimizer winner config (spec §6)."""
+        from lm_optimizer.services.sandbox_lab import (
+            SandboxTask,
+            BUILTIN_TASKS,
+            get_task_by_id,
+            validate_custom_prompt,
+        )
+        from lm_optimizer.services.sandbox_runner import run_manual_prompt, run_sandbox_task
+
+        mode = self.state.run.final_sandbox_mode
+        preset_ids = self.state.run.final_sandbox_preset_ids
+        custom_prompts = self.state.run.final_sandbox_custom_prompts
+        compare_baseline = self.state.run.sandbox_compare_baseline
+
+        if mode == "off":
+            return
+
+        tasks_to_run: list[SandboxTask] = []
+        invalid_custom: list[dict] = []
+        manual_specs: dict[str, dict] = {}
+
+        if mode == "one":
+            for pid in preset_ids[:1]:
+                task = get_task_by_id(pid)
+                if task is None:
+                    self._log_event("Final sandbox: unknown preset", str(pid))
+                else:
+                    tasks_to_run.append(task)
+        elif mode == "all":
+            # "all" means every registered compatible built-in (single source
+            # of truth: SANDBOX_TASKS / BUILTIN_TASKS).
+            tasks_to_run.extend(BUILTIN_TASKS.values())
+        elif mode == "custom":
+            for raw in custom_prompts:
+                try:
+                    spec = validate_custom_prompt(raw)
+                except ValueError as e:
+                    invalid_custom.append({"spec": raw, "error": str(e)})
+                    continue
+                if spec["manual_review_only"]:
+                    # Handled by the generation-only path below; no score.
+                    manual_specs[spec["id"]] = spec
+                    tasks_to_run.append(
+                        SandboxTask(
+                            id=spec["id"],
+                            kind=spec["task_kind"],
+                            title=spec["name"],
+                            prompt=spec["prompt"],
+                            checks=[],
+                            max_repair_attempts=0,
+                            timeout_s=spec["timeout_s"],
+                        )
+                    )
+                else:
+                    tasks_to_run.append(
+                        SandboxTask(
+                            id=spec["id"],
+                            kind=spec["task_kind"],
+                            title=spec["name"],
+                            prompt=spec["prompt"],
+                            checks=spec["checks"],
+                            max_repair_attempts=0,
+                            timeout_s=spec["timeout_s"],
+                        )
+                    )
+
+        if not tasks_to_run:
+            self._log_event("Final sandbox skipped", "no valid tasks to run")
+            self.state.run.benchmark_params["final_sandbox"] = {
+                "mode": mode,
+                "tasks": [],
+                "invalid_custom_prompts": invalid_custom,
+            }
+            run_repo.save(self.state.run)
+            return
+
+        self._log_event("Final sandbox started", f"mode={mode} tasks={len(tasks_to_run)}")
+        await self._pause_point()
+
+        model_id = self.state.run.model.id
+        winner_config = winner.config
+
+        sandbox_results: list[dict] = []
+
+        async def _run_one(cfg, task: SandboxTask, slot: str) -> None:
+            if task.kind.value == "text" and not task.checks:
+                spec = manual_specs.get(task.id) or {}
+                result = await run_manual_prompt(
+                    self.client,
+                    model_id,
+                    cfg,
+                    task.prompt,
+                    run_id=str(self.state.run.id),
+                    max_output_tokens=spec.get("max_output_tokens", 2048),
+                    temperature=spec.get("temperature", 0.2),
+                    timeout_s=task.timeout_s,
+                )
+            else:
+                result = await run_sandbox_task(
+                    self.client,
+                    model_id,
+                    cfg,
+                    task,
+                    run_id=str(self.state.run.id),
+                )
+            sandbox_results.append(
+                {
+                    "task_id": task.id,
+                    "task_kind": task.kind.value,
+                    "config": slot,
+                    "result": result,
+                }
+            )
+
+        for task in tasks_to_run:
+            if self.state.should_cancel:
+                break
+            self._log_event("Sandbox task", f"{task.id} ({task.kind.value})")
+            try:
+                await _run_one(winner_config, task, "winner")
+            except Exception as e:
+                logger.error("Sandbox task failed", task=task.id, error=str(e))
+                sandbox_results.append(
+                    {
+                        "task_id": task.id,
+                        "task_kind": task.kind.value,
+                        "config": "winner",
+                        "error": str(e)[:200],
+                    }
+                )
+
+        # Optional baseline comparison (separate A/B, never mixed into scores).
+        if compare_baseline and self.state.run.baseline_config_id:
+            baseline_cfg = self.state.run.get_baseline_config()
+            if baseline_cfg:
+                self._log_event("Sandbox baseline comparison", "running")
+                for task in tasks_to_run:
+                    if self.state.should_cancel:
+                        break
+                    try:
+                        await _run_one(baseline_cfg.config, task, "baseline")
+                    except Exception as e:
+                        sandbox_results.append(
+                            {
+                                "task_id": task.id,
+                                "task_kind": task.kind.value,
+                                "config": "baseline",
+                                "error": str(e)[:200],
+                            }
+                        )
+
+        # Store sandbox results (kept OUT of optimizer scores/Pareto).
+        self.state.run.benchmark_params["final_sandbox"] = {
+            "mode": mode,
+            "tasks": sandbox_results,
+            "invalid_custom_prompts": invalid_custom,
+            "winner_config_id": str(winner.id),
+            "winner_config": winner_config.to_dict(),
+            "affects_optimizer_score": False,
+        }
+        self._sync_phase_params()
+        run_repo.save(self.state.run)
+        self._checkpoint("phase:final_sandbox:complete")
+        await self._broadcast({"stage": "final_sandbox", "event": "final_sandbox_complete"})
 
 
 # Type alias for LoadConfig

@@ -198,6 +198,11 @@ class ModelIdentity:
     # None when the backend does not report it; eligibility then falls back to
     # architecture/name signals and stays conservative.
     model_type: str | None = None
+    # LM Studio key (publisher/model) - distinct from id when variants exist.
+    # e.g. id="swift-qwen3.8-27b@q3_k_m", key="swift-qwen3.8-27b"
+    key: str | None = None
+    # Selected variant from LM Studio (e.g. "swift-qwen3.8-27b@q3_k_m")
+    selected_variant: str | None = None
 
     def __hash__(self):
         return hash(self.id)
@@ -546,6 +551,37 @@ class OptimizationRun:
     phase_b_enabled: bool = False
     phase_b_result: dict | None = None
     advanced_settings: dict = field(default_factory=dict)
+
+    # --- Speed floor (spec §3) ---
+    min_generation_tok_s: float = 2.0
+    enforce_min_generation_speed: bool = True
+
+    # --- Preset and stage selection (spec §2, §7) ---
+    run_preset: str = "standard"  # quick, standard, thorough, custom
+    selected_stages: list[str] = field(default_factory=list)
+    max_speed_probes: int | None = None
+    max_finalists: int | None = None
+    benchmark_repetitions_override: int | None = None
+    validation_repetitions_min: int = 2
+    validation_repetitions_max: int = 5
+    recovery_budget: int = 3
+
+    # --- Context strategies (spec §5) ---
+    context_strategy_modes: list[str] = field(default_factory=list)
+
+    # --- Final sandbox (spec §6) ---
+    final_sandbox_mode: str = "off"  # off, one, all, custom
+    final_sandbox_preset_ids: list[str] = field(default_factory=list)
+    final_sandbox_custom_prompts: list[dict] = field(default_factory=list)
+    sandbox_compare_baseline: bool = False
+
+    # --- Resolved preset budgets (frozen at run start, for reporting) ---
+    resolved_preset: dict | None = None
+
+    # Explicit reason when a terminal run produced no eligible winner
+    # (e.g. NO_CONFIG_MEETS_SPEED_FLOOR). None means "a winner exists or
+    # the run failed for another reason recorded in `error`".
+    no_winner_reason: str | None = None
 
     def get_best_config(self) -> ConfigurationResult | None:
         if self.best_config_id:

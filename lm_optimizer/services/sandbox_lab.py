@@ -40,6 +40,7 @@ class SandboxTaskKind(str, Enum):
     WEB = "web"
     RESEARCH = "research"
     BLENDER = "blender"
+    TEXT = "text"  # plain generation; scored only when checks are supplied
 
 
 @dataclass
@@ -201,6 +202,131 @@ BLENDER_TASK = SandboxTask(
 SANDBOX_TASKS: dict[str, SandboxTask] = {
     t.id: t for t in (WEB_TASK, RESEARCH_TASK, BLENDER_TASK)
 }
+
+#: Canonical alias used by the optimizer's post-run sandbox stage. Exactly
+#: the same registry object - one source of truth for built-in tasks.
+BUILTIN_TASKS: dict[str, SandboxTask] = SANDBOX_TASKS
+
+
+def get_task_by_id(task_id: str) -> SandboxTask | None:
+    """Resolve a built-in sandbox task by stable id (None when unknown)."""
+    return SANDBOX_TASKS.get(task_id)
+
+
+# --- Custom prompt schema + limits (spec §6.3) -----------------------------
+
+CUSTOM_PROMPT_MAX_CHARS = 8000
+CUSTOM_MAX_OUTPUT_TOKENS = 8192
+CUSTOM_TIMEOUT_MIN_S = 30.0
+CUSTOM_TIMEOUT_MAX_S = 3600.0
+CUSTOM_TEMPERATURE_MIN = 0.0
+CUSTOM_TEMPERATURE_MAX = 2.0
+
+#: Display kind -> task kind. `text` stays a plain TEXT task.
+_CUSTOM_KIND_MAP = {
+    "text": SandboxTaskKind.TEXT,
+    "html": SandboxTaskKind.WEB,
+    "web": SandboxTaskKind.WEB,
+    "scene": SandboxTaskKind.BLENDER,
+    "blender": SandboxTaskKind.BLENDER,
+    "research": SandboxTaskKind.RESEARCH,
+}
+
+
+def _stable_custom_id(prompt: str) -> str:
+    """Deterministic id for a custom prompt (stable across processes)."""
+    import hashlib
+
+    return "custom_" + hashlib.sha1(prompt.encode("utf-8")).hexdigest()[:10]
+
+
+def validate_custom_prompt(spec: dict) -> dict:
+    """Validate and normalise one custom sandbox prompt (spec §6.3).
+
+    Enforces prompt/token/timeout/temperature limits and a valid kind.
+    Raises ValueError with an actionable message on invalid input.
+    """
+    if not isinstance(spec, dict):
+        raise ValueError("custom prompt must be an object")
+    prompt = str(spec.get("prompt") or "").strip()
+    if not prompt:
+        raise ValueError("custom prompt requires a non-empty 'prompt'")
+    if len(prompt) > CUSTOM_PROMPT_MAX_CHARS:
+        raise ValueError(
+            f"custom prompt is {len(prompt)} chars; limit is {CUSTOM_PROMPT_MAX_CHARS}"
+        )
+
+    raw_kind = str(spec.get("kind") or "text").lower()
+    kind = _CUSTOM_KIND_MAP.get(raw_kind)
+    if kind is None:
+        raise ValueError(
+            f"unknown custom prompt kind {raw_kind!r}; "
+            f"expected one of {', '.join(sorted(_CUSTOM_KIND_MAP))}"
+        )
+
+    try:
+        max_tokens = int(spec.get("max_output_tokens", 2048))
+    except (TypeError, ValueError):
+        raise ValueError("max_output_tokens must be an integer") from None
+    if not 1 <= max_tokens <= CUSTOM_MAX_OUTPUT_TOKENS:
+        raise ValueError(
+            f"max_output_tokens must be 1..{CUSTOM_MAX_OUTPUT_TOKENS} (got {max_tokens})"
+        )
+
+    try:
+        timeout_s = float(spec.get("timeout_s", 300.0))
+    except (TypeError, ValueError):
+        raise ValueError("timeout_s must be a number") from None
+    if not CUSTOM_TIMEOUT_MIN_S <= timeout_s <= CUSTOM_TIMEOUT_MAX_S:
+        raise ValueError(
+            f"timeout_s must be {CUSTOM_TIMEOUT_MIN_S:.0f}..{CUSTOM_TIMEOUT_MAX_S:.0f} "
+            f"(got {timeout_s})"
+        )
+
+    try:
+        temperature = float(spec.get("temperature", 0.2))
+    except (TypeError, ValueError):
+        raise ValueError("temperature must be a number") from None
+    if not CUSTOM_TEMPERATURE_MIN <= temperature <= CUSTOM_TEMPERATURE_MAX:
+        raise ValueError(
+            f"temperature must be {CUSTOM_TEMPERATURE_MIN}..{CUSTOM_TEMPERATURE_MAX}"
+        )
+
+    checks_raw = spec.get("checks") or []
+    if not isinstance(checks_raw, list):
+        raise ValueError("checks must be a list")
+    checks: list[SandboxCheck] = []
+    for i, c in enumerate(checks_raw):
+        if not isinstance(c, dict) or not c.get("name") or not c.get("kind"):
+            raise ValueError(f"checks[{i}] requires 'name' and 'kind'")
+        if c["kind"] not in ("files", "regex", "json", "exit_code"):
+            raise ValueError(
+                f"checks[{i}].kind must be files/regex/json/exit_code"
+            )
+        checks.append(
+            SandboxCheck(
+                name=str(c["name"]),
+                kind=str(c["kind"]),
+                value=c.get("value"),
+                weight=float(c.get("weight", 1.0)),
+                critical=bool(c.get("critical", False)),
+                negate=bool(c.get("negate", False)),
+            )
+        )
+
+    return {
+        "id": str(spec.get("id") or _stable_custom_id(prompt)),
+        "name": str(spec.get("name") or "Custom task")[:120],
+        "prompt": prompt,
+        "kind": kind.value,
+        "task_kind": kind,
+        "max_output_tokens": max_tokens,
+        "temperature": temperature,
+        "timeout_s": timeout_s,
+        "checks": checks,
+        # No expected criteria -> human review only, never a fabricated score.
+        "manual_review_only": not checks,
+    }
 
 
 # --- 13.5 Security --------------------------------------------------------

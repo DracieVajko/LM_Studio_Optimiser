@@ -217,6 +217,7 @@ class BenchmarkService:
         test_names: list[str] | None = None,
         flash_attention: bool = True,
         offload_kv_cache_to_gpu: bool = True,
+        min_tps: float = 1.0,
     ):
         self.client = client
         self.config = benchmark_config or BenchmarkConfig(
@@ -238,6 +239,9 @@ class BenchmarkService:
         self.mtp_test = mtp_test
         self.reasoning_sweep = reasoning_sweep
         self.quality_lab = quality_lab
+        self.flash_attention = flash_attention
+        self.offload_kv_cache_to_gpu = offload_kv_cache_to_gpu
+        self.min_tps = min_tps
         # --test / --test-only: exact case names to run.
         self.test_names = [str(n) for n in (test_names or []) if str(n).strip()]
         # Set (model id) only when the trailing ensure_unloaded of an attempt

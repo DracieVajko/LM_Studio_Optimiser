@@ -121,16 +121,20 @@ class QualityEvaluator:
         """Evaluate a single test output."""
         prompt_def = self._get_prompt_def(test_name)
         if not prompt_def:
+            # Never award unearned quality: an unknown test has no criteria,
+            # so it cannot contribute a passing score to the aggregate.
             return QualityScore(
-                overall=1.0,
-                task_completion=1.0,
-                factual_consistency=1.0,
-                format_compliance=1.0,
-                coding_correctness=1.0,
-                no_truncation=1.0,
-                no_malformed=1.0,
+                overall=0.0,
+                task_completion=0.0,
+                factual_consistency=0.0,
+                format_compliance=0.0,
+                coding_correctness=0.0,
+                no_truncation=0.0,
+                no_malformed=0.0,
                 confident=False,
-                details={"reason": "Unknown test"},
+                details={"reason": "Unknown test: no criteria"},
+                checks_passed=0,
+                checks_total=0,
             )
 
         if prompt_def.category == "format":
@@ -142,10 +146,22 @@ class QualityEvaluator:
         return self._evaluate_general(output, prompt_def)
 
     def _get_prompt_def(self, test_name: str) -> BenchmarkCase | None:
-        """Get benchmark prompt definition."""
+        """Get benchmark prompt definition.
+
+        Reasoning sweeps create variants named ``<base>_<level>`` (e.g.
+        ``medium_reasoning_xhigh``). They share the base prompt's criteria, so
+        the level suffix is stripped before lookup; otherwise every reasoning
+        output would be "unknown" and silently unscored.
+        """
         for p in BENCHMARK_SUITE:
             if p.name == test_name:
                 return p
+        for suffix in ("_off", "_low", "_medium", "_high", "_xhigh"):
+            if test_name.endswith(suffix):
+                base = test_name[: -len(suffix)]
+                for p in BENCHMARK_SUITE:
+                    if p.name == base:
+                        return p
         return None
 
     def _evaluate_format(self, output: str, prompt_def: BenchmarkCase) -> QualityScore:

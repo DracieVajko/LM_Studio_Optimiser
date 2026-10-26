@@ -117,6 +117,29 @@ class AdvancedSettingsSchema(BaseModel):
     quality_lab: bool = False
     speed_context: int | None = None
 
+    # --- Speed floor (spec §3) ---
+    min_generation_tok_s: float = Field(default=2.0, ge=0.0)
+    enforce_min_generation_speed: bool = True
+
+    # --- Preset and stage selection (spec §2, §7) ---
+    run_preset: str = "standard"  # quick, standard, thorough, custom
+    selected_stages: list[str] = []
+    max_speed_probes: int | None = Field(default=None, ge=1)
+    max_finalists: int | None = Field(default=None, ge=1)
+    benchmark_repetitions: int = Field(default=3, ge=1, le=10)
+    validation_repetitions_min: int = Field(default=2, ge=1, le=10)
+    validation_repetitions_max: int = Field(default=5, ge=1, le=10)
+    recovery_budget: int = Field(default=3, ge=0, le=20)
+
+    # --- Context strategies (spec §5) ---
+    context_strategy_modes: list[str] = []
+
+    # --- Final sandbox (spec §6) ---
+    final_sandbox_mode: str = "off"  # off, one, all, custom
+    final_sandbox_preset_ids: list[str] = []
+    final_sandbox_custom_prompts: list[dict] = []
+    sandbox_compare_baseline: bool = False
+
 
 class OptimizationRequest(BaseModel):
     model_id: str
@@ -125,6 +148,13 @@ class OptimizationRequest(BaseModel):
     quality_threshold: float = Field(default=0.97, ge=0.9, le=1.0)
     advanced_settings: AdvancedSettingsSchema | None = None
     workload_type: str = "interactive"  # interactive | throughput
+
+    # --- Speed floor (spec §3) - top-level for easy access ---
+    min_generation_tok_s: float = Field(default=2.0, ge=0.0)
+    enforce_min_generation_speed: bool = True
+
+    # --- Preset (spec §2) - top-level for easy access ---
+    run_preset: str = "standard"  # quick, standard, thorough, custom
 
 
 class OptimizationRunResponse(BaseModel):

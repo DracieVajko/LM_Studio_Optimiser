@@ -326,6 +326,7 @@ async def _run_optimization(
         reasoning_sweep=advanced.get("reasoning_sweep", False),
         quality_lab=advanced.get("quality_lab", False),
         test_names=advanced.get("test_names") or None,
+        min_tps=advanced.get("min_tps"),
     )
     quality_evaluator = QualityEvaluator(QualityConfig(minimum_score=quality_threshold))
     search_generator = SearchSpaceGenerator(client)
@@ -414,6 +415,21 @@ def _optimize_advanced(
     workload: str,
     gpu_via_cli: bool,
     optimize_context: bool,
+    min_generation_tok_s: float = 2.0,
+    enforce_min_generation_speed: bool = True,
+    run_preset: str = "standard",
+    selected_stages: list[str] | None = None,
+    max_speed_probes: int | None = None,
+    max_finalists: int | None = None,
+    benchmark_repetitions: int | None = None,
+    validation_repetitions_min: int | None = None,
+    validation_repetitions_max: int | None = None,
+    recovery_budget: int | None = None,
+    context_strategy_modes: list[str] | None = None,
+    final_sandbox_mode: str = "off",
+    final_sandbox_preset_ids: list[str] | None = None,
+    final_sandbox_custom_prompts: list[str] | None = None,
+    sandbox_compare_baseline: bool = False,
 ) -> dict:
     """Advanced settings for the optimize command (Phase A/B keys included)."""
     return {
@@ -430,6 +446,27 @@ def _optimize_advanced(
         "selection_threshold": 0.05,
         "gpu_via_cli": gpu_via_cli,
         "optimize_context": optimize_context,
+        # Speed floor
+        "min_generation_tok_s": min_generation_tok_s,
+        "enforce_min_generation_speed": enforce_min_generation_speed,
+        # Preset
+        "run_preset": run_preset,
+        # Stage selection
+        "selected_stages": selected_stages or [],
+        # Budget controls
+        "max_speed_probes": max_speed_probes,
+        "max_finalists": max_finalists,
+        "benchmark_repetitions": benchmark_repetitions,
+        "validation_repetitions_min": validation_repetitions_min,
+        "validation_repetitions_max": validation_repetitions_max,
+        "recovery_budget": recovery_budget,
+        # Context strategies
+        "context_strategy_modes": context_strategy_modes or [],
+        # Sandbox
+        "final_sandbox_mode": final_sandbox_mode,
+        "final_sandbox_preset_ids": final_sandbox_preset_ids or [],
+        "final_sandbox_custom_prompts": final_sandbox_custom_prompts or [],
+        "sandbox_compare_baseline": sandbox_compare_baseline,
     }
 
 
@@ -1122,6 +1159,27 @@ def _preflight_optimize(
     mtp_test: bool = False,
     reasoning_sweep: bool = False,
     quality_lab: bool = False,
+    # Speed floor (spec §3)
+    min_generation_tok_s: float = 2.0,
+    enforce_min_generation_speed: bool = True,
+    # Preset (spec §2)
+    run_preset: str = "standard",
+    # Stage selection (spec §7)
+    selected_stages: list[str] | None = None,
+    # Budget controls (spec §4)
+    max_speed_probes: int | None = None,
+    max_finalists: int | None = None,
+    benchmark_repetitions: int | None = None,
+    validation_repetitions_min: int | None = None,
+    validation_repetitions_max: int | None = None,
+    recovery_budget: int | None = None,
+    # Context strategies (spec §5)
+    context_strategy_modes: list[str] | None = None,
+    # Final sandbox (spec §6)
+    final_sandbox_mode: str = "off",
+    final_sandbox_preset_ids: list[str] | None = None,
+    final_sandbox_custom_prompts: list[str] | None = None,
+    sandbox_compare_baseline: bool = False,
 ) -> dict:
     """Pure local validation + resolution for optimize. No server calls."""
     if not 0 <= warmup_runs <= 5:
@@ -1130,6 +1188,30 @@ def _preflight_optimize(
     if report_sort not in ("run", "speed", "quality"):
         console.print("[red]Invalid --report-sort (run|speed|quality)[/red]")
         sys.exit(2)
+    if min_generation_tok_s < 0:
+        console.print("[red]Invalid --min-generation-tok-s (must be >= 0)[/red]")
+        sys.exit(2)
+    if run_preset not in ("quick", "standard", "thorough", "custom"):
+        console.print("[red]Invalid --preset (quick|standard|thorough|custom)[/red]")
+        sys.exit(2)
+    if final_sandbox_mode not in ("off", "one", "all", "custom"):
+        console.print("[red]Invalid --final-sandbox (off|one|all|custom)[/red]")
+        sys.exit(2)
+
+    valid_stages = {"preflight", "speed", "quality", "recovery", "validation", "context", "sandbox", "experimental"}
+    if selected_stages:
+        invalid = [s for s in selected_stages if s not in valid_stages]
+        if invalid:
+            console.print(f"[red]Invalid --stage: {', '.join(invalid)}. Valid: {', '.join(sorted(valid_stages))}[/red]")
+            sys.exit(2)
+
+    valid_strategies = {"winner", "gpu_resident", "model_first_kv_cpu", "system_spillover"}
+    if context_strategy_modes:
+        invalid = [s for s in context_strategy_modes if s not in valid_strategies]
+        if invalid:
+            console.print(f"[red]Invalid --context-strategy: {', '.join(invalid)}. Valid: {', '.join(sorted(valid_strategies))}[/red]")
+            sys.exit(2)
+
     skips: list[str] = []
     if skip_phases:
         from lm_optimizer.services.optimizer import parse_phase_skips
@@ -1255,6 +1337,27 @@ def _preflight_optimize(
         "reasoning_sweep": reasoning_sweep,
         "quality_lab": quality_lab,
         "test_names": list(test or []),
+        # Speed floor
+        "min_generation_tok_s": min_generation_tok_s,
+        "enforce_min_generation_speed": enforce_min_generation_speed,
+        # Preset
+        "run_preset": run_preset,
+        # Stage selection
+        "selected_stages": selected_stages or [],
+        # Budget controls
+        "max_speed_probes": max_speed_probes,
+        "max_finalists": max_finalists,
+        "benchmark_repetitions": benchmark_repetitions,
+        "validation_repetitions_min": validation_repetitions_min,
+        "validation_repetitions_max": validation_repetitions_max,
+        "recovery_budget": recovery_budget,
+        # Context strategies
+        "context_strategy_modes": context_strategy_modes or [],
+        # Sandbox
+        "final_sandbox_mode": final_sandbox_mode,
+        "final_sandbox_preset_ids": final_sandbox_preset_ids or [],
+        "final_sandbox_custom_prompts": final_sandbox_custom_prompts or [],
+        "sandbox_compare_baseline": sandbox_compare_baseline,
     }
 
 
@@ -1279,6 +1382,11 @@ def optimize(
     max_gpu: float = typer.Option(1.0, "--max-gpu", help="Maximum GPU ratio"),
     style: str = typer.Option(
         "balanced", "--style", help="Benchmark style (precise/balanced/creative)"
+    ),
+    min_tps: float = typer.Option(
+        1.0,
+        "--min-tps",
+        help="Interactive speed floor (spec 8.2 default user limit); hysteresis band scales with it",
     ),
     dry_run: bool = typer.Option(False, "--dry-run", help="Show search space without running"),
     resume_id: str | None = typer.Option(
@@ -1305,10 +1413,91 @@ def optimize(
         "--min-speed",
         help="Minimum generation tok/s to accept a config; slower configs are skipped and marked as too slow",
     ),
+    # Speed floor (spec §3) - default 2.0 tok/s
+    min_generation_tok_s: float = typer.Option(
+        2.0,
+        "--min-generation-tok-s",
+        help="Minimum median generation speed for a winner (default 2.0 tok/s)",
+    ),
+    enforce_min_generation_speed: bool = typer.Option(
+        True,
+        "--enforce-min-generation-speed/--no-enforce-min-generation-speed",
+        help="Enforce the speed floor as a hard eligibility rule (default ON)",
+    ),
+    # Preset (spec §2)
+    run_preset: str = typer.Option(
+        "standard",
+        "--preset",
+        help="Optimization preset: quick, standard, thorough, custom",
+    ),
     optimize_context: bool = typer.Option(
         False,
         "--optimize-context",
         help="Phase B opt-in: max-context sweep on the frozen runtime winner",
+    ),
+    # Stage selection (spec §7) - custom mode only
+    selected_stages: list[str] = typer.Option(
+        None,
+        "--stage",
+        help="Stage to run (repeatable): preflight,speed,quality,recovery,validation,context,sandbox,experimental",
+    ),
+    # Budget controls (spec §4)
+    max_speed_probes: int | None = typer.Option(
+        None,
+        "--max-speed-probes",
+        help="Maximum speed probe count (preset default if unset)",
+    ),
+    max_finalists: int | None = typer.Option(
+        None,
+        "--max-finalists",
+        help="Maximum finalists for quality suite (preset default if unset)",
+    ),
+    benchmark_repetitions: int | None = typer.Option(
+        None,
+        "--benchmark-repetitions",
+        help="Benchmark repetitions per config (preset default if unset)",
+    ),
+    validation_repetitions_min: int | None = typer.Option(
+        None,
+        "--validation-repetitions-min",
+        help="Minimum validation repetitions (preset default if unset)",
+    ),
+    validation_repetitions_max: int | None = typer.Option(
+        None,
+        "--validation-repetitions-max",
+        help="Maximum validation repetitions (preset default if unset)",
+    ),
+    recovery_budget: int | None = typer.Option(
+        None,
+        "--recovery-budget",
+        help="Recovery probe budget (preset default if unset)",
+    ),
+    # Context strategies (spec §5)
+    context_strategy_modes: list[str] = typer.Option(
+        None,
+        "--context-strategy",
+        help="Context strategy to test (repeatable): winner,gpu_resident,model_first_kv_cpu,system_spillover",
+    ),
+    # Final sandbox (spec §6)
+    final_sandbox_mode: str = typer.Option(
+        "off",
+        "--final-sandbox",
+        help="Final sandbox mode: off, one, all, custom",
+    ),
+    final_sandbox_preset_ids: list[str] = typer.Option(
+        None,
+        "--final-sandbox-preset",
+        help="Sandbox preset ID to run (repeatable, for --final-sandbox one/all)",
+    ),
+    final_sandbox_custom_prompts: list[str] = typer.Option(
+        None,
+        "--final-sandbox-prompt",
+        help="Custom sandbox prompt as JSON (repeatable, for --final-sandbox custom)",
+    ),
+    sandbox_compare_baseline: bool = typer.Option(
+        False,
+        "--sandbox-compare-baseline",
+        help="Also run sandbox tasks against baseline/default config for comparison",
     ),
     warmup_runs: int = typer.Option(
         1, "--warmup-runs", help="Warmup suite passes per config 0-5 (0 = fastest, noisier)"
@@ -1485,6 +1674,21 @@ def optimize(
         mtp_test=mtp_test,
         reasoning_sweep=reasoning_sweep,
         quality_lab=quality_lab,
+        min_generation_tok_s=min_generation_tok_s,
+        enforce_min_generation_speed=enforce_min_generation_speed,
+        run_preset=run_preset,
+        selected_stages=selected_stages,
+        max_speed_probes=max_speed_probes,
+        max_finalists=max_finalists,
+        benchmark_repetitions=benchmark_repetitions,
+        validation_repetitions_min=validation_repetitions_min,
+        validation_repetitions_max=validation_repetitions_max,
+        recovery_budget=recovery_budget,
+        context_strategy_modes=context_strategy_modes,
+        final_sandbox_mode=final_sandbox_mode,
+        final_sandbox_preset_ids=final_sandbox_preset_ids,
+        final_sandbox_custom_prompts=final_sandbox_custom_prompts,
+        sandbox_compare_baseline=sandbox_compare_baseline,
     )
 
     if not _preflight_confirm(effective, dry_run, yes, non_interactive):
@@ -1549,6 +1753,21 @@ def optimize(
                 workload,
                 gpu_via_cli,
                 optimize_context,
+                min_generation_tok_s,
+                enforce_min_generation_speed,
+                run_preset,
+                selected_stages,
+                max_speed_probes,
+                max_finalists,
+                benchmark_repetitions,
+                validation_repetitions_min,
+                validation_repetitions_max,
+                recovery_budget,
+                context_strategy_modes,
+                final_sandbox_mode,
+                final_sandbox_preset_ids,
+                final_sandbox_custom_prompts,
+                sandbox_compare_baseline,
             )
 
             if dry_run:
@@ -1559,6 +1778,7 @@ def optimize(
 
             advanced.update(effective["experimental"])
             advanced["min_speed"] = min_speed
+            advanced["min_tps"] = min_tps
             advanced["warmup_runs"] = effective["warmup_runs"]
             advanced["report_sort"] = effective["report_sort"]
             if effective["skip_phases"]:
@@ -1581,6 +1801,12 @@ def optimize(
                 advanced["speed_context"] = int(context)
             advanced["flash"] = flash
             advanced["kv_gpu"] = kv_gpu
+            # Explicit CLI repetition overrides beat the preset; untouched
+            # defaults (3 / 5) leave the preset budget in charge.
+            if repetitions != 3:
+                advanced["benchmark_repetitions"] = int(repetitions)
+            if validation_repetitions != 5:
+                advanced["validation_repetitions_max"] = max(2, int(validation_repetitions))
 
             console.print(f"[bold]Starting optimization for {model}[/bold]")
             console.print(f"  Profile: {profile}")
@@ -3116,6 +3342,11 @@ def ctx(
     quality_threshold: float = typer.Option(
         0.97, "--quality-threshold", help="Pass threshold for quality-rung verdicts"
     ),
+    min_tps: float = typer.Option(
+        1.0,
+        "--min-tps",
+        help="Interactive speed floor for usable-context classification (tok/s)",
+    ),
     retrieval: bool = typer.Option(
         True,
         "--retrieval/--no-retrieval",
@@ -3212,7 +3443,7 @@ def ctx(
                 med = toks_sorted[len(toks_sorted) // 2]
                 return {"ok": True, "tok_s": round(med, 1), "error": ""}
 
-            report = await _ctx_sweep(_probe, min_context, hi, step=step, precheck=_precheck)
+            report = await _ctx_sweep(_probe, min_context, hi, step=step, precheck=_precheck, min_tps=min_tps)
             if _est_cache:
                 console.print("[dim]lms estimates (not proof):[/dim]")
                 for ctx_len in sorted(_est_cache):
