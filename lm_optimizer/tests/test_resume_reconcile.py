@@ -6,6 +6,8 @@ Mock-only; never touches data/optimizer.db or live checkpoints.
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+from lm_optimizer.domain.models import ConfigurationResult
+
 
 def _opt_with_state():
     from lm_optimizer.services import optimizer as _opt
