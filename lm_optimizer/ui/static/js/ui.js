@@ -207,16 +207,19 @@ export const UI = {
                         ${this.renderProfileOption('custom', 'Custom', 'Edit weights manually (must total 100%)', '🎛️')}
                     </div>
                     <div id="custom-weights" class="hidden mt-4 p-4 bg-gray-50 rounded-lg border">
-                        <p class="text-sm font-medium mb-2">Custom Weights (must total 100%)</p>
-                        <div class="grid grid-cols-2 md:grid-cols-3 gap-3 text-sm">
-                            <label>Generation speed <input type="number" id="w-gen" value="30" min="0" max="100" class="form-input w-full">%</label>
-                            <label>Prompt speed <input type="number" id="w-prompt" value="10" min="0" max="100" class="form-input w-full">%</label>
-                            <label>Context <input type="number" id="w-ctx" value="20" min="0" max="100" class="form-input w-full">%</label>
-                            <label>Memory <input type="number" id="w-mem" value="10" min="0" max="100" class="form-input w-full">%</label>
-                            <label>Correctness <input type="number" id="w-qual" value="20" min="0" max="100" class="form-input w-full">%</label>
-                            <label>Stability <input type="number" id="w-stab" value="10" min="0" max="100" class="form-input w-full">%</label>
+                        <p class="text-sm font-medium mb-1">Custom priorities (0.00 – 1.00)</p>
+                        <p class="text-xs text-gray-500 mb-3">Relative importance only — values are normalized automatically. Hard targets live in Quality threshold and Minimum speed below.</p>
+                        <div class="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
+                            <label title="Weight for measured generation speed">Generation speed <input type="number" id="w-gen" value="0.25" min="0" max="1" step="0.05" class="form-input w-full"></label>
+                            <label title="Weight for prompt-processing speed">Prompt speed <input type="number" id="w-prompt" value="0.10" min="0" max="1" step="0.05" class="form-input w-full"></label>
+                            <label title="Weight for time-to-first-token">TTFT <input type="number" id="w-ttft" value="0.10" min="0" max="1" step="0.05" class="form-input w-full"></label>
+                            <label title="Weight for usable context length">Context <input type="number" id="w-ctx" value="0.15" min="0" max="1" step="0.05" class="form-input w-full"></label>
+                            <label title="Weight for memory efficiency (VRAM/RAM)">Memory <input type="number" id="w-mem" value="0.10" min="0" max="1" step="0.05" class="form-input w-full"></label>
+                            <label title="Weight for correctness/quality evidence">Correctness <input type="number" id="w-qual" value="0.20" min="0" max="1" step="0.05" class="form-input w-full"></label>
+                            <label title="Weight for measurement stability">Stability <input type="number" id="w-stab" value="0.10" min="0" max="1" step="0.05" class="form-input w-full"></label>
+                            <label title="Hard floor: configs slower than this cannot win">Min speed (tok/s) <input type="number" id="min-generation-tok-s" value="2.0" min="0" step="0.1" class="form-input w-full"></label>
                         </div>
-                        <div id="weights-total" class="text-xs mt-2 text-gray-500">Total: 100% ✓</div>
+                        <div id="weights-total" class="text-xs mt-2 text-gray-500">Share: normalized automatically</div>
                     </div>
                 </div>
 

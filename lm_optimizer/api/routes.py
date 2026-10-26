@@ -593,6 +593,13 @@ async def start_optimization(request: OptimizationRequest, background_tasks: Bac
         adv = request.advanced_settings.dict() if request.advanced_settings else {}
         adv.setdefault("workload_type", normalize_workload(request.workload_type))
         adv["workload_type"] = normalize_workload(adv.get("workload_type"))
+        # Top-level request fields are authoritative for the speed floor and
+        # preset; advanced_settings defaults must not silently override them.
+        adv["min_generation_tok_s"] = float(request.min_generation_tok_s)
+        adv["enforce_min_generation_speed"] = bool(
+            request.enforce_min_generation_speed
+        )
+        adv["run_preset"] = str(request.run_preset)
 
         # Granular modes: compose the skip set the same way the CLI does, so
         # the web endpoint honours --speed-only/--quality-only/... too.

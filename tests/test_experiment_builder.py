@@ -74,4 +74,7 @@ def test_experiments_nav_present(client):
         response = client.get(path)
         if response.status_code != 200:
             continue
-        assert 'href="/experiments"' in response.text, f"missing nav on {path}"
+        # Experiments live under the single Brewery entry now.
+        assert 'href="/brewery"' in response.text, f"missing Brewery nav on {path}"
+    lab = client.get("/lab")
+    assert 'href="/experiments"' in lab.text, "Brewery must link to the experiment builder"
