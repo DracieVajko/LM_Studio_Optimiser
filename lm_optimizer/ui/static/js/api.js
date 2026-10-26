@@ -176,6 +176,17 @@ export const API = {
         }
     },
 
+    async judge(request) {
+        return this.request('/judge', {
+            method: 'POST',
+            body: JSON.stringify(request),
+        });
+    },
+
+    async exportLmStudioConfig(runId) {
+        return this.request(`/runs/${runId}/export-config`);
+    },
+
     // Apply Configuration
     async applyConfiguration(request) {
         return this.request('/apply', {

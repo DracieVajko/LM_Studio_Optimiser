@@ -1,9 +1,9 @@
 // LM Studio Auto Optimizer - Results Page
 
-import { API } from './api.js?v=11';
-import { UI } from './ui.js?v=11';
-import { Charts } from './charts.js?v=11';
-import { WebSocketManager } from './websocket.js?v=11';
+import { API } from './api.js?v=12';
+import { UI } from './ui.js?v=12';
+import { Charts } from './charts.js?v=12';
+import { WebSocketManager } from './websocket.js?v=12';
 
 const ResultsPage = {
     state: {
@@ -253,6 +253,12 @@ const ResultsPage = {
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path>
                             </svg>
                             Apply Best Config
+                        </button>
+                        <button id="save-lmstudio-config-btn" class="btn btn-outline" title="Download a reusable load-config JSON (llama.cpp: paste into My Models; vLLM: --engine-config-file)">
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1-4l-3 3m0 0L9 3m3 3V4"></path>
+                            </svg>
+                            Save LM Studio config
                         </button>
                         <button id="export-btn" class="btn btn-outline">
                             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -1154,6 +1160,25 @@ const ResultsPage = {
         const applyBtn = document.getElementById('apply-best-btn');
         if (applyBtn) {
             applyBtn.addEventListener('click', () => this.applyBestConfig());
+        }
+
+        // Save a reusable load-config JSON (LM Studio / vLLM)
+        const saveCfgBtn = document.getElementById('save-lmstudio-config-btn');
+        if (saveCfgBtn) {
+            saveCfgBtn.addEventListener('click', async () => {
+                try {
+                    const data = await API.exportLmStudioConfig(this.state.runId);
+                    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+                    const a = document.createElement('a');
+                    a.href = URL.createObjectURL(blob);
+                    a.download = `${(this.state.run.model.id || 'model').replace(/[^\w.-]+/g, '-')}-lmstudio-config.json`;
+                    a.click();
+                    URL.revokeObjectURL(a.href);
+                    UI.showToast('Config exported: llama.cpp values for My Models, vLLM engine-config included', 'success');
+                } catch (err) {
+                    UI.showToast((err && err.message) || 'Export failed', 'error');
+                }
+            });
         }
 
         // Export

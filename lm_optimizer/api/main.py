@@ -204,6 +204,12 @@ async def model_detail_page(request: Request, model_id: str):
     return templates.TemplateResponse(request, "model_detail.html")
 
 
+@app.get("/brewery", response_class=HTMLResponse)
+async def brewery_page(request: Request):
+    """Brewery: Lab + experiment builder under one nav entry."""
+    return templates.TemplateResponse(request, "lab.html")
+
+
 @app.get("/experiments", response_class=HTMLResponse)
 async def experiments_page(request: Request):
     """Experiment Builder: mode -> model -> budget -> review -> run."""

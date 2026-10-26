@@ -87,4 +87,5 @@ def test_lab_nav_present_on_other_pages(client):
         response = client.get(path)
         if response.status_code != 200:
             continue
-        assert 'href="/lab"' in response.text, f"Lab link missing on {path}"
+        # Lab and experiments now live under one "Brewery" entry.
+        assert 'href="/brewery"' in response.text, f"Brewery link missing on {path}"

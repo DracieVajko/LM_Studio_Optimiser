@@ -1,7 +1,7 @@
 // LM Studio Auto Optimizer - History Page
 
-import { API } from './api.js?v=11';
-import { UI } from './ui.js?v=11';
+import { API } from './api.js?v=12';
+import { UI } from './ui.js?v=12';
 
 const HistoryPage = {
     state: {
@@ -258,11 +258,19 @@ const HistoryPage = {
         }
 
         return `
+            <div class="card-body border-b flex items-center gap-2 flex-wrap">
+                <span id="bulk-count" class="text-sm text-gray-500">0 selected</span>
+                <button id="bulk-compare" class="btn btn-outline btn-sm" disabled>Compare selected</button>
+                <button id="bulk-rerun" class="btn btn-outline btn-sm" disabled>Re-run selected</button>
+                <button id="bulk-delete" class="btn btn-danger btn-sm" disabled>Delete selected</button>
+                <button id="bulk-clear" class="btn btn-outline btn-sm">Clear</button>
+            </div>
             <div class="card-body p-0">
                 <div class="table-container">
                     <table class="table history-table">
                         <thead>
                             <tr>
+                                <th class="w-10"><input type="checkbox" id="select-all-runs" title="Select all visible runs"></th>
                                 <th>Date</th>
                                 <th>Model</th>
                                 <th>Profile</th>
@@ -277,6 +285,7 @@ const HistoryPage = {
                         <tbody>
                             ${this.state.filteredRuns.map(r => `
                                 <tr class="run-row hover:bg-gray-50 cursor-pointer" data-run-id="${r.id}">
+                                    <td class="text-center"><input type="checkbox" class="run-select" value="${r.id}"></td>
                                     <td class="font-mono text-sm">${new Date(r.created_at).toLocaleString()}</td>
                                     <td class="model-cell">
                                         <div class="font-medium">${r.model.name}</div>
@@ -350,6 +359,90 @@ const HistoryPage = {
                 if (el) el.value = '';
             });
             this.applyFilters();
+        });
+
+        // Bulk selection (delete / re-run / compare)
+        const boxes = () => Array.from(document.querySelectorAll('.run-select'));
+        const selectedIds = () => boxes().filter(b => b.checked).map(b => b.value);
+        const updateBulk = () => {
+            const n = selectedIds().length;
+            const count = document.getElementById('bulk-count');
+            if (count) count.textContent = `${n} selected`;
+            const del = document.getElementById('bulk-delete');
+            const rerun = document.getElementById('bulk-rerun');
+            const cmp = document.getElementById('bulk-compare');
+            if (del) del.disabled = n === 0;
+            if (rerun) rerun.disabled = n === 0;
+            if (cmp) cmp.disabled = n < 2;
+        };
+        boxes().forEach(b => {
+            b.addEventListener('click', e => e.stopPropagation());
+            b.addEventListener('change', updateBulk);
+        });
+        document.getElementById('select-all-runs')?.addEventListener('change', (e) => {
+            boxes().forEach(b => { b.checked = e.target.checked; });
+            updateBulk();
+        });
+        document.getElementById('bulk-clear')?.addEventListener('click', () => {
+            boxes().forEach(b => { b.checked = false; });
+            const all = document.getElementById('select-all-runs');
+            if (all) all.checked = false;
+            updateBulk();
+        });
+        document.getElementById('bulk-delete')?.addEventListener('click', async () => {
+            const ids = selectedIds();
+            if (!ids.length) return;
+            if (!window.confirm(`Delete ${ids.length} selected run(s) and their configurations?`)) return;
+            let ok = 0, failed = 0;
+            for (const id of ids) {
+                try { await API.deleteRun(id); ok++; }
+                catch (err) { failed++; }
+            }
+            UI.showToast(`Deleted ${ok} run(s)${failed ? `, ${failed} failed (live runs are refused)` : ''}`, failed ? 'warning' : 'success');
+            await this.refresh();
+        });
+        document.getElementById('bulk-rerun')?.addEventListener('click', async () => {
+            const ids = selectedIds();
+            if (!ids.length) return;
+            const run = (this.state.runs || []).find(r => r.id === ids[0]);
+            if (!run) { UI.showToast('Selected run not found', 'error'); return; }
+            try {
+                await API.startOptimization({
+                    model_id: run.model.id,
+                    profile: run.profile,
+                    advanced_settings: {},
+                });
+                UI.showToast(`Re-run started: ${run.model.id}${ids.length > 1 ? ' (only the first selected model was started)' : ''}`, 'success');
+            } catch (err) {
+                UI.showToast((err && err.message) || 'Re-run failed', 'error');
+            }
+        });
+        document.getElementById('bulk-compare')?.addEventListener('click', async () => {
+            const ids = selectedIds();
+            if (ids.length < 2) return;
+            UI.showLoading('Judging selected runs...');
+            try {
+                const res = await API.judge({
+                    run_ids: ids,
+                    backend: 'heuristic',
+                    priority: 'balanced',
+                    wait: true,
+                });
+                UI.hideLoading();
+                const verdict = (res && res.verdict) || {};
+                const text = JSON.stringify(verdict, null, 2)
+                    .replace(/&/g, '&amp;').replace(/</g, '&lt;');
+                UI.openModal(
+                    '<p class="text-sm text-gray-600 mb-2">Heuristic comparison of '
+                    + ids.length + ' selected runs.</p>'
+                    + '<pre class="text-xs whitespace-pre-wrap bg-gray-50 p-3 rounded max-h-[60vh] overflow-auto">'
+                    + text + '</pre>',
+                    'Compare selected runs'
+                );
+            } catch (err) {
+                UI.hideLoading();
+                UI.showToast((err && err.message) || 'Judge failed', 'error');
+            }
         });
 
         // View run buttons
