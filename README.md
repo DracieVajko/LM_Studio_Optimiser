@@ -259,9 +259,16 @@ the quality phase. `--context` is required with `--speed-only` / `--mtp-only`
 exclusive with each other by design. Batch runner for whole model families:
 `python tools/granular_suite.py` (sequential, job-lock aware, per-step
 timeout plus a stall watchdog that kills a step producing no log output for
-20 minutes, then reconciles the dead run). Known limits: `--test` /
-`--test-only` are preflight API surface only (not yet CLI-exposed) and the
-web start endpoint does not accept granular flags until the UI lands.
+20 minutes, then reconciles the dead run).
+
+**Operational tools.** `tools/verify_runs.py` checks persisted runs against
+the acceptance invariants (resolved settings, speed-floor block, probe cap,
+stage skips, explicit no-winner reason); `tools/webui_audit.py` renders every
+page and key API endpoint over HTTP; `tools/speed_summary.py` reports median
+and max generation speed per model; `tools/model_status.py` shows the latest
+run per model. `lm-optimizer lab export-config <run-id>` writes the validated
+winner as a reusable load-config JSON (REST params + vLLM engine config +
+llama.cpp instructions).
 
 **Cleanup (v1.6.x).** `cleanup.bat` one-click maintenance:
 archives the run history first (whole `optimizer.db` snapshot plus
