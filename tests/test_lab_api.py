@@ -89,3 +89,17 @@ def test_lab_nav_present_on_other_pages(client):
             continue
         # Lab and experiments now live under one "Brewery" entry.
         assert 'href="/brewery"' in response.text, f"Brewery link missing on {path}"
+
+
+def test_brewery_page_hosts_lab_and_experiments(client):
+    response = client.get("/brewery")
+    assert response.status_code == 200
+    assert "Brewery" in response.text
+    assert "lab-panel-experiments" in response.text
+    assert "/experiments?embed=1" in response.text
+
+
+def test_experiments_page_still_available(client):
+    response = client.get("/experiments")
+    assert response.status_code == 200
+    assert "Experiment" in response.text
