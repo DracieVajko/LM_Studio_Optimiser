@@ -575,6 +575,9 @@ class OptimizationRun:
     final_sandbox_custom_prompts: list[dict] = field(default_factory=list)
     sandbox_compare_baseline: bool = False
 
+    # --- Scheduled artifact test (fourth option, runs last on the winner) ---
+    artifact_test_id: str | None = None  # builtin task id or "custom:<path>"
+
     # --- Resolved preset budgets (frozen at run start, for reporting) ---
     resolved_preset: dict | None = None
 

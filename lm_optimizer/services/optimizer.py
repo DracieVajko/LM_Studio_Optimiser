@@ -1,10 +1,12 @@
 """Adaptive optimization engine - hardware-agnostic scoring."""
 
 import asyncio
+import json
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 from uuid import UUID
 
@@ -482,6 +484,86 @@ def run_skip_phases(run) -> set[str]:
     return phase_skips_of(getattr(run, "benchmark_params", None))
 
 
+def resolve_phase_contexts(advanced_settings, model_limit) -> tuple[int, int]:
+    """Frozen Phase-A contexts (speed, quality), clamped to the model limit.
+
+    - speed: explicit ``speed_context`` wins, else the derived default.
+    - quality: explicit ``quality_context`` wins, else the legacy derivation.
+
+    The explicit quality default (8192 from CLI/API) prevents the old
+    behaviour where ``--max-context 32768`` silently made the quality suite run
+    at 32K, costing 2-4x for no extra evidence.
+    """
+    from lm_optimizer.services.speed_probe import (
+        quality_context_for,
+        speed_context_for,
+    )
+
+    adv = advanced_settings or {}
+    user_cap = adv.get("max_context")
+    try:
+        limit = int(model_limit or 0) or None
+    except (TypeError, ValueError):
+        limit = None
+
+    speed = None
+    explicit_speed = adv.get("speed_context")
+    if explicit_speed:
+        try:
+            speed = int(explicit_speed)
+        except (TypeError, ValueError):
+            speed = None
+    if speed is None:
+        speed = speed_context_for(user_cap, model_limit)
+    speed = max(256, speed)
+    if limit:
+        speed = min(speed, limit)
+
+    quality = None
+    explicit_quality = adv.get("quality_context")
+    if explicit_quality:
+        try:
+            quality = int(explicit_quality)
+        except (TypeError, ValueError):
+            quality = None
+    if quality is None:
+        quality = quality_context_for(user_cap, model_limit, speed)
+    quality = max(speed, max(256, quality))
+    if limit:
+        quality = min(quality, limit)
+    return speed, quality
+
+
+def validate_artifact_test_id(value):
+    """Validate a scheduled artifact-test selector and return it normalised.
+
+    Accepts a built-in ``SANDBOX_TASKS`` id or ``custom:<path.json>`` (validated
+    with the same custom-prompt schema as the sandbox). Raises ValueError with
+    an actionable message; never silently turns an invalid choice off.
+    """
+    if not value:
+        return None
+    from lm_optimizer.services.sandbox_lab import SANDBOX_TASKS, validate_custom_prompt
+
+    text = str(value).strip()
+    if text in SANDBOX_TASKS:
+        return text
+    if text.startswith("custom:"):
+        path = Path(text.split(":", 1)[1]).expanduser()
+        if not path.is_file():
+            raise ValueError(f"custom artifact test file not found: {path}")
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as e:
+            raise ValueError(f"custom artifact test is not valid JSON: {e}") from None
+        validate_custom_prompt(payload)
+        return text
+    raise ValueError(
+        f"unknown artifact test {text!r}; use one of "
+        f"{', '.join(sorted(SANDBOX_TASKS))} or custom:<path.json>"
+    )
+
+
 #: Run fields frozen at start and restored verbatim on resume (spec §9).
 PERSISTED_RUN_SETTINGS = (
     "min_generation_tok_s",
@@ -499,6 +581,7 @@ PERSISTED_RUN_SETTINGS = (
     "final_sandbox_preset_ids",
     "final_sandbox_custom_prompts",
     "sandbox_compare_baseline",
+    "artifact_test_id",
 )
 
 
@@ -699,6 +782,13 @@ class AdaptiveOptimizer:
             "enforce_min_generation_speed", True
         )
 
+        # --- Scheduled artifact test (fourth option) ---
+        # Fail fast on an unknown task: silently disabling it would let a run
+        # claim "full" while skipping the requested artifact evidence.
+        artifact_test_id = validate_artifact_test_id(
+            advanced_settings.get("artifact_test_id")
+        )
+
         # --- Experimental tail opt-ins ---
         requested_raw = {k: advanced_settings.get(k) for k in EXPERIMENTAL_FLAGS}
         exp_flags = parse_experimental_flags(
@@ -850,6 +940,8 @@ class AdaptiveOptimizer:
             final_sandbox_preset_ids=resolved_preset.get("final_sandbox_preset_ids", []),
             final_sandbox_custom_prompts=resolved_preset.get("final_sandbox_custom_prompts", []),
             sandbox_compare_baseline=resolved_preset.get("sandbox_compare_baseline", False),
+            # Scheduled artifact test
+            artifact_test_id=artifact_test_id,
             # Resolved preset for reporting
             resolved_preset=resolved_preset,
         )
@@ -3569,26 +3661,10 @@ class AdaptiveOptimizer:
         self, advanced_settings: dict, baseline_config: LoadConfiguration | None
     ) -> None:
         """Phase A/B orchestration: SPEED → QUALITY → RECOVERY → validation → B."""
-        from lm_optimizer.services.speed_probe import (
-            quality_context_for,
-            speed_context_for,
-        )
-
         model = self.state.run.model
-        user_cap = (advanced_settings or {}).get("max_context")
-        # Granular modes may pin the speed context explicitly (--speed-only /
-        # --mtp-only --context N). An explicit value wins over the derived one
-        # and is clamped to the model's advertised context limit.
-        explicit_speed = (advanced_settings or {}).get("speed_context")
-        if explicit_speed:
-            try:
-                limit = int(getattr(model, "context_limit", 0) or 0)
-                speed_ctx = min(max(256, int(explicit_speed)), limit or int(explicit_speed))
-            except (TypeError, ValueError):
-                speed_ctx = speed_context_for(user_cap, model.context_limit)
-        else:
-            speed_ctx = speed_context_for(user_cap, model.context_limit)
-        quality_ctx = quality_context_for(user_cap, model.context_limit, speed_ctx)
+        speed_ctx, quality_ctx = resolve_phase_contexts(
+            advanced_settings, model.context_limit
+        )
         self.state.speed_context = speed_ctx
         self.state.quality_context = quality_ctx
         self.state.run.speed_context = speed_ctx
@@ -3824,6 +3900,10 @@ class AdaptiveOptimizer:
         # --- Final sandbox (spec §6) ---
         if self.state.best_config and self.state.run.final_sandbox_mode != "off":
             await self._run_final_sandbox(self.state.best_config)
+
+        # --- Scheduled artifact test (fourth option, runs last) ---
+        if self.state.best_config and self.state.run.artifact_test_id:
+            await self._run_artifact_test(self.state.best_config)
 
     def pause(self) -> None:
         """Pause optimization."""
@@ -4709,6 +4789,115 @@ class AdaptiveOptimizer:
         # Create LoadConfiguration with only valid fields
         valid_fields = {k: v for k, v in data.items() if hasattr(LoadConfiguration, k) and v is not None}
         return LoadConfiguration(**valid_fields)
+
+    # ============================================================
+    # Scheduled Artifact Test (fourth option)
+    # ============================================================
+
+    async def _run_artifact_test(self, winner: ConfigurationResult) -> None:
+        """Run the user-selected artifact task against the exact winner config.
+
+        This is the scheduled fourth option of a full run: it runs last, uses
+        the same verified load channel, records requested/applied config and
+        never changes optimizer scores. Results live in
+        ``benchmark_params["artifact_test"]`` so history/compare can filter by
+        task id.
+        """
+        from lm_optimizer.services.sandbox_lab import (
+            SANDBOX_TASKS,
+            SandboxTask,
+            get_task_by_id,
+            validate_custom_prompt,
+        )
+        from lm_optimizer.services.sandbox_runner import (
+            run_manual_prompt,
+            run_sandbox_task,
+        )
+
+        selector = self.state.run.artifact_test_id
+        if not selector:
+            return
+
+        model_id = self.state.run.model.id
+        config = winner.config
+        spec: dict | None = None
+        task: SandboxTask | None = None
+
+        if selector in SANDBOX_TASKS:
+            task = get_task_by_id(selector)
+        elif selector.startswith("custom:"):
+            path = Path(selector.split(":", 1)[1]).expanduser()
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            spec = validate_custom_prompt(raw)
+            task = SandboxTask(
+                id=spec["id"],
+                kind=spec["task_kind"],
+                title=spec["name"],
+                prompt=spec["prompt"],
+                checks=spec["checks"],
+                max_repair_attempts=0,
+                timeout_s=spec["timeout_s"],
+            )
+        if task is None:
+            self._log_event("Artifact test skipped", f"unknown task {selector!r}")
+            return
+
+        self._log_event("Artifact test started", f"{task.id} ({task.kind.value})")
+        await self._pause_point()
+
+        entry: dict
+        try:
+            if task.kind.value == "text" and not task.checks:
+                result = await run_manual_prompt(
+                    self.client,
+                    model_id,
+                    config,
+                    task.prompt,
+                    run_id=str(self.state.run.id),
+                    max_output_tokens=(spec or {}).get("max_output_tokens", 2048),
+                    temperature=(spec or {}).get("temperature", 0.2),
+                    timeout_s=task.timeout_s,
+                )
+                score = None
+            else:
+                result = await run_sandbox_task(
+                    self.client, model_id, config, task, run_id=str(self.state.run.id)
+                )
+                score = (result.get("result") or {}).get("penalized_score")
+            entry = {
+                "task_id": task.id,
+                "task_kind": task.kind.value,
+                "selector": selector,
+                "config_id": str(winner.id),
+                "config_fingerprint": (self.state.run.benchmark_params or {}).get(
+                    "fingerprint"
+                ),
+                "success": bool(result.get("success")),
+                "score": score,
+                "manual_review_only": bool(result.get("manual_review_only", False)),
+                "artifacts": (result.get("result") or {}).get("artifacts", []),
+                "config_applied": result.get("config_applied"),
+                "echo_mismatches": result.get("echo_mismatches"),
+                "unloaded": result.get("unloaded"),
+                "duration_s": result.get("duration_s"),
+                "error": result.get("error"),
+            }
+        except Exception as e:  # noqa: BLE001 - artifact failure is contained
+            logger.error("Artifact test failed", task=task.id, error=str(e))
+            entry = {
+                "task_id": task.id,
+                "task_kind": task.kind.value,
+                "selector": selector,
+                "config_id": str(winner.id),
+                "success": False,
+                "error": f"{type(e).__name__}: {e}"[:200],
+            }
+
+        self.state.run.benchmark_params["artifact_test"] = entry
+        self._sync_phase_params()
+        run_repo.save(self.state.run)
+        self._checkpoint("phase:artifact_test:complete")
+        await self._broadcast({"stage": "artifact_test", "event": "artifact_test_complete"})
 
     # ============================================================
     # Final Sandbox (spec §6)

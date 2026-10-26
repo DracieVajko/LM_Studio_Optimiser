@@ -301,3 +301,61 @@ def test_finalize_runs_context_strategies_when_context_enabled(monkeypatch):
     opt._run_context_strategies = fake_strategies
     asyncio.run(opt._finalize())
     assert len(called) == 1
+
+
+# --- quality context default ------------------------------------------------
+
+def test_quality_context_defaults_to_8k_despite_32k_max():
+    from lm_optimizer.services.optimizer import resolve_phase_contexts
+
+    speed, quality = resolve_phase_contexts(
+        {"max_context": 32768, "quality_context": 8192}, 32768
+    )
+    assert speed == 4096
+    assert quality == 8192
+    assert quality <= 32768
+
+
+def test_quality_context_legacy_without_explicit_value():
+    from lm_optimizer.services.optimizer import resolve_phase_contexts
+
+    _speed, quality = resolve_phase_contexts({"max_context": 32768}, 32768)
+    assert quality == 32768  # old derivation retained when not provided
+
+
+def test_quality_context_clamps_and_never_below_speed():
+    from lm_optimizer.services.optimizer import resolve_phase_contexts
+
+    assert resolve_phase_contexts(
+        {"max_context": 32768, "quality_context": 4096}, 32768
+    ) == (4096, 4096)
+    assert resolve_phase_contexts(
+        {"max_context": 32768, "quality_context": 65536}, 32768
+    )[1] == 32768
+    assert resolve_phase_contexts(
+        {"speed_context": 8192, "quality_context": 2048}, 32768
+    )[1] == 8192
+
+
+def test_api_quality_context_default_and_validation():
+    from lm_optimizer.api.schemas import AdvancedSettingsSchema
+
+    assert AdvancedSettingsSchema().quality_context == 8192
+    assert AdvancedSettingsSchema(quality_context=4096).quality_context == 4096
+    with pytest.raises(Exception):
+        AdvancedSettingsSchema(quality_context=128)
+
+
+def test_cli_rejects_tiny_quality_context_without_connecting(monkeypatch):
+    from typer.testing import CliRunner
+
+    from lm_optimizer.cli import main as _cli
+
+    mk = MagicMock()
+    monkeypatch.setattr(_cli, "get_client", mk)
+    result = CliRunner().invoke(
+        _cli.app, ["optimize", "m", "--quality-context", "100", "--yes"]
+    )
+    assert result.exit_code == 2
+    assert "quality-context" in result.output
+    mk.assert_not_called()

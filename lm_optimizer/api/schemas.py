@@ -88,6 +88,9 @@ class LoadConfigSchema(BaseModel):
 class AdvancedSettingsSchema(BaseModel):
     min_context: int | None = 2048
     max_context: int | None = 32768
+    # Context for the quality suite. Default 8192 keeps the suite affordable;
+    # it is independent of max_context (which only caps the search space).
+    quality_context: int = Field(default=8192, ge=256)
     custom_contexts: list[int] = []
     min_gpu_ratio: float | None = 0.0
     max_gpu_ratio: float | None = 1.0
@@ -139,6 +142,9 @@ class AdvancedSettingsSchema(BaseModel):
     final_sandbox_preset_ids: list[str] = []
     final_sandbox_custom_prompts: list[dict] = []
     sandbox_compare_baseline: bool = False
+
+    # --- Scheduled artifact test (fourth option, runs last) ---
+    artifact_test_id: str | None = None  # builtin id or "custom:<path.json>"
 
 
 class OptimizationRequest(BaseModel):
@@ -194,6 +200,8 @@ class OptimizationRunResponse(BaseModel):
     best_quality: float | None = None
     best_context_length: int | None = None
     has_validated_winner: bool = False
+    # Scheduled artifact test summary (None when not requested/run).
+    artifact_test: dict | None = None
 
 
 class StatsResponse(BaseModel):

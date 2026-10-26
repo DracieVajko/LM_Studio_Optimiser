@@ -425,11 +425,13 @@ def _optimize_advanced(
     validation_repetitions_min: int | None = None,
     validation_repetitions_max: int | None = None,
     recovery_budget: int | None = None,
+    quality_context: int = 8192,
     context_strategy_modes: list[str] | None = None,
     final_sandbox_mode: str = "off",
     final_sandbox_preset_ids: list[str] | None = None,
     final_sandbox_custom_prompts: list[str] | None = None,
     sandbox_compare_baseline: bool = False,
+    artifact_test_id: str | None = None,
 ) -> dict:
     """Advanced settings for the optimize command (Phase A/B keys included)."""
     return {
@@ -460,6 +462,10 @@ def _optimize_advanced(
         "validation_repetitions_min": validation_repetitions_min,
         "validation_repetitions_max": validation_repetitions_max,
         "recovery_budget": recovery_budget,
+        # Quality context (explicit default 8192, independent of --max-context)
+        "quality_context": quality_context,
+        # Scheduled artifact test
+        "artifact_test_id": artifact_test_id,
         # Context strategies
         "context_strategy_modes": context_strategy_modes or [],
         # Sandbox
@@ -594,15 +600,22 @@ def _phase_transparency_table(run, best):
 
 
 def _print_phase_dry_run(
-    client, model_info, max_context: int, gpu_via_cli: bool, optimize_context: bool
+    client,
+    model_info,
+    max_context: int,
+    gpu_via_cli: bool,
+    optimize_context: bool,
+    quality_context: int | None = None,
 ) -> None:
     """Phase A/B plan preview (no Cartesian estimate, no server writes)."""
     from lm_optimizer.domain.models import LoadConfiguration
-    from lm_optimizer.services.speed_probe import quality_context_for, speed_context_for
+    from lm_optimizer.services.optimizer import resolve_phase_contexts
     from lm_optimizer.services.speed_search import SpeedCaps, build_speed_plan
 
-    speed_ctx = speed_context_for(max_context, model_info.context_limit)
-    quality_ctx = quality_context_for(max_context, model_info.context_limit, speed_ctx)
+    speed_ctx, quality_ctx = resolve_phase_contexts(
+        {"max_context": max_context, "quality_context": quality_context},
+        model_info.context_limit,
+    )
     caps = client.capabilities
     rest = {"context_length"}
     for attr, key in (
@@ -1173,6 +1186,9 @@ def _preflight_optimize(
     validation_repetitions_min: int | None = None,
     validation_repetitions_max: int | None = None,
     recovery_budget: int | None = None,
+    quality_context: int = 8192,
+    # Scheduled artifact test (fourth option)
+    artifact_test_id: str | None = None,
     # Context strategies (spec §5)
     context_strategy_modes: list[str] | None = None,
     # Final sandbox (spec §6)
@@ -1190,6 +1206,16 @@ def _preflight_optimize(
         sys.exit(2)
     if min_generation_tok_s < 0:
         console.print("[red]Invalid --min-generation-tok-s (must be >= 0)[/red]")
+        sys.exit(2)
+    if quality_context < 256:
+        console.print("[red]Invalid --quality-context (must be >= 256)[/red]")
+        sys.exit(2)
+    from lm_optimizer.services.optimizer import validate_artifact_test_id
+
+    try:
+        artifact_test_id = validate_artifact_test_id(artifact_test_id)
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
         sys.exit(2)
     if run_preset not in ("quick", "standard", "thorough", "custom"):
         console.print("[red]Invalid --preset (quick|standard|thorough|custom)[/red]")
@@ -1351,6 +1377,10 @@ def _preflight_optimize(
         "validation_repetitions_min": validation_repetitions_min,
         "validation_repetitions_max": validation_repetitions_max,
         "recovery_budget": recovery_budget,
+        # Quality context (explicit default 8192, independent of --max-context)
+        "quality_context": quality_context,
+        # Scheduled artifact test
+        "artifact_test_id": artifact_test_id,
         # Context strategies
         "context_strategy_modes": context_strategy_modes or [],
         # Sandbox
@@ -1471,6 +1501,17 @@ def optimize(
         None,
         "--recovery-budget",
         help="Recovery probe budget (preset default if unset)",
+    ),
+    quality_context: int = typer.Option(
+        8192,
+        "--quality-context",
+        help="Context length for the quality suite (default 8192; independent of --max-context)",
+    ),
+    artifact_test: str | None = typer.Option(
+        None,
+        "--artifact-test",
+        help="Scheduled artifact test run last on the winner: web_dashboard, "
+        "blender_skyblock, research_synthesis, or custom:<path.json>",
     ),
     # Context strategies (spec §5)
     context_strategy_modes: list[str] = typer.Option(
@@ -1684,6 +1725,8 @@ def optimize(
         validation_repetitions_min=validation_repetitions_min,
         validation_repetitions_max=validation_repetitions_max,
         recovery_budget=recovery_budget,
+        quality_context=quality_context,
+        artifact_test_id=artifact_test,
         context_strategy_modes=context_strategy_modes,
         final_sandbox_mode=final_sandbox_mode,
         final_sandbox_preset_ids=final_sandbox_preset_ids,
@@ -1763,16 +1806,19 @@ def optimize(
                 validation_repetitions_min,
                 validation_repetitions_max,
                 recovery_budget,
+                quality_context,
                 context_strategy_modes,
                 final_sandbox_mode,
                 final_sandbox_preset_ids,
                 final_sandbox_custom_prompts,
                 sandbox_compare_baseline,
+                artifact_test,
             )
 
             if dry_run:
                 _print_phase_dry_run(
-                    client, model_info, max_context, gpu_via_cli, optimize_context
+                    client, model_info, max_context, gpu_via_cli, optimize_context,
+                    quality_context,
                 )
                 return
 

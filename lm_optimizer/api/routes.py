@@ -279,6 +279,7 @@ def _convert_run(r, config_count: int = 0, stale: bool = False) -> OptimizationR
         best_quality=winner["best_quality"],
         best_context_length=winner["best_context_length"],
         has_validated_winner=winner["has_validated_winner"],
+        artifact_test=(r.benchmark_params or {}).get("artifact_test"),
     )
 
 
@@ -604,6 +605,22 @@ async def start_optimization(request: OptimizationRequest, background_tasks: Bac
             adv["skip_phases"] = compose_granular_skips(adv)
         if adv.get("reasoning_sweep"):
             adv["include_categories"] = {"reasoning"}
+
+        # Scheduled artifact test: validate before any run is created so an
+        # unknown task fails fast instead of being silently disabled.
+        if adv.get("artifact_test_id"):
+            from lm_optimizer.services.optimizer import validate_artifact_test_id
+
+            try:
+                adv["artifact_test_id"] = validate_artifact_test_id(
+                    adv["artifact_test_id"]
+                )
+            except ValueError as e:
+                try:
+                    await client.close()
+                except Exception:
+                    pass
+                raise HTTPException(status_code=422, detail=str(e)[:300]) from None
 
         # Create services
         benchmark_service = BenchmarkService(
