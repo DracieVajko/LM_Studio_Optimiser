@@ -1106,3 +1106,190 @@ def save_default(
     for key, value in result.fields.items():
         table.add_row(key, json.dumps(value))
     console.print(table)
+
+
+def _winner_config(run, run_id: str):
+    """A run's validated winner config, with the context_length fallback."""
+    from dataclasses import replace
+
+    best = run.get_best_config() if hasattr(run, "get_best_config") else None
+    config = getattr(best, "config", None)
+    if config is None:
+        console.print(f"[red]No validated winner in run {run_id}[/red]")
+        raise typer.Exit(1)
+    if config.context_length is None and getattr(best, "context_length", None):
+        config = replace(config, context_length=best.context_length)
+    return config
+
+
+@app.command("diff-default")
+def diff_default(
+    run_id: str = typer.Argument(..., help="Run ID with a validated winner"),
+):
+    """Show how a model's LM Studio defaults differ from the run's winner.
+
+    Read-only: the defaults file is never written by this command.
+    """
+    from lm_optimizer.database.repositories import run_repo
+    from lm_optimizer.services.lmstudio_defaults import DefaultsError, diff_defaults
+
+    run = run_repo.get(run_id)
+    if not run:
+        console.print(f"[red]Run not found: {run_id}[/red]")
+        raise typer.Exit(1)
+    config = _winner_config(run, run_id)
+    model_id = getattr(getattr(run, "model", None), "id", "") or ""
+    try:
+        diff = diff_defaults(model_id, config)
+    except DefaultsError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1) from None
+
+    console.print(f"Model: {diff.model_id}")
+    console.print(f"File:  {diff.path}")
+    if not diff.changes:
+        console.print("[green]Defaults are already up to date.[/green]")
+    else:
+        table = Table(title=f"{len(diff.changes)} field(s) would change")
+        table.add_column("Key")
+        table.add_column("Current")
+        table.add_column("Winner")
+        for change in diff.changes:
+            current = (
+                "-"
+                if change.get("kind") == "added"
+                else json.dumps(change.get("current"))
+            )
+            table.add_row(
+                str(change.get("key")),
+                current,
+                json.dumps(change.get("winner")),
+            )
+        console.print(table)
+    console.print(
+        f"{len(diff.changes)} change(s), {len(diff.unchanged)} unchanged, "
+        f"{len(diff.preserved)} preserved key(s)"
+    )
+
+
+@app.command("restore-default")
+def restore_default(
+    model: str = typer.Argument(..., help="Model ID whose defaults to restore"),
+    backup: str = typer.Option("latest", "--backup", help="Backup name, or 'latest'"),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Show what would be restored, change nothing"
+    ),
+    yes: bool = typer.Option(
+        False, "--yes", "-y", help="Restore without asking for confirmation"
+    ),
+):
+    """Restore a model's LM Studio defaults from a backup.
+
+    The current file is backed up before it is overwritten. An unknown
+    backup fails before anything is written or any question is asked.
+    """
+    from lm_optimizer.services.lmstudio_defaults import DefaultsError, restore_defaults
+
+    try:
+        preview = restore_defaults(model, backup=backup, dry_run=True)
+    except DefaultsError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1) from None
+
+    if not yes and not dry_run:
+        console.print(f"Restore {model} from backup: {preview.restored_from}")
+        typer.confirm("Overwrite the current LM Studio defaults?", abort=True)
+
+    try:
+        result = (
+            preview
+            if dry_run
+            else restore_defaults(model, backup=backup, dry_run=False)
+        )
+    except DefaultsError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1) from None
+
+    console.print(f"Model: {result.model_id}")
+    console.print(f"restored_from: {result.restored_from}")
+    console.print(f"noop: {result.noop}")
+    console.print(f"backup_path: {result.backup_path or '-'}")
+    console.print(f"dry_run: {result.dry_run}")
+    if dry_run:
+        console.print(f"[yellow]Dry run[/yellow] — {result.path} not written")
+    elif result.noop:
+        console.print(f"[green]No change[/green]: {result.path} already matches")
+    else:
+        console.print(f"[green]Restored[/green]: {result.path}")
+
+
+def _print_verify_result(result: dict) -> None:
+    """Render a ``verify_defaults`` payload; exit 1 when it is not verified."""
+    if not result.get("verified"):
+        console.print("[red]not verified[/red]")
+        if result.get("error"):
+            console.print(f"[red]{result['error']}[/red]")
+        mismatches = result.get("mismatches") or {}
+        if mismatches:
+            table = Table(title="Mismatches")
+            table.add_column("Field")
+            table.add_column("Expected")
+            table.add_column("Actual")
+            for key, values in mismatches.items():
+                table.add_row(
+                    str(key),
+                    json.dumps(values.get("expected")),
+                    json.dumps(values.get("actual")),
+                )
+            console.print(table)
+        raise typer.Exit(1)
+    checked = result.get("checked") or {}
+    console.print(f"[green]verified[/green] — {len(checked)} field(s) match")
+    unverified = result.get("unverified") or []
+    if unverified:
+        console.print(f"[yellow]not echoed by LM Studio: {', '.join(unverified)}[/yellow]")
+    if not result.get("unloaded"):
+        console.print("[yellow]model was not unloaded[/yellow]")
+
+
+@app.command("verify-default")
+def verify_default(
+    run_id: str = typer.Argument(..., help="Run ID with a validated winner"),
+):
+    """Verify the saved defaults with an echo load (never writes).
+
+    LM Studio resolves the saved default when loading with an empty config
+    and echoes the resolved values back. Only echoed fields are verified;
+    the model is unloaded again in every case.
+    """
+    import asyncio
+
+    from lm_optimizer.api import routes
+    from lm_optimizer.database.repositories import run_repo
+    from lm_optimizer.services.lmstudio_default_verify import verify_defaults
+
+    run = run_repo.get(run_id)
+    if not run:
+        console.print(f"[red]Run not found: {run_id}[/red]")
+        raise typer.Exit(1)
+    config = _winner_config(run, run_id)
+    model_id = getattr(getattr(run, "model", None), "id", "") or ""
+
+    async def _run():
+        client_result = routes.get_lm_client(echo_probe=False)
+        if hasattr(client_result, "__await__"):
+            client = await client_result
+        else:
+            client = client_result
+        try:
+            return await verify_defaults(model_id, config, client=client)
+        finally:
+            try:
+                close = getattr(client, "close", None)
+                if close is not None:
+                    await close()
+            except Exception:
+                pass
+
+    result = asyncio.run(_run())
+    _print_verify_result(result)
