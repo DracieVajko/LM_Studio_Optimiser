@@ -23,9 +23,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import tempfile
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +40,8 @@ HOME_ENV = "LM_OPTIMIZER_LMSTUDIO_HOME"
 DEFAULTS_SUBDIR = Path(".internal") / "user-concrete-model-default-config"
 MODEL_DATA_PATH = Path(".internal") / "model-data.json"
 BACKUP_SUFFIX = ".optimizer-backup"
+BACKUP_KEEP = 10
+_BACKUP_TIMESTAMP_RE = re.compile(r"^\d{8}T\d{6}Z(-\d+)?$")
 
 
 class DefaultsError(RuntimeError):
@@ -76,6 +80,16 @@ class DefaultsSaveResult:
             "backup_path": str(self.backup_path) if self.backup_path else None,
             "dry_run": self.dry_run,
         }
+
+
+@dataclass(frozen=True)
+class BackupEntry:
+    """A single defaults backup discovered on disk."""
+
+    name: str
+    path: Path
+    modified: float
+    legacy: bool
 
 
 # ``model field -> (canonical LM Studio key, legacy key, value kind)``.
@@ -373,6 +387,98 @@ def _atomic_write(path: Path, document: dict[str, Any]) -> None:
         tmp.unlink(missing_ok=True)
 
 
+def _backup_prefix(path: Path) -> str:
+    return f"{path.name}{BACKUP_SUFFIX}"
+
+
+def _is_service_backup_name(path: Path, name: str) -> bool:
+    prefix = _backup_prefix(path)
+    if not name.startswith(prefix + "-"):
+        return False
+    suffix = name[len(prefix) + 1 :]
+    return bool(_BACKUP_TIMESTAMP_RE.match(suffix))
+
+
+def list_backups(path: Path) -> list[BackupEntry]:
+    """List defaults backups newest-first.
+
+    Recognises the legacy ``<name>.optimizer-backup`` file plus timestamped
+    ``<name>.optimizer-backup-<UTC stamp>`` files (and their ``-N`` collision
+    variants).
+    """
+    directory = path.parent
+    if not directory.exists():
+        return []
+    prefix = _backup_prefix(path)
+    entries: list[BackupEntry] = []
+    for candidate in directory.iterdir():
+        if not candidate.is_file():
+            continue
+        name = candidate.name
+        if name == prefix:
+            legacy = True
+        elif name.startswith(prefix + "-"):
+            legacy = False
+        else:
+            continue
+        try:
+            modified = candidate.stat().st_mtime
+        except OSError:
+            continue
+        entries.append(
+            BackupEntry(name=name, path=candidate, modified=modified, legacy=legacy)
+        )
+    entries.sort(key=lambda entry: (entry.modified, entry.name), reverse=True)
+    return entries
+
+
+def prune_backups(path: Path, *, keep: int = 10) -> None:
+    """Delete oldest timestamped backups beyond ``keep``.
+
+    Only files whose names were produced by this service are touched; the
+    legacy ``.optimizer-backup`` and any unrelated files are preserved.
+    """
+    directory = path.parent
+    if not directory.exists() or keep < 0:
+        return
+    timestamped: list[Path] = []
+    for candidate in directory.iterdir():
+        if not candidate.is_file():
+            continue
+        if not _is_service_backup_name(path, candidate.name):
+            continue
+        timestamped.append(candidate)
+    timestamped.sort(key=lambda p: p.name, reverse=True)
+    for stale in timestamped[keep:]:
+        try:
+            stale.unlink()
+        except OSError:
+            continue
+
+
+def create_backup(
+    path: Path, *, keep: int = 10, now: datetime | None = None
+) -> Path | None:
+    """Copy ``path`` to a timestamped backup and prune, or ``None`` if missing."""
+    if not path.exists():
+        return None
+    if now is None:
+        now = datetime.now(timezone.utc)
+    stamp = now.strftime("%Y%m%dT%H%M%SZ")
+    directory = path.parent
+    directory.mkdir(parents=True, exist_ok=True)
+    base_name = f"{path.name}{BACKUP_SUFFIX}-{stamp}"
+    candidate = directory / base_name
+    if candidate.exists():
+        index = 1
+        while (directory / f"{base_name}-{index}").exists():
+            index += 1
+        candidate = directory / f"{base_name}-{index}"
+    shutil.copy2(path, candidate)
+    prune_backups(path, keep=keep)
+    return candidate
+
+
 def apply_defaults(
     model_id: str,
     config: LoadConfiguration,
@@ -397,8 +503,7 @@ def apply_defaults(
     backup_path: Path | None = None
     if not dry_run:
         if existed and backup:
-            backup_path = path.with_name(path.name + BACKUP_SUFFIX)
-            shutil.copy2(path, backup_path)
+            backup_path = create_backup(path, keep=BACKUP_KEEP)
         _atomic_write(path, document)
 
     return DefaultsSaveResult(

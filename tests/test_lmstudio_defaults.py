@@ -22,10 +22,15 @@ from lm_optimizer.domain.models import (
     OptimizationRun,
 )
 from lm_optimizer.services.lmstudio_defaults import (
+    BACKUP_KEEP,
+    BackupEntry,
     DefaultsError,
     ModelNotFoundError,
     NoWinnerError,
     apply_defaults,
+    create_backup,
+    list_backups,
+    prune_backups,
     resolve_defaults_path,
     save_run_defaults,
 )
@@ -384,3 +389,36 @@ def test_every_prefixed_key_is_an_llm_load_key(tmp_path):
     result = apply_defaults("prism-ml/bonsai-27b", _config(), home=home)
 
     assert all(key.startswith("llm.load.") for key in result.fields)
+
+def test_create_backup_uses_timestamped_name(tmp_path):
+    path = tmp_path / "model.json"
+    path.write_text("{}", encoding="utf-8")
+    backup = create_backup(path)
+    assert backup is not None
+    assert backup.name.startswith("model.json.optimizer-backup-")
+    assert backup.read_text(encoding="utf-8") == "{}"
+
+
+def test_create_backup_returns_none_for_missing_file(tmp_path):
+    assert create_backup(tmp_path / "missing.json") is None
+
+
+def test_prune_keeps_only_newest_timestamped(tmp_path):
+    path = tmp_path / "model.json"
+    path.write_text("{}", encoding="utf-8")
+    for stamp in ("20260101T000000Z", "20260102T000000Z", "20260103T000000Z"):
+        (tmp_path / f"model.json.optimizer-backup-{stamp}").write_text("{}", encoding="utf-8")
+    prune_backups(path, keep=2)
+    names = {p.name for p in tmp_path.glob("model.json.optimizer-backup-*")}
+    assert "model.json.optimizer-backup-20260101T000000Z" not in names
+    assert "model.json.optimizer-backup-20260102T000000Z" in names
+
+
+def test_list_backups_includes_legacy(tmp_path):
+    path = tmp_path / "model.json"
+    path.write_text("{}", encoding="utf-8")
+    (tmp_path / "model.json.optimizer-backup").write_text("{}", encoding="utf-8")
+    (tmp_path / "model.json.optimizer-backup-20260103T000000Z").write_text("{}", encoding="utf-8")
+    entries = list_backups(path)
+    assert {e.legacy for e in entries} == {True, False}
+    assert entries[0].legacy is False  # newest first
