@@ -417,7 +417,7 @@ def list_backups(path: Path) -> list[BackupEntry]:
         name = candidate.name
         if name == prefix:
             legacy = True
-        elif name.startswith(prefix + "-"):
+        elif _is_service_backup_name(path, name):
             legacy = False
         else:
             continue
@@ -464,6 +464,10 @@ def create_backup(
         return None
     if now is None:
         now = datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    else:
+        now = now.astimezone(timezone.utc)
     stamp = now.strftime("%Y%m%dT%H%M%SZ")
     directory = path.parent
     directory.mkdir(parents=True, exist_ok=True)
@@ -475,7 +479,8 @@ def create_backup(
             index += 1
         candidate = directory / f"{base_name}-{index}"
     shutil.copy2(path, candidate)
-    prune_backups(path, keep=keep)
+    if keep >= 1:
+        prune_backups(path, keep=keep)
     return candidate
 
 
