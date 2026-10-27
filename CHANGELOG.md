@@ -5,6 +5,7 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **Persistence loop**: timestamped backups (`optimizer-backup-<utc>`), keep newest 10, legacy `.optimizer-backup` recognized; `lab diff-default`, `lab restore-default`, `lab verify-default`; `GET /api/model-default`, `GET /api/runs/{run_id}/default-diff`, `POST /api/model-default/restore`, `POST /api/runs/{run_id}/verify-default`, `POST /api/runs/{run_id}/save-default?verify=true`; Results-page diff before save; model-detail "LM Studio default" card.
 - **Persist the winner in LM Studio**: `lm-optimizer lab save-default <run-id>`,
   `POST /api/runs/{run-id}/save-default` and a Results-page **Save as LM Studio
   default** button write the validated winner into

@@ -186,6 +186,22 @@
             el("md-configs").innerHTML = "<p>No configurations recorded.</p>";
         }
 
+        try {
+            const defPayload = await getJSON(API + "/model-default?model_id=" + encodeURIComponent(modelId));
+            const content = el("md-default-content");
+            if (defPayload.exists) {
+                const fields = defPayload.fields || {};
+                const keys = Object.keys(fields);
+                content.innerHTML = keys.length
+                    ? '<p class="mb-1">Saved default with ' + keys.length + ' key(s).</p><p class="text-xs text-gray-500">Backups: ' + (defPayload.backups ? defPayload.backups.length : 0) + '</p>'
+                    : '<p class="text-xs text-gray-500">Defaults file exists with no mapped fields.</p>';
+            } else {
+                content.innerHTML = '<p class="text-xs text-gray-500">No LM Studio default saved for this model.</p>';
+            }
+        } catch (err) {
+            el("md-default-content").innerHTML = '<p class="text-xs text-red-600">Failed to load default info.</p>';
+        }
+
         const button = el("md-run-optimize");
         if (button) {
             button.addEventListener("click", function () {

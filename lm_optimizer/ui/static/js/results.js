@@ -1475,9 +1475,19 @@ const ResultsPage = {
         const run = this.state.run;
         if (!run || !run.best_config_id) return;
 
+        // Fetch diff before confirming so the user sees changes.
+        let diffNote = '';
+        try {
+            const d = await API.getDefaultDiff(this.state.runId);
+            const changes = d.changes || [];
+            diffNote = changes.length ? ('\n\nChanges: ' + changes.length + ' field(s) would change.') : '\n\nAlready up to date (no changes).';
+        } catch (e) {
+            diffNote = '\n\n(Diff unavailable)';
+        }
+
         const ok = window.confirm(
             'Save this run\'s winning configuration as the LM Studio default for '
-            + run.model.id + '?\n\n'
+            + run.model.id + '?' + diffNote + '\n\n'
             + 'This writes LM Studio\'s per-model defaults file. The previous file '
             + 'is backed up next to it. The next load uses the new values; '
             + 'LM Studio does not need a restart.'

@@ -81,6 +81,21 @@ keep-in-memory) are left untouched.
 - Model identifiers are validated against the defaults directory; `..` and
   absolute/drive paths are rejected.
 
+## Persistence loop (backups, diff, restore, verify)
+
+Backups are timestamped (`<file>.optimizer-backup-<utc>`); the newest 10 are kept. A legacy `.optimizer-backup` file is recognized but not overwritten by new backups.
+
+```bash
+lm-optimizer lab diff-default <run-id>
+lm-optimizer lab restore-default <model>
+lm-optimizer lab restore-default <model> --yes
+lm-optimizer lab verify-default <run-id>
+```
+
+API: `GET /api/model-default`, `GET /api/runs/{run_id}/default-diff`, `POST /api/model-default/restore`, `POST /api/runs/{run_id}/verify-default`, `POST /api/runs/{run_id}/save-default?verify=true`. Diff compares current defaults against the winner; restore validates JSON before writing; verify loads with an empty config and compares only echoed fields, always unloading in `finally`.
+
+Results page shows a diff summary before save; the model detail page shows an "LM Studio default" card with current fields and backup count.
+
 ## Usage
 
 ```bash
