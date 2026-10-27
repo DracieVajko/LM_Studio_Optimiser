@@ -12,7 +12,7 @@ from enum import Enum
 from typing import Any, ClassVar
 
 import httpx
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from tenacity import (
     AsyncRetrying,
     retry_if_exception_type,
@@ -155,7 +155,17 @@ class LoadModelResponse(BaseModel):
     identifier: str | None = None
     error: str | None = None
     load_config: LoadConfig | None = None
+    # Service-style alias; kept in sync with ``load_config``.
+    loaded_config: LoadConfig | None = None
     echo_mismatches: dict | None = None
+
+    @model_validator(mode="after")
+    def _sync_loaded_config(self):
+        if self.loaded_config is None and self.load_config is not None:
+            self.loaded_config = self.load_config
+        if self.load_config is None and self.loaded_config is not None:
+            self.load_config = self.loaded_config
+        return self
 
 
 class UnloadModelResponse(BaseModel):

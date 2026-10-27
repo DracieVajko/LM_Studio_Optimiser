@@ -683,6 +683,20 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
         tmp.unlink(missing_ok=True)
 
 
+def expected_echo_fields(config: LoadConfiguration) -> dict[str, Any]:
+    """Return the config fields LM Studio echoes back on load.
+
+    Only keys in ``LoadConfiguration.API_KEYS`` that are non-``None`` in
+    ``config`` are included; ``gpu_ratio`` and the RoPE fields are excluded
+    because the server never echoes them.
+    """
+    return {
+        attr: getattr(config, attr)
+        for attr in LoadConfiguration.API_KEYS
+        if getattr(config, attr, None) is not None
+    }
+
+
 def _normalize_backup_fields(payload: Any) -> dict[str, Any]:
     if not isinstance(payload, dict):
         return {}
