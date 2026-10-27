@@ -62,6 +62,17 @@ def test_experiments_exposes_speed_floor_and_quality_context():
     assert "quality_context" in js
 
 
+def test_results_can_persist_lmstudio_defaults():
+    js = _read("static/js/results.js")
+    api = _read("static/js/api.js")
+    assert 'id="save-default-btn"' in js
+    assert "API.saveLmStudioDefault" in js
+    assert "/runs/${runId}/save-default" in api
+    assert "Save as LM Studio default" in js
+    # The one-shot apply must stay clearly separate from persistence.
+    assert "does NOT change any saved default" in js
+
+
 def test_brewery_hosts_the_experiment_builder():
     html = _read("templates/lab.html")
     assert "lab-panel-experiments" in html

@@ -1321,6 +1321,29 @@ async def export_lmstudio_config(run_id: UUID):
         raise HTTPException(status_code=404, detail=str(e)) from None
 
 
+@router.post("/runs/{run_id}/save-default")
+async def save_lmstudio_default(run_id: UUID, dry_run: bool = False):
+    """Persist the validated winner as LM Studio's per-model load default."""
+    from lm_optimizer.services.lmstudio_defaults import (
+        DefaultsError,
+        ModelNotFoundError,
+        NoWinnerError,
+        save_run_defaults,
+    )
+
+    run = run_repo.get(str(run_id))
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    try:
+        result = save_run_defaults(run, dry_run=dry_run)
+    except (NoWinnerError, ModelNotFoundError) as e:
+        raise HTTPException(status_code=404, detail=str(e)) from None
+    except DefaultsError as e:
+        # Unreadable/conflicting local file: never overwrite user data.
+        raise HTTPException(status_code=409, detail=str(e)) from None
+    return result.to_dict()
+
+
 @router.get("/runs/{run_id}/export")
 async def export_run(run_id: UUID, format: str = "json"):
     """Export run results."""

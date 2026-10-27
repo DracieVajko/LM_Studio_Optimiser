@@ -73,6 +73,25 @@ Honest no-winners (measured, none passed quality — not config bugs): qwen3.8-4
 alibaba-30b (incl. MoE rollback). Unloadable: ternary-27b. Details in
 `results/campaign/` (`INDEX.md`, `CAMPAIGN_SUMMARY.md`).
 
+## Persist the winner in LM Studio
+
+LM Studio keeps per-model load defaults in
+`~/.lmstudio/.internal/user-concrete-model-default-config/<model>.json`.
+`lm-optimizer lab save-default <run-id>` (or Results → **Save as LM Studio
+default**) merges the validated winner into that file:
+
+- only tested, non-`None` fields are written; unknown keys (CPU threads, KV
+  cache quantization, mmap) and prediction presets are preserved;
+- the previous file is copied to `<name>.optimizer-backup` before an overwrite;
+- the next load uses the new values — no LM Studio restart required;
+- unreadable/non-object files are never overwritten (CLI exits 1, API 409).
+
+Verified live on 2026-10-27: writing `llm.load.contextLength=3072`,
+`llm.load.llama.flashAttention=false` and
+`llm.load.offloadKVCacheToGpu=false`, then loading with
+`echo_load_config=true`, echoed `3072 / false / false`; the original file was
+restored byte-for-byte after the test.
+
 ## Launchers per OS (same tree and files, only the starter differs)
 
 **Windows** (`.bat`):
@@ -153,8 +172,9 @@ Pages: **Dashboard** (optimize form, live status, plain model dropdown, custom
 priorities 0.00-1.00 + hard speed target), **History** (runs + sandbox duels,
 config counts, stale flags, per-row checkboxes with bulk delete / re-run /
 compare, abandon), **Results** (winner card, alternatives, charts, per-test
-Prompt/Thinking/Output, full JSON page, Apply Best Config and Save LM Studio
-config), **Sandbox** (text/HTML/3D duels with presets), **Brewery** (Lab +
+Prompt/Thinking/Output, full JSON page, Apply Best Config, Save LM Studio
+config (download) and Save as LM Studio default (persist with backup)),
+**Sandbox** (text/HTML/3D duels with presets), **Brewery** (Lab +
 Experiment Builder under one entry), **Settings**. API under single `/api` prefix
 + websocket progress. Dark mode follows the OS (toggle in nav). Read endpoints
 are load-free and degrade gracefully when LM Studio is down.
@@ -268,7 +288,9 @@ page and key API endpoint over HTTP; `tools/speed_summary.py` reports median
 and max generation speed per model; `tools/model_status.py` shows the latest
 run per model. `lm-optimizer lab export-config <run-id>` writes the validated
 winner as a reusable load-config JSON (REST params + vLLM engine config +
-llama.cpp instructions).
+llama.cpp instructions). `lm-optimizer lab save-default <run-id>` persists
+the winner directly into LM Studio's per-model defaults (atomic write, previous
+file backed up, `--dry-run` and `--no-backup` supported).
 
 **Cleanup (v1.6.x).** `cleanup.bat` one-click maintenance:
 archives the run history first (whole `optimizer.db` snapshot plus

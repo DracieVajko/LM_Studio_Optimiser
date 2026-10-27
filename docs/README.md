@@ -8,6 +8,7 @@
 | `specs/2026-10-19-llm-judge-design.md` | LLM-as-judge design (Tasks 1-11 of the judge plan). |
 | `specs/2026-10-15-auto-run-design.md` | Auto-run orchestration design. |
 | `specs/2026-10-02-multi-backend-design.md` | Multi-backend (LM Studio / Ollama) design. |
+| `LM_STUDIO_DEFAULTS.md` | Per-model load-defaults file: layout, verified echo test, field mapping and safety rules for persisting a winner. |
 | `metrics_semantics.md` | What every metric means, how medians vs means are computed, and which values are estimates. |
 | `superpowers/plans/` | Implementation plans with step-by-step task lists. |
 | `superpowers/plans/../` (see `.superpowers/sdd/`) | Progress ledger of the SDD workflow. |

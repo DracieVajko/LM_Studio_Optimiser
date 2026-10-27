@@ -40,11 +40,16 @@ def build_load_config_export(run: Any) -> dict:
         "vllm_engine_config": vllm,
         "lmstudio_load_body": {"model": run.model.id, **params},
         "instructions": [
-            "llama.cpp/GGUF: LM Studio has no public API to write per-model "
-            "defaults; open My Models -> gear and paste the values from 'config'.",
+            "llama.cpp/GGUF: persist the winner with `lm-optimizer lab "
+            "save-default <run-id>` (or the results-page button). It writes "
+            "LM Studio's user-concrete-model-default-config file, backs up the "
+            "previous version, and applies on the next load without a restart.",
+            "llama.cpp/GGUF (manual alternative): paste the values from "
+            "'config' into My Models -> gear.",
             "vLLM: save 'vllm_engine_config' to a .json file and run "
             "`lms load <model> --engine-config-file <file>`.",
-            "Any engine: POST /api/v1/models/load with 'lmstudio_load_body'.",
+            "Any engine (one-shot): POST /api/v1/models/load with "
+            "'lmstudio_load_body'.",
         ],
         "generated_at": datetime.now().isoformat(timespec="seconds"),
     }

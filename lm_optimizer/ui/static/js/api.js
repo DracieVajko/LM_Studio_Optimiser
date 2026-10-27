@@ -187,6 +187,11 @@ export const API = {
         return this.request(`/runs/${runId}/export-config`);
     },
 
+    async saveLmStudioDefault(runId, dryRun = false) {
+        const query = dryRun ? '?dry_run=true' : '';
+        return this.request(`/runs/${runId}/save-default${query}`, { method: 'POST' });
+    },
+
     // Apply Configuration
     async applyConfiguration(request) {
         return this.request('/apply', {

@@ -1,9 +1,16 @@
 // LM Studio Auto Optimizer - Results Page
 
-import { API } from './api.js?v=16';
-import { UI } from './ui.js?v=16';
-import { Charts } from './charts.js?v=16';
-import { WebSocketManager } from './websocket.js?v=16';
+import { API } from './api.js?v=17';
+import { UI } from './ui.js?v=17';
+import { Charts } from './charts.js?v=17';
+import { WebSocketManager } from './websocket.js?v=17';
+
+const escapeHtml = (value) => String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 
 const ResultsPage = {
     state: {
@@ -259,6 +266,12 @@ const ResultsPage = {
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1-4l-3 3m0 0L9 3m3 3V4"></path>
                             </svg>
                             Save LM Studio config
+                        </button>
+                        <button id="save-default-btn" class="btn btn-outline" title="Write the winner into LM Studio's per-model defaults. The previous file is backed up; the next load uses it (no restart).">
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16v3a1 1 0 01-1 1H8a1 1 0 01-1-1v-3M12 3v12m0 0l-4-4m4 4l4-4"></path>
+                            </svg>
+                            Save as LM Studio default
                         </button>
                         <button id="export-btn" class="btn btn-outline">
                             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -1181,6 +1194,12 @@ const ResultsPage = {
             });
         }
 
+        // Persist the winner into LM Studio's per-model defaults.
+        const saveDefaultBtn = document.getElementById('save-default-btn');
+        if (saveDefaultBtn) {
+            saveDefaultBtn.addEventListener('click', () => this.saveLmStudioDefault());
+        }
+
         // Export
         const exportBtn = document.getElementById('export-btn');
         if (exportBtn) {
@@ -1449,6 +1468,52 @@ const ResultsPage = {
         } catch (error) {
             UI.hideLoading();
             UI.showToast(error.message || 'Failed to apply configuration', 'error');
+        }
+    },
+
+    async saveLmStudioDefault() {
+        const run = this.state.run;
+        if (!run || !run.best_config_id) return;
+
+        const ok = window.confirm(
+            'Save this run\'s winning configuration as the LM Studio default for '
+            + run.model.id + '?\n\n'
+            + 'This writes LM Studio\'s per-model defaults file. The previous file '
+            + 'is backed up next to it. The next load uses the new values; '
+            + 'LM Studio does not need a restart.'
+        );
+        if (!ok) return;
+
+        UI.showLoading('Saving LM Studio default...');
+        try {
+            const result = await API.saveLmStudioDefault(this.state.runId);
+            UI.hideLoading();
+            const rows = Object.entries(result.fields || {})
+                .map(([key, value]) => (
+                    '<tr><td class="font-mono text-xs">' + escapeHtml(key) + '</td>'
+                    + '<td class="text-right font-mono text-xs">'
+                    + escapeHtml(JSON.stringify(value)) + '</td></tr>'
+                ))
+                .join('');
+            UI.openModal(
+                '<p class="text-sm">Saved to <span class="font-mono text-xs">'
+                + escapeHtml(result.path) + '</span></p>'
+                + (result.backup_path
+                    ? '<p class="text-xs text-gray-500 mt-1">Backup: <span class="font-mono">'
+                      + escapeHtml(result.backup_path) + '</span></p>'
+                    : '')
+                + '<p class="text-xs text-gray-500 mt-1">Applied on the next load; '
+                + 'no LM Studio restart needed.</p>'
+                + '<div class="overflow-auto max-h-[45vh] mt-3">'
+                + '<table class="table text-sm"><thead><tr><th>Key</th>'
+                + '<th class="text-right">Value</th></tr></thead><tbody>'
+                + rows + '</tbody></table></div>',
+                'LM Studio default saved'
+            );
+            UI.showToast('Saved as LM Studio default', 'success');
+        } catch (error) {
+            UI.hideLoading();
+            UI.showToast(error.message || 'Failed to save LM Studio default', 'error');
         }
     },
 

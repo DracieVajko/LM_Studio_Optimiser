@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- **Persist the winner in LM Studio**: `lm-optimizer lab save-default <run-id>`,
+  `POST /api/runs/{run-id}/save-default` and a Results-page **Save as LM Studio
+  default** button write the validated winner into
+  `~/.lmstudio/.internal/user-concrete-model-default-config/<model>.json`.
+  The merge preserves unknown keys/presets, writes atomically, backs up the
+  previous file, supports `--dry-run`, and never overwrites unreadable files.
+  Verified live: `contextLength`, `llama.flashAttention` and
+  `offloadKVCacheToGpu` are applied on the next load without an LM Studio
+  restart. Config-export instructions updated accordingly.
+
 ## [1.8.0] - 2026-10-27
 
 ### Added

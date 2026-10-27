@@ -93,6 +93,14 @@ def test_no_validated_winner_raises():
     assert "No validated winner" in str(exc.value)
 
 
+def test_export_points_to_persistent_defaults_channel():
+    out = build_load_config_export(_run(best=_best()))
+    text = " ".join(out["instructions"])
+    assert "save-default" in text
+    assert "user-concrete-model-default-config" in text
+    assert "no public API" not in text
+
+
 def test_export_does_not_invent_model_name():
     best = _best()
     out = build_load_config_export(_run(best=best, name=""))

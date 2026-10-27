@@ -1060,3 +1060,49 @@ def export_config(
         console.print(f"Saved: {out}")
     else:
         console.print_json(text)
+
+
+@app.command("save-default")
+def save_default(
+    run_id: str = typer.Argument(..., help="Run ID with a validated winner"),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Show what would be written, change nothing"
+    ),
+    no_backup: bool = typer.Option(
+        False, "--no-backup", help="Do not copy the previous defaults file"
+    ),
+):
+    """Persist the validated winner as LM Studio's per-model load default.
+
+    Writes `~/.lmstudio/.internal/user-concrete-model-default-config/...json`,
+    which LM Studio applies on the next load (no restart). Unknown keys in
+    the file are preserved and the previous version is backed up.
+    """
+    from lm_optimizer.database.repositories import run_repo
+    from lm_optimizer.services.lmstudio_defaults import (
+        DefaultsError,
+        save_run_defaults,
+    )
+
+    run = run_repo.get(run_id)
+    if not run:
+        console.print(f"[red]Run not found: {run_id}[/red]")
+        raise typer.Exit(1)
+    try:
+        result = save_run_defaults(run, dry_run=dry_run, backup=not no_backup)
+    except DefaultsError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1) from None
+
+    if dry_run:
+        console.print(f"[yellow]Dry run[/yellow] — {result.path} not written")
+    else:
+        console.print(f"[green]Saved[/green]: {result.path}")
+    if result.backup_path:
+        console.print(f"Backup: {result.backup_path}")
+    table = Table(title="LM Studio load defaults")
+    table.add_column("Key")
+    table.add_column("Value", justify="right")
+    for key, value in result.fields.items():
+        table.add_row(key, json.dumps(value))
+    console.print(table)
