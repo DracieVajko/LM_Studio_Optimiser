@@ -388,3 +388,9 @@ class JudgeHistoryItem(BaseModel):
     status: str
     confidence: float | None = None
     overall_winner_model: str | None = None
+
+
+class RestoreDefaultsRequest(BaseModel):
+    model_id: str
+    backup: str = "latest"
+    dry_run: bool = False

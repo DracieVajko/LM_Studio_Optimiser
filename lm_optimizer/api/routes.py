@@ -24,6 +24,7 @@ from lm_optimizer.api.schemas import (
     OptimizationRequest,
     OptimizationRunResponse,
     PresetSchema,
+    RestoreDefaultsRequest,
     ProfileWeightsSchema,
     SettingsSchema,
     StatsResponse,
@@ -1321,8 +1322,122 @@ async def export_lmstudio_config(run_id: UUID):
         raise HTTPException(status_code=404, detail=str(e)) from None
 
 
+@router.get("/model-default")
+async def get_model_default(model_id: str):
+    """Inspect a model's current LM Studio defaults, fields and backups."""
+    from lm_optimizer.services.lmstudio_defaults import (
+        DefaultsError,
+        ModelNotFoundError,
+        list_backups,
+        resolve_defaults_path,
+    )
+
+    try:
+        path = resolve_defaults_path(model_id)
+    except ModelNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from None
+    except Exception as e:  # noqa: BLE001 - surface resolution errors
+        raise HTTPException(status_code=400, detail=str(e)) from None
+
+    existed = path.exists()
+    fields: dict = {}
+    if existed:
+        try:
+            from lm_optimizer.services.lmstudio_defaults import (
+                _normalize_backup_fields,
+                _read_document,
+            )
+
+            document, _ = _read_document(path)
+            fields = _normalize_backup_fields(document)
+        except DefaultsError as e:
+            raise HTTPException(status_code=409, detail=str(e)) from None
+
+    backups = [entry.name for entry in list_backups(path)]
+    return {
+        "model_id": model_id,
+        "path": str(path),
+        "exists": existed,
+        "fields": fields,
+        "backups": backups,
+    }
+
+
+@router.post("/model-default/restore")
+async def restore_model_default(request: RestoreDefaultsRequest):
+    """Restore a model's LM Studio defaults from a backup."""
+    from lm_optimizer.services.lmstudio_defaults import DefaultsError, restore_defaults
+
+    try:
+        result = restore_defaults(
+            request.model_id, backup=request.backup, dry_run=request.dry_run
+        )
+    except DefaultsError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from None
+    return result.to_dict()
+
+
+@router.get("/runs/{run_id}/default-diff")
+async def get_run_default_diff(run_id: UUID):
+    """Diff a run's validated winner against the model's current defaults."""
+    from dataclasses import replace as _replace
+
+    run = run_repo.get(str(run_id))
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    best = run.get_best_config()
+    if best is None:
+        raise HTTPException(status_code=404, detail="No validated winner in this run")
+    config = best.config
+    if config.context_length is None and getattr(best, "context_length", None):
+        config = _replace(config, context_length=best.context_length)
+    model_id = getattr(getattr(run, "model", None), "id", "") or ""
+
+    from lm_optimizer.services.lmstudio_defaults import DefaultsError, diff_defaults
+
+    try:
+        diff = diff_defaults(model_id, config)
+    except DefaultsError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from None
+    return diff.to_dict()
+
+
+@router.post("/runs/{run_id}/verify-default")
+async def verify_run_default(run_id: UUID):
+    """Verify a run's saved defaults via an echo load (never writes)."""
+    from dataclasses import replace as _replace
+
+    run = run_repo.get(str(run_id))
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    best = run.get_best_config()
+    if best is None:
+        raise HTTPException(status_code=404, detail="No validated winner in this run")
+    config = best.config
+    if config.context_length is None and getattr(best, "context_length", None):
+        config = _replace(config, context_length=best.context_length)
+    model_id = getattr(getattr(run, "model", None), "id", "") or ""
+
+    _client_result = get_lm_client(echo_probe=False)
+    if hasattr(_client_result, "__await__"):
+        client = await _client_result
+    else:
+        client = _client_result
+    try:
+        from lm_optimizer.services.lmstudio_default_verify import verify_defaults
+
+        result = await verify_defaults(model_id, config, client=client)
+    finally:
+        try:
+            if hasattr(client, "close"):
+                await client.close()
+        except Exception:  # noqa: BLE001
+            pass
+    return result
+
+
 @router.post("/runs/{run_id}/save-default")
-async def save_lmstudio_default(run_id: UUID, dry_run: bool = False):
+async def save_lmstudio_default(run_id: UUID, dry_run: bool = False, verify: bool = False):
     """Persist the validated winner as LM Studio's per-model load default."""
     from lm_optimizer.services.lmstudio_defaults import (
         DefaultsError,
@@ -1341,7 +1456,40 @@ async def save_lmstudio_default(run_id: UUID, dry_run: bool = False):
     except DefaultsError as e:
         # Unreadable/conflicting local file: never overwrite user data.
         raise HTTPException(status_code=409, detail=str(e)) from None
-    return result.to_dict()
+
+    payload = result.to_dict()
+
+    if verify:
+        if dry_run:
+            payload["verification"] = {"skipped": "dry_run"}
+        else:
+            from dataclasses import replace as _replace
+
+            best = run.get_best_config()
+            config = best.config if best is not None else None
+            if config is not None and config.context_length is None and getattr(
+                best, "context_length", None
+            ):
+                config = _replace(config, context_length=best.context_length)
+            model_id = getattr(getattr(run, "model", None), "id", "") or ""
+            _client_result = get_lm_client(echo_probe=False)
+            if hasattr(_client_result, "__await__"):
+                client = await _client_result
+            else:
+                client = _client_result
+            try:
+                from lm_optimizer.services.lmstudio_default_verify import verify_defaults
+
+                verification = await verify_defaults(model_id, config, client=client)
+            finally:
+                try:
+                    if hasattr(client, "close"):
+                        await client.close()
+                except Exception:
+                    pass
+            payload["verification"] = verification
+
+    return payload
 
 
 @router.get("/runs/{run_id}/export")
