@@ -96,7 +96,7 @@ def test_brewery_page_hosts_lab_and_experiments(client):
     assert response.status_code == 200
     assert "Brewery" in response.text
     assert "lab-panel-experiments" in response.text
-    assert "/experiments?embed=1" in response.text
+    assert "ex-mode" in response.text
 
 
 def test_experiments_page_still_available(client):

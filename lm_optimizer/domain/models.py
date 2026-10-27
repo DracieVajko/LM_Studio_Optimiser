@@ -540,7 +540,7 @@ class OptimizationRun:
     completed_at: datetime | None = None
     duration_seconds: float = 0.0
     error: str | None = None
-    optimizer_version: str = "1.5.0b1"
+    optimizer_version: str = "1.8.0"
     benchmark_repetitions: int = 3
     validation_repetitions: int = 5
     # Phase A/B strategy fields (all defaulted; legacy runs ignore them).

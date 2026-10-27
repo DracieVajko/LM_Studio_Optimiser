@@ -1078,6 +1078,74 @@ def save_best_report(
                 lines.append(f"- Note: {pb.get('spill_note')}")
             lines += [""]
 
+    # --- Speed floor outcome (spec §3) ---
+    floor = (run.search_space or {}).get("speed_floor")
+    if isinstance(floor, dict):
+        lines += ["## Speed floor", ""]
+        lines.append(
+            f"- Floor: {floor.get('value', 'N/A')} tok/s "
+            f"({'enforced' if floor.get('enforced') else 'informational'})"
+        )
+        lines.append(f"- Met: {floor.get('met')}")
+        fastest = floor.get("fastest_tok_s")
+        if fastest is not None:
+            lines.append(
+                f"- Fastest candidate: {fastest} tok/s "
+                f"(id {str(floor.get('fastest_candidate_id') or 'N/A')[:8]}) "
+                "- shown even when below the floor"
+            )
+        if floor.get("enforced") and not floor.get("met"):
+            lines.append(
+                "- Outcome: NO CONFIG MEETS SPEED FLOOR; no winner was "
+                "promoted. The fastest candidate is diagnostic only."
+            )
+        lines += [""]
+
+    # --- Context strategies (spec §5) ---
+    strategies = ((pab.get("phase_b_result") or {}).get("context_strategies")) or {}
+    if isinstance(strategies, dict) and strategies:
+        lines += [
+            "## Context strategies",
+            "",
+            "| Strategy | Available | Max stable | Max usable | Note |",
+            "| --- | --- | --- | --- | --- |",
+        ]
+        for name, info in strategies.items():
+            info = info if isinstance(info, dict) else {}
+            note = info.get("reason") or info.get("error") or ""
+            lines.append(
+                f"| {name} | {info.get('available', True)} | "
+                f"{info.get('max_stable_context', 'N/A')} | "
+                f"{info.get('max_usable_context', 'N/A')} | {str(note)[:120]} |"
+            )
+        lines += [""]
+
+    # --- Scheduled artifact test (fourth option) ---
+    artifact = (run.benchmark_params or {}).get("artifact_test")
+    if isinstance(artifact, dict) and artifact:
+        lines += ["## Artifact test (post-run)", ""]
+        lines.append(
+            f"- Task: {artifact.get('task_id', '?')} "
+            f"({artifact.get('task_kind', '?')})"
+        )
+        lines.append(f"- Success: {artifact.get('success')}")
+        if artifact.get("manual_review_only"):
+            lines.append("- Score: n/a (manual review only, no checks)")
+        else:
+            score = artifact.get("score")
+            lines.append(
+                f"- Score: {score if score is not None else 'n/a'}"
+            )
+        if artifact.get("config_id"):
+            lines.append(f"- Config: {str(artifact.get('config_id'))[:8]}")
+        if artifact.get("echo_mismatches"):
+            lines.append(f"- Requested vs applied: {artifact.get('echo_mismatches')}")
+        if artifact.get("unloaded") is not None:
+            lines.append(f"- Unloaded: {artifact.get('unloaded')}")
+        if artifact.get("error"):
+            lines.append(f"- Error: {artifact.get('error')}")
+        lines += [""]
+
     lines += [
         "## How quality and score work",
         "",

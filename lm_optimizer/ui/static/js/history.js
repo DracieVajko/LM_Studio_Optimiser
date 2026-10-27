@@ -1,7 +1,7 @@
 // LM Studio Auto Optimizer - History Page
 
-import { API } from './api.js?v=15';
-import { UI } from './ui.js?v=15';
+import { API } from './api.js?v=16';
+import { UI } from './ui.js?v=16';
 
 const HistoryPage = {
     state: {
@@ -417,32 +417,33 @@ const HistoryPage = {
                 UI.showToast((err && err.message) || 'Re-run failed', 'error');
             }
         });
-        document.getElementById('bulk-compare')?.addEventListener('click', async () => {
+        document.getElementById('bulk-compare')?.addEventListener('click', () => {
             const ids = selectedIds();
             if (ids.length < 2) return;
-            UI.showLoading('Judging selected runs...');
-            try {
-                const res = await API.judge({
-                    run_ids: ids,
-                    backend: 'heuristic',
-                    priority: 'balanced',
-                    wait: true,
-                });
-                UI.hideLoading();
-                const verdict = (res && res.verdict) || {};
-                const text = JSON.stringify(verdict, null, 2)
-                    .replace(/&/g, '&amp;').replace(/</g, '&lt;');
-                UI.openModal(
-                    '<p class="text-sm text-gray-600 mb-2">Heuristic comparison of '
-                    + ids.length + ' selected runs.</p>'
-                    + '<pre class="text-xs whitespace-pre-wrap bg-gray-50 p-3 rounded max-h-[60vh] overflow-auto">'
-                    + text + '</pre>',
-                    'Compare selected runs'
-                );
-            } catch (err) {
-                UI.hideLoading();
-                UI.showToast((err && err.message) || 'Judge failed', 'error');
-            }
+            const runs = ids
+                .map(id => (this.state.runs || []).find(r => r.id === id))
+                .filter(Boolean);
+            const dash = v => (v === null || v === undefined || v === '') ? '—' : v;
+            const rows = runs.map(r => `
+                <tr>
+                    <td class="font-mono text-xs">${r.model.id}</td>
+                    <td>${r.profile}</td>
+                    <td>${r.status}</td>
+                    <td class="text-right">${r.best_gen_tok_s != null ? Number(r.best_gen_tok_s).toFixed(1) : '—'}</td>
+                    <td class="text-right">${r.best_quality != null ? Number(r.best_quality).toFixed(3) : '—'}</td>
+                    <td class="text-right">${dash(r.best_context_length)}</td>
+                    <td class="text-right">${r.duration_seconds ? Math.round(r.duration_seconds) + 's' : '—'}</td>
+                </tr>`).join('');
+            UI.openModal(
+                '<div class="overflow-auto max-h-[65vh]">'
+                + '<table class="table text-sm"><thead><tr>'
+                + '<th>Model</th><th>Profile</th><th>Status</th><th>Gen tok/s</th>'
+                + '<th>Quality</th><th>Context</th><th>Duration</th>'
+                + '</tr></thead><tbody>' + rows + '</tbody></table></div>'
+                + '<p class="text-xs text-gray-500 mt-2">Winner metrics per selected run; '
+                + 'failed runs are shown too.</p>',
+                'Compare selected runs'
+            );
         });
 
         // View run buttons

@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [1.8.0] - 2026-10-27
 
 ### Added
 - **Presets** (`quick`, `standard`, `thorough`, `custom`) with frozen budgets persisted in `benchmark_params.resolved_settings`; resume restores them verbatim
@@ -332,7 +332,7 @@ Physical end-to-end LM Studio validation is still pending.
 - Recommended card and table reading config from wrong level (always OFF/CPU/Auto); comparison modal X button (module-scope handler).
 - Double-prefix route `/api/api/runs/...`; SPA nav hijack swallowing new pages; asset cache-busting versions.
 
-## [Unreleased]
+## [1.7.0] - 2026-10-27
 
 ### Planned
 - Docker support with GPU access

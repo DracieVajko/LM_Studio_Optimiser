@@ -35,7 +35,7 @@ def test_history_bulk_controls_and_handlers():
         "selectedIds()",
         "API.deleteRun",
         "API.startOptimization",
-        "API.judge",
+        "Compare selected runs",
     ):
         assert needle in js, f"history.js missing {needle}"
 
@@ -65,6 +65,6 @@ def test_experiments_exposes_speed_floor_and_quality_context():
 def test_brewery_hosts_the_experiment_builder():
     html = _read("templates/lab.html")
     assert "lab-panel-experiments" in html
-    assert "/experiments?embed=1" in html
+    assert "ex-mode" in html
     js = _read("static/js/experiments.js")
     assert "embed=1" in js
