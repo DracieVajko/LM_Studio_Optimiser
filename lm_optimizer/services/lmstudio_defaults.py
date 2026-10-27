@@ -93,6 +93,30 @@ class BackupEntry:
 
 
 @dataclass(frozen=True)
+class DefaultsDiff:
+    """Diff between a defaults file and a winner configuration."""
+
+    model_id: str
+    path: Path
+    exists: bool
+    changes: list[dict[str, Any]]
+    unchanged: list[str]
+    preserved: list[str]
+    winner_fields: dict[str, Any]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "model_id": self.model_id,
+            "path": str(self.path),
+            "exists": self.exists,
+            "changes": self.changes,
+            "unchanged": self.unchanged,
+            "preserved": self.preserved,
+            "winner_fields": self.winner_fields,
+        }
+
+
+@dataclass(frozen=True)
 class DefaultsRestoreResult:
     """Outcome of restoring defaults from a backup."""
 
@@ -508,6 +532,78 @@ def create_backup(
     if keep >= 1:
         prune_backups(path, keep=keep)
     return candidate
+
+
+def diff_defaults(
+    model_id: str,
+    config: LoadConfiguration,
+    *,
+    home: Path | None = None,
+) -> DefaultsDiff:
+    """Diff a model's current defaults against a winner configuration."""
+    home = home or default_home()
+    path = resolve_defaults_path(model_id, home=home)
+    document, existed = _read_document(path)
+    fields = _field_list(document)
+    updates = _updates_for(config, fields)
+
+    current_map = _normalize_backup_fields(document)
+
+    changes: list[dict[str, Any]] = []
+    unchanged: list[str] = []
+    for key, winner_value in updates.items():
+        if key in current_map:
+            current_value = current_map[key]
+            if current_value == winner_value:
+                unchanged.append(key)
+            else:
+                changes.append(
+                    {
+                        "key": key,
+                        "current": current_value,
+                        "winner": winner_value,
+                        "kind": "changed",
+                    }
+                )
+        else:
+            changes.append(
+                {
+                    "key": key,
+                    "current": None,
+                    "winner": winner_value,
+                    "kind": "added",
+                }
+            )
+
+    produced_keys: set[str] = set()
+    for _attr, canonical, legacy, _kind in _FIELD_MAP:
+        produced_keys.add(canonical)
+        if legacy:
+            produced_keys.add(legacy)
+
+    mapped_winner_keys = set(updates.keys())
+    preserved: list[str] = []
+    seen: set[str] = set()
+    for field in fields:
+        if not isinstance(field, dict) or not field.get("key"):
+            continue
+        key = str(field.get("key"))
+        if key in mapped_winner_keys or key in produced_keys:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        preserved.append(key)
+
+    return DefaultsDiff(
+        model_id=model_id,
+        path=path,
+        exists=bool(existed),
+        changes=changes,
+        unchanged=unchanged,
+        preserved=preserved,
+        winner_fields=updates,
+    )
 
 
 def apply_defaults(

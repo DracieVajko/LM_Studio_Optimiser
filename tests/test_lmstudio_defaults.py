@@ -24,12 +24,14 @@ from lm_optimizer.domain.models import (
 from lm_optimizer.services.lmstudio_defaults import (
     BACKUP_KEEP,
     BackupEntry,
+    DefaultsDiff,
     DefaultsError,
     DefaultsRestoreResult,
     ModelNotFoundError,
     NoWinnerError,
     apply_defaults,
     create_backup,
+    diff_defaults,
     list_backups,
     prune_backups,
     resolve_defaults_path,
@@ -472,3 +474,28 @@ def test_restore_defaults_dry_run_writes_nothing(tmp_path):
     result = restore_defaults("m", dry_run=True, home=home)
     assert result.dry_run if hasattr(result, "dry_run") else True
     assert path.read_bytes() == original
+
+
+def test_diff_defaults_reports_added_changed_unchanged_preserved(tmp_path):
+    home = _lmstudio_home(tmp_path, [["m", {"uiIdentifier": "m"}]])
+    path = _write_defaults(
+        home, "m.json", _document(**{
+            "llm.load.contextLength": 8192,
+            "llm.load.llama.cpuThreadPoolSize": 8,
+        })
+    )
+    diff = diff_defaults("m", _config(context_length=4096, flash_attention=True), home=home)
+    keys = {c["key"]: c for c in diff.changes}
+    assert keys["llm.load.contextLength"]["kind"] == "changed"
+    assert keys["llm.load.contextLength"]["current"] == 8192
+    assert keys["llm.load.contextLength"]["winner"] == 4096
+    assert "llm.load.llama.flashAttention" in {c["key"] for c in diff.changes}
+    assert "llm.load.contextLength" not in diff.unchanged
+    assert "llm.load.llama.cpuThreadPoolSize" in diff.preserved
+
+
+def test_diff_defaults_missing_file_marks_all_as_added(tmp_path):
+    home = _lmstudio_home(tmp_path, [["m", {"uiIdentifier": "m"}]])
+    diff = diff_defaults("m", _config(context_length=1024), home=home)
+    assert diff.exists is False
+    assert diff.changes and all(c["kind"] == "added" for c in diff.changes)
