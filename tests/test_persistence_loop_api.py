@@ -159,6 +159,45 @@ def test_restore_unknown_backup_returns_400(client, monkeypatch, tmp_path):
     assert response.status_code == 400, response.text
 
 
+def test_restore_unknown_model_returns_404(client, monkeypatch, tmp_path):
+    monkeypatch.setenv("LM_OPTIMIZER_LMSTUDIO_HOME", str(tmp_path / "empty"))
+
+    response = client.post(
+        "/api/model-default/restore",
+        json={"model_id": "vendor/missing", "backup": "latest", "dry_run": False},
+    )
+
+    assert response.status_code == 404, response.text
+    assert "model-data.json" in response.json()["detail"]
+
+
+def test_default_diff_unknown_model_returns_404(client, monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        routes.run_repo, "get", lambda _run_id: _run(model_id="vendor/missing")
+    )
+    monkeypatch.setenv("LM_OPTIMIZER_LMSTUDIO_HOME", str(tmp_path / "empty"))
+
+    response = client.get(f"/api/runs/{uuid4()}/default-diff")
+
+    assert response.status_code == 404, response.text
+    assert "model-data.json" in response.json()["detail"]
+
+
+def test_verify_default_without_config_returns_404(client, monkeypatch):
+    from types import SimpleNamespace
+
+    run = _run()
+    monkeypatch.setattr(routes.run_repo, "get", lambda _run_id: run)
+    monkeypatch.setattr(
+        run, "get_best_config", lambda: SimpleNamespace(config=None, context_length=None)
+    )
+
+    response = client.post(f"/api/runs/{uuid4()}/verify-default")
+
+    assert response.status_code == 404, response.text
+    assert "winner" in response.json()["detail"]
+
+
 def test_verify_default_calls_fake_client_and_returns_verified(client, monkeypatch, tmp_path):
     home = _home(tmp_path)
     monkeypatch.setattr(routes.run_repo, "get", lambda _run_id: _run())

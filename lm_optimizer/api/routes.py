@@ -1366,12 +1366,18 @@ async def get_model_default(model_id: str):
 @router.post("/model-default/restore")
 async def restore_model_default(request: RestoreDefaultsRequest):
     """Restore a model's LM Studio defaults from a backup."""
-    from lm_optimizer.services.lmstudio_defaults import DefaultsError, restore_defaults
+    from lm_optimizer.services.lmstudio_defaults import (
+        DefaultsError,
+        ModelNotFoundError,
+        restore_defaults,
+    )
 
     try:
         result = restore_defaults(
             request.model_id, backup=request.backup, dry_run=request.dry_run
         )
+    except ModelNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from None
     except DefaultsError as e:
         raise HTTPException(status_code=400, detail=str(e)) from None
     return result.to_dict()
@@ -1389,14 +1395,22 @@ async def get_run_default_diff(run_id: UUID):
     if best is None:
         raise HTTPException(status_code=404, detail="No validated winner in this run")
     config = best.config
+    if config is None:
+        raise HTTPException(status_code=404, detail="No validated winner in this run")
     if config.context_length is None and getattr(best, "context_length", None):
         config = _replace(config, context_length=best.context_length)
     model_id = getattr(getattr(run, "model", None), "id", "") or ""
 
-    from lm_optimizer.services.lmstudio_defaults import DefaultsError, diff_defaults
+    from lm_optimizer.services.lmstudio_defaults import (
+        DefaultsError,
+        ModelNotFoundError,
+        diff_defaults,
+    )
 
     try:
         diff = diff_defaults(model_id, config)
+    except ModelNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from None
     except DefaultsError as e:
         raise HTTPException(status_code=409, detail=str(e)) from None
     return diff.to_dict()
@@ -1414,6 +1428,8 @@ async def verify_run_default(run_id: UUID):
     if best is None:
         raise HTTPException(status_code=404, detail="No validated winner in this run")
     config = best.config
+    if config is None:
+        raise HTTPException(status_code=404, detail="No validated winner in this run")
     if config.context_length is None and getattr(best, "context_length", None):
         config = _replace(config, context_length=best.context_length)
     model_id = getattr(getattr(run, "model", None), "id", "") or ""
@@ -1467,7 +1483,10 @@ async def save_lmstudio_default(run_id: UUID, dry_run: bool = False, verify: boo
 
             best = run.get_best_config()
             config = best.config if best is not None else None
-            if config is not None and config.context_length is None and getattr(
+            if config is None:
+                payload["verification"] = {"skipped": "no_winner"}
+                return payload
+            if config.context_length is None and getattr(
                 best, "context_length", None
             ):
                 config = _replace(config, context_length=best.context_length)
