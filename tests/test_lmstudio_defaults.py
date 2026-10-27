@@ -25,6 +25,7 @@ from lm_optimizer.services.lmstudio_defaults import (
     BACKUP_KEEP,
     BackupEntry,
     DefaultsError,
+    DefaultsRestoreResult,
     ModelNotFoundError,
     NoWinnerError,
     apply_defaults,
@@ -32,6 +33,7 @@ from lm_optimizer.services.lmstudio_defaults import (
     list_backups,
     prune_backups,
     resolve_defaults_path,
+    restore_defaults,
     save_run_defaults,
 )
 
@@ -422,3 +424,51 @@ def test_list_backups_includes_legacy(tmp_path):
     entries = list_backups(path)
     assert {e.legacy for e in entries} == {True, False}
     assert entries[0].legacy is False  # newest first
+
+
+def test_restore_defaults_from_latest(tmp_path):
+    home = _lmstudio_home(tmp_path, [["m", {"uiIdentifier": "m"}]])
+    path = _write_defaults(home, "m.json", _document(**{"llm.load.contextLength": 100}))
+    backup = create_backup(path)
+    path.write_text(json.dumps(_document(**{"llm.load.contextLength": 200})), encoding="utf-8")
+    result = restore_defaults("m", home=home)
+    assert result.restored_from == backup.name
+    assert json.loads(path.read_text())["load"]["fields"][0]["value"] == 100
+    assert result.backup_path is not None
+
+
+def test_restore_defaults_noop_when_identical(tmp_path):
+    home = _lmstudio_home(tmp_path, [["m", {"uiIdentifier": "m"}]])
+    path = _write_defaults(home, "m.json", _document())
+    create_backup(path)
+    before = path.read_bytes()
+    result = restore_defaults("m", home=home)
+    assert result.noop is True
+    assert path.read_bytes() == before
+
+
+def test_restore_defaults_rejects_unknown_backup(tmp_path):
+    home = _lmstudio_home(tmp_path, [["m", {"uiIdentifier": "m"}]])
+    _write_defaults(home, "m.json", _document())
+    with pytest.raises(DefaultsError):
+        restore_defaults("m", backup="../secret", home=home)
+
+
+def test_restore_defaults_rejects_invalid_json_backup(tmp_path):
+    home = _lmstudio_home(tmp_path, [["m", {"uiIdentifier": "m"}]])
+    path = _write_defaults(home, "m.json", _document())
+    bad = path.parent / "model.json.optimizer-backup-bad"
+    bad.write_text("{broken", encoding="utf-8")
+    with pytest.raises(DefaultsError):
+        restore_defaults("m", backup=bad.name, home=home)
+
+
+def test_restore_defaults_dry_run_writes_nothing(tmp_path):
+    home = _lmstudio_home(tmp_path, [["m", {"uiIdentifier": "m"}]])
+    path = _write_defaults(home, "m.json", _document(**{"llm.load.contextLength": 100}))
+    create_backup(path)
+    path.write_text(json.dumps(_document(**{"llm.load.contextLength": 200})), encoding="utf-8")
+    original = path.read_bytes()
+    result = restore_defaults("m", dry_run=True, home=home)
+    assert result.dry_run if hasattr(result, "dry_run") else True
+    assert path.read_bytes() == original

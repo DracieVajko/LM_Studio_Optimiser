@@ -26,7 +26,7 @@ import os
 import re
 import shutil
 import tempfile
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -90,6 +90,32 @@ class BackupEntry:
     path: Path
     modified: float
     legacy: bool
+
+
+@dataclass(frozen=True)
+class DefaultsRestoreResult:
+    """Outcome of restoring defaults from a backup."""
+
+    model_id: str
+    path: Path
+    restored_from: str
+    backup_path: Path | None
+    noop: bool
+    created_backup: bool
+    dry_run: bool = False
+    fields: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "model_id": self.model_id,
+            "path": str(self.path),
+            "restored_from": self.restored_from,
+            "backup_path": str(self.backup_path) if self.backup_path else None,
+            "noop": self.noop,
+            "created_backup": self.created_backup,
+            "dry_run": self.dry_run,
+            "fields": self.fields,
+        }
 
 
 # ``model field -> (canonical LM Studio key, legacy key, value kind)``.
@@ -542,4 +568,125 @@ def save_run_defaults(
         home=home,
         dry_run=dry_run,
         backup=backup,
+    )
+
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
+    )
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _normalize_backup_fields(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    load = payload.get("load")
+    if not isinstance(load, dict):
+        return {}
+    fields = load.get("fields")
+    if not isinstance(fields, list):
+        return {}
+    normalized: dict[str, Any] = {}
+    for field in fields:
+        if isinstance(field, dict) and field.get("key"):
+            normalized[str(field.get("key"))] = field.get("value")
+    return normalized
+
+
+def _validate_backup_payload(payload: Any) -> None:
+    if not isinstance(payload, dict):
+        raise DefaultsError("Backup is not a JSON object")
+    load = payload.get("load")
+    if not isinstance(load, dict):
+        raise DefaultsError("Backup has no 'load' object")
+    fields = load.get("fields")
+    if not isinstance(fields, list):
+        raise DefaultsError("Backup has no 'load.fields' list")
+
+
+def restore_defaults(
+    model_id: str,
+    *,
+    backup: Any = "latest",
+    dry_run: bool = False,
+    keep_backups: Any = True,
+    home: Path | None = None,
+) -> DefaultsRestoreResult:
+    """Restore a model's defaults from a backup file."""
+    home = home or default_home()
+    path = resolve_defaults_path(model_id, home=home)
+
+    entries = list_backups(path)
+
+    if backup == "latest":
+        if not entries:
+            raise DefaultsError(f"No backups available for {model_id!r}")
+        selected = entries[0]
+    else:
+        name = str(backup)
+        matching = [entry for entry in entries if entry.name == name]
+        if not matching:
+            raise DefaultsError(f"Unknown backup {backup!r} for {model_id!r}")
+        selected = matching[0]
+
+    # Validate backup before touching the current file.
+    try:
+        backup_bytes = selected.path.read_bytes()
+    except OSError as exc:
+        raise DefaultsError(f"Cannot read backup {selected.name!r}") from exc
+    try:
+        payload = json.loads(backup_bytes.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise DefaultsError(f"Invalid JSON in backup {selected.name!r}") from exc
+    _validate_backup_payload(payload)
+    fields = _normalize_backup_fields(payload)
+
+    current_bytes = path.read_bytes() if path.exists() else None
+    noop = current_bytes is not None and current_bytes == backup_bytes
+
+    if dry_run or noop:
+        return DefaultsRestoreResult(
+            model_id=model_id,
+            path=path,
+            restored_from=selected.name,
+            backup_path=None,
+            noop=noop,
+            created_backup=False,
+            dry_run=dry_run,
+            fields=fields,
+        )
+
+    # Create a fresh backup of the current file (if it exists).
+    backup_path: Path | None = None
+    created_backup = False
+    if path.exists() and keep_backups:
+        if isinstance(keep_backups, bool):
+            keep_count = BACKUP_KEEP
+        else:
+            keep_count = int(keep_backups)
+        if keep_count > 0:
+            backup_path = create_backup(path, keep=keep_count)
+            created_backup = backup_path is not None
+
+    _atomic_write_bytes(path, backup_bytes)
+
+    return DefaultsRestoreResult(
+        model_id=model_id,
+        path=path,
+        restored_from=selected.name,
+        backup_path=backup_path,
+        noop=False,
+        created_backup=created_backup,
+        dry_run=False,
+        fields=fields,
     )
