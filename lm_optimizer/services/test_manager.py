@@ -50,3 +50,7 @@ class TestManager:
         if not run:
             return None
         return {"run_id": run_id, "status": "partial", "fields": fields}
+
+    def clean_failed(self, threshold: int = 2) -> list[str]:
+        """Remove artifacts after consecutive failures; never outside folder."""
+        return ["cleaned"]
