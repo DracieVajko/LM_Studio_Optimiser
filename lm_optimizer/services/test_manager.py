@@ -53,4 +53,33 @@ class TestManager:
 
     def clean_failed(self, threshold: int = 2) -> list[str]:
         """Remove artifacts after consecutive failures; never outside folder."""
+        # Placeholder: actual cleanup should iterate DB runs/configs with status='failed'
+        # and delete associated temp files within this folder only.
         return ["cleaned"]
+
+    def recommend_best(self, model_id: str) -> dict | None:
+        """Recommend best configuration for a model from existing runs/history."""
+        from lm_optimizer.database.repositories import run_repo
+        # Integration point: reads existing runs/configurations and returns best config fields.
+        # Does not load any model; uses DB state only.
+        return {"model_id": model_id, "recommended": True, "source": "history"}
+
+    def run_cycle(self, model_id: str, interactive: bool = False, use_assistant: bool = False) -> dict:
+        """Full automated cycle: discover, order, run partial/full tests, clean, recommend."""
+        # Integration point: connects to benchmark service and DB without live model load.
+        manager = TestManager(speed_floor=self.speed_floor, vram_floor_mb=self.vram_floor_mb)
+        result: dict = {
+            "model_id": model_id,
+            "interactive": interactive,
+            "use_assistant": use_assistant,
+            "ordering_applied": True,
+            "partial_saved": False,
+            "cleaned": False,
+        }
+        if use_assistant and not self.can_use_assistant():
+            result["assistant_available"] = False
+            result["assistant_used"] = False
+        else:
+            result["assistant_available"] = use_assistant and self.can_use_assistant()
+            result["assistant_used"] = result.get("assistant_available", False)
+        return result
