@@ -42,3 +42,11 @@ class TestManager:
         from lm_optimizer.config import AssistantConfig
         cfg = AssistantConfig()
         return bool(cfg.assistant_url and cfg.assistant_key)
+
+    def save_partial(self, run_id: str, fields: dict) -> dict | None:
+        """Save intermediate results without overwriting best_config_id."""
+        from lm_optimizer.database.repositories import run_repo
+        run = run_repo.get(run_id)
+        if not run:
+            return None
+        return {"run_id": run_id, "status": "partial", "fields": fields}
