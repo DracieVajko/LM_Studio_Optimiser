@@ -45,6 +45,19 @@ class LMStudioConfig(BaseSettings):
         return v
 
 
+class AssistantConfig(BaseSettings):
+    """Optional external assistant endpoint (e.g., local LM Studio or external service)."""
+
+    model_config = SettingsConfigDict(env_prefix="LM_OPTIMIZER_", extra="ignore")
+
+    assistant_url: str | None = Field(
+        default=None, description="Optional assistant endpoint URL"
+    )
+    assistant_key: str | None = Field(
+        default=None, description="Optional assistant API key (from .env only)"
+    )
+
+
 class OptimizationConfig(BaseSettings):
     """Optimization behavior configuration."""
 

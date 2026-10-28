@@ -154,3 +154,9 @@ def test_clean_command_runs(monkeypatch):
     result = CliRunner().invoke(cli_main.app, ["lab", "clean", "--dry-run"])
     assert result.exit_code == 0, result.output
     assert "Clean" in result.output
+
+
+def test_assistant_not_used_without_env(monkeypatch):
+    from lm_optimizer.services.test_manager import TestManager
+    manager = TestManager()
+    assert manager.can_use_assistant() is False

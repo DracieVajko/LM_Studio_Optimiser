@@ -37,3 +37,8 @@ class TestManager:
         # Default conservative estimate; in production this should query
         # the actual model info from LM Studio server or database.
         return 1024 * 1024 * 1024  # 1 GB placeholder
+
+    def can_use_assistant(self) -> bool:
+        from lm_optimizer.config import AssistantConfig
+        cfg = AssistantConfig()
+        return bool(cfg.assistant_url and cfg.assistant_key)
