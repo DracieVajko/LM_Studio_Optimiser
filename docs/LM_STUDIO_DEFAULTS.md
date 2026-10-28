@@ -94,7 +94,7 @@ lm-optimizer lab verify-default <run-id>
 
 API: `GET /api/model-default`, `GET /api/runs/{run_id}/default-diff`, `POST /api/model-default/restore`, `POST /api/runs/{run_id}/verify-default`, `POST /api/runs/{run_id}/save-default?verify=true`. Diff compares current defaults against the winner; restore validates JSON before writing; verify loads with an empty config and compares only echoed fields, always unloading in `finally`.
 
-Results page shows a diff summary before save; the model detail page shows an "LM Studio default" card with current fields and backup count.
+Results page shows a diff summary before save; the model detail page shows an "LM Studio default" card with current fields and backup count. The test-manager subsystem (`lab test-manager`, `recommend`, `clean`) integrates intelligent ordering, partial results, assistant opt-in (`.env` only), and folder-bound cleanup — all within this repo.
 
 ## Usage
 
