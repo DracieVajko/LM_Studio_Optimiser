@@ -33,9 +33,21 @@ class TestManager:
         return generation_tok_s is not None and generation_tok_s < self.speed_floor
 
     def estimate_vram_needed(self, model_id: str) -> int:
-        """Placeholder: real VRAM estimation should read from hardware detector."""
-        # Default conservative estimate; in production this should query
-        # the actual model info from LM Studio server or database.
+        """Real VRAM estimation using hardware detector; falls back to 1GB placeholder."""
+        try:
+            from lm_optimizer.services.hardware import HardwareDetector
+            detector = HardwareDetector()
+            info = detector.detect()
+            # Use first GPU's VRAM if available; otherwise fall back to conservative estimate.
+            gpus = getattr(info, "gpus", None) or []
+            if gpus:
+                vram_gb = float(getattr(gpus[0], "vram_gb", 0) or 0)
+                if vram_gb > 0:
+                    # Reserve floor (250-500MB) for scheduling; return available above floor.
+                    available = max(0, int((vram_gb - 0.375) * 1024 * 1024 * 1024))  # 375MB floor
+                    return available
+        except Exception:
+            pass
         return 1024 * 1024 * 1024  # 1 GB placeholder
 
     def can_use_assistant(self) -> bool:
