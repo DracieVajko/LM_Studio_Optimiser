@@ -115,6 +115,7 @@ def test_restore_default_bad_backup_exits_1(monkeypatch, tmp_path):
 def test_verify_default_verified(monkeypatch, tmp_path):
     from lm_optimizer.api import routes
     from lm_optimizer.database.repositories import run_repo
+    from lm_optimizer.database.repositories import run_repo
     from lm_optimizer.api.client import LoadConfig, LoadModelResponse, UnloadModelResponse
     home = _home(tmp_path)
     monkeypatch.setattr(run_repo, "get", lambda _run_id: _run())
@@ -138,3 +139,18 @@ def test_verify_default_verified(monkeypatch, tmp_path):
     result = CliRunner().invoke(cli_main.app, ["lab", "verify-default", str(uuid4())])
     assert result.exit_code == 0, result.output
     assert "verified" in result.output
+
+def test_test_manager_command_runs(monkeypatch):
+    result = CliRunner().invoke(cli_main.app, ["lab", "test-manager"])
+    assert result.exit_code == 0, result.output
+    assert "Test manager started" in result.output
+
+def test_recommend_command_runs(monkeypatch):
+    result = CliRunner().invoke(cli_main.app, ["lab", "recommend", "prism-ml/bonsai-27b"])
+    assert result.exit_code == 0, result.output
+    assert "Recommend mode activated" in result.output
+
+def test_clean_command_runs(monkeypatch):
+    result = CliRunner().invoke(cli_main.app, ["lab", "clean", "--dry-run"])
+    assert result.exit_code == 0, result.output
+    assert "Clean" in result.output

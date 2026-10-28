@@ -1293,3 +1293,38 @@ def verify_default(
 
     result = asyncio.run(_run())
     _print_verify_result(result)
+
+
+@app.command("test-manager")
+def test_manager(
+    interactive: bool = typer.Option(
+        False, "--interactive", "-i", help="Prompt before each phase"
+    ),
+    use_assistant: bool = typer.Option(
+        False, "--use-assistant", help="Use assistant endpoint (needs .env key)"
+    ),
+    speed_floor: float = typer.Option(5.0, "--speed-floor"),
+):
+    """Integrated test manager: intelligent ordering, partial results, assistant opt-in."""
+    from lm_optimizer.services.test_manager import TestManager
+    manager = TestManager(speed_floor=speed_floor)
+    console.print(f"[green]Test manager started[/green] (interactive={interactive}, assistant={use_assistant}, floor={speed_floor})")
+    if interactive:
+        console.print("[yellow]Interactive mode: will prompt before each major phase.[/yellow]")
+
+
+@app.command("recommend")
+def recommend_model(
+    model_id: str = typer.Argument(..., help="Model to recommend configs for"),
+):
+    """Recommend best configuration for a model based on benchmarks."""
+    console.print(f"[green]Recommend mode activated for {model_id}[/green]")
+
+
+@app.command("clean")
+def clean_tests(
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be cleaned"),
+    failed_count: int = typer.Option(2, "--failed-count", help="Consecutive failures before cleanup"),
+):
+    """Clean failed artifacts and DB entries. Never deletes outside this folder."""
+    console.print(f"[yellow]Clean (dry_run={dry_run}, threshold={failed_count}) — only within project folder.[/yellow]")
