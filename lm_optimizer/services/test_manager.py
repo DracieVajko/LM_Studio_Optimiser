@@ -69,6 +69,31 @@ class TestManager:
         # and delete associated temp files within this folder only.
         return ["cleaned"]
 
+    def quick_test_nemotron(self, model_id: str = "lmstudio-community/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF", dry_run: bool = True) -> dict:
+        """Prepare quick default/test for new Nemotron Bolt models (no live load)."""
+        from lm_optimizer.services.lmstudio_defaults import resolve_defaults_path, apply_defaults
+        from lm_optimizer.domain.models import LoadConfiguration
+        result = {
+            "model_id": model_id,
+            "dry_run": dry_run,
+            "prepared": True,
+            "note": "No live LLM load performed; file/default preparation only.",
+        }
+        try:
+            path = resolve_defaults_path(model_id)
+            safe_config = LoadConfiguration(
+                context_length=131072,
+                flash_attention=False,
+                offload_kv_cache_to_gpu=True,
+            )
+            apply_defaults(model_id, safe_config, dry_run=dry_run, backup=True)
+            result["path"] = str(path)
+            result["applied_config"] = {"context_length": 131072, "flash_attention": False, "offload_kv_cache_to_gpu": True}
+        except Exception as exc:
+            result["prepared"] = False
+            result["error"] = str(exc)[:200]
+        return result
+
     def recommend_best(self, model_id: str) -> dict | None:
         """Recommend best configuration for a model from existing runs/history."""
         from lm_optimizer.database.repositories import run_repo
