@@ -101,7 +101,7 @@ class TestManager:
         # Does not load any model; uses DB state only.
         return {"model_id": model_id, "recommended": True, "source": "history"}
 
-    def run_cycle(self, model_id: str, interactive: bool = False, use_assistant: bool = False) -> dict:
+    def run_cycle(self, model_id: str, interactive: bool = False, use_assistant: bool = False, calm_minutes: int = 15, check_interval: int = 60) -> dict:
         """Full automated cycle: discover, order, run partial/full tests, clean, recommend."""
         # Integration point: connects to benchmark service and DB without live model load.
         manager = TestManager(speed_floor=self.speed_floor, vram_floor_mb=self.vram_floor_mb)

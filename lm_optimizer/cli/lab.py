@@ -1304,13 +1304,24 @@ def test_manager(
         False, "--use-assistant", help="Use assistant endpoint (needs .env key)"
     ),
     speed_floor: float = typer.Option(5.0, "--speed-floor"),
+    calm_minutes: int = typer.Option(15, "--calm-minutes", help="Minutes of GPU/CPU calm before full cycle proceeds"),
+    check_interval: int = typer.Option(60, "--check-interval", help="Seconds between GPU/CPU checks"),
 ):
     """Integrated test manager: intelligent ordering, partial results, assistant opt-in."""
     from lm_optimizer.services.test_manager import TestManager
-    manager = TestManager(speed_floor=speed_floor)
-    console.print(f"[green]Test manager started[/green] (interactive={interactive}, assistant={use_assistant}, floor={speed_floor})")
+    manager = TestManager(speed_floor=speed_floor, vram_floor_mb=250)
+    console.print(f"[green]Test manager started[/green] (interactive={interactive}, assistant={use_assistant}, floor={speed_floor}, calm_minutes={calm_minutes}, check_interval={check_interval})")
     if interactive:
         console.print("[yellow]Interactive mode: will prompt before each major phase.[/yellow]")
+    # Full automated cycle (no live model load by default; scheduling logic only)
+    cycle_result = manager.run_cycle(
+        model_id="lmstudio-community/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF",
+        interactive=interactive,
+        use_assistant=use_assistant,
+        calm_minutes=calm_minutes,
+        check_interval=check_interval,
+    )
+    console.print(f"[dim]Cycle result: {cycle_result}[/dim]")
 
 
 @app.command("recommend")
