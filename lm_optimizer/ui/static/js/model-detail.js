@@ -202,6 +202,12 @@
             el("md-default-content").innerHTML = '<p class="text-xs text-red-600">Failed to load default info.</p>';
         }
 
+        // Test manager card
+        const tmContent = el("md-test-manager-content");
+        if (tmContent) {
+            tmContent.innerHTML = '<p class="text-xs text-gray-500">Run <code class="font-mono">lm-optimizer lab test-manager --interactive</code> to start intelligent scheduling.</p>';
+        }
+
         const button = el("md-run-optimize");
         if (button) {
             button.addEventListener("click", function () {

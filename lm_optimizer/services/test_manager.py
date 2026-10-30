@@ -19,6 +19,35 @@ class TestManager:
     def __init__(self, speed_floor: float = 5.0, vram_floor_mb: int = 250):
         self.speed_floor = speed_floor
         self.vram_floor_mb = vram_floor_mb
+        self._speculative_config = None
+        self._kv_cache_config = None
+        self._monitoring_info = None
+        self._wire_monitoring()
+
+    def _wire_monitoring(self):
+        """Wire HardwareDetector into TestManager for real-time VRAM profiling."""
+        try:
+            from lm_optimizer.services.hardware import HardwareDetector
+            detector = HardwareDetector()
+            info = detector.detect()
+            gpus = getattr(info, "gpus", None) or []
+            vram_gb = float(getattr(gpus[0], "vram_gb", 8.0) if gpus else 8.0)
+            self.vram_floor_mb = int(vram_gb * 1024 * 0.9)
+            self._monitoring_info = {"vram_gb": vram_gb, "floor_mb": self.vram_floor_mb}
+        except Exception:
+            self._monitoring_info = {"vram_gb": 8.0, "floor_mb": self.vram_floor_mb}
+
+    def auto_tune_speculative(self, config=None):
+        """Auto-select speculative decoding params based on model size and config."""
+        from lm_optimizer.api.routes import auto_tune_speculative
+        self._speculative_config = auto_tune_speculative(config)
+        return self._speculative_config
+
+    def auto_tune_kv_cache(self, gpu_vram_gb=8.0):
+        """Auto-select KV cache quantization based on GPU VRAM."""
+        from lm_optimizer.api.routes import auto_tune_kv_cache
+        self._kv_cache_config = auto_tune_kv_cache(None, gpu_vram_gb)
+        return self._kv_cache_config
 
     def order_models(self, models: list["ModelInfo"]) -> list[str]:
         """Ascending size; MoE before dense in same band; dense last."""
@@ -83,7 +112,7 @@ class TestManager:
             path = resolve_defaults_path(model_id)
             safe_config = LoadConfiguration(
                 context_length=131072,
-                flash_attention=False,
+                flash_attention=True,  # Required for V cache quantization (q4_0)
                 offload_kv_cache_to_gpu=True,
             )
             apply_defaults(model_id, safe_config, dry_run=dry_run, backup=True)
@@ -119,6 +148,12 @@ class TestManager:
         else:
             result["assistant_available"] = use_assistant and self.can_use_assistant()
             result["assistant_used"] = result.get("assistant_available", False)
+
+        # Auto-tune speculative decoding and KV cache based on detected VRAM
+        vram_gb = self._monitoring_info.get("vram_gb", 8.0) if self._monitoring_info else 8.0
+        result["speculative_config"] = self.auto_tune_speculative(None)
+        result["kv_cache_config"] = self.auto_tune_kv_cache(vram_gb)
+        result["monitoring"] = self._monitoring_info
 
         # 15-minute calm trigger: only proceed when GPU/CPU is calm for scheduling.
         from lm_optimizer.services.gpu_monitor import should_run_tests
