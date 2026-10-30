@@ -12,6 +12,7 @@ Live-verified contract (2026-09-19, LM Studio bundled server, `lms` commit 69d94
   /api/v1/chat/completions does NOT exist in this version.
 """
 
+import asyncio
 import time
 import uuid
 from dataclasses import dataclass
@@ -47,6 +48,10 @@ CHAT_TIMEOUT_FLOOR_S = 300.0
 
 # Candidate load keys with type-correct probe values (reasoning_budget_message
 # is a string; numbers are rejected with invalid_type, not unrecognized_keys).
+#
+# Speculative/MTP keys: probed with values that pass validation so a
+# "recognized key" (404 model_not_found) is distinguishable from a
+# "recognized key, bad value" (400 invalid_request) - both mean supported.
 _PROBE_VALUES: dict[str, object] = {
     "context_length": 512,
     "flash_attention": True,
@@ -58,6 +63,11 @@ _PROBE_VALUES: dict[str, object] = {
     "reasoning_budget_message": "",
     "num_experts": 8,
     "speculative_draft_max_tokens": 8,
+    "speculative_draft_min_tokens": 0,
+    "speculative_draft_min_continue_probability": 0.0,
+    "speculative_draft_mtp": True,
+    "speculative_draft_simple": False,
+    "speculative_draft_model": "",
     "gpu_ratio": 0.5,
     "rope_freq_base": 10000.0,
     "rope_freq_scale": 1.0,
@@ -278,6 +288,17 @@ class LMStudioClient:
         caps.supports_context_checkpoints = "context_checkpoints" in accepted
         caps.supports_num_experts = "num_experts" in accepted
         caps.supports_rope_scaling = "rope_freq_base" in accepted
+        caps.supports_speculative_draft = bool(
+            accepted
+            & {
+                "speculative_draft_max_tokens",
+                "speculative_draft_min_tokens",
+                "speculative_draft_min_continue_probability",
+                "speculative_draft_simple",
+                "speculative_draft_model",
+            }
+        )
+        caps.supports_speculative_mtp = "speculative_draft_mtp" in accepted
 
     async def _probe_load_parameters(self) -> None:
         """Probe which load parameters are supported.
@@ -376,6 +397,8 @@ class LMStudioClient:
 
     async def list_models(self, force_refresh: bool = False) -> list[ModelIdentity]:
         """List all available models."""
+        if force_refresh:
+            self._models_cache = []
         if self._models_cache and not force_refresh:
             return self._models_cache
 
@@ -387,9 +410,16 @@ class LMStudioClient:
 
         for item in items:
             quant = item.get("quantization") or {}
+            # The LM Studio load endpoint accepts the KEY (publisher/model),
+            # not the "@quant" variant id: probe confirmed 200 for
+            # "qwen/qwen3-coder-30b" and 404 for "...@q4_k_m". `id` is
+            # therefore the key; `selected_variant` stays available for
+            # display and user-facing matching.
+            lm_key = item.get("key", "")
+            selected_variant = item.get("selected_variant") or lm_key
             model = ModelIdentity(
-                id=item.get("key", ""),
-                name=item.get("display_name") or item.get("key", ""),
+                id=lm_key or selected_variant,
+                name=item.get("display_name") or lm_key,
                 architecture=item.get("architecture"),
                 parameter_count=item.get("parameter_count"),
                 quantization=quant.get("name") if isinstance(quant, dict) else quant,
@@ -397,6 +427,9 @@ class LMStudioClient:
                 is_moe=self._detect_moe(item),
                 num_experts=item.get("num_experts"),
                 size_bytes=item.get("size_bytes"),
+                model_type=item.get("type"),
+                key=lm_key,
+                selected_variant=selected_variant,
             )
             models.append(model)
 
@@ -449,9 +482,14 @@ class LMStudioClient:
 
     async def get_model(self, model_id: str) -> ModelIdentity | None:
         """Get specific model information."""
-        models = await self.list_models()
+        models = await self.list_models(force_refresh=True)
         for model in models:
+            # Match by id, key, or selected_variant (for variant models)
             if model.id == model_id:
+                return model
+            if model.key == model_id:
+                return model
+            if model.selected_variant == model_id:
                 return model
         return None
 
@@ -590,11 +628,15 @@ class LMStudioClient:
     async def ensure_unloaded(self, model_id: str) -> bool:
         """Unload a model and verify it is really gone (server state).
 
-        Retries once by instance id: covers stale client cache and transient
-        unload failures. Returns True only when no instance of the model
-        remains loaded.
+        Retries with a short settle delay: LM Studio accepts the unload
+        request before its `/models` inventory stops reporting the instance,
+        so an immediate recheck can look like a failed unload for large
+        models (observed 2026-10-24 on a 27B: two 200 OK unloads followed by
+        a stale instance entry). Returns True only when no instance of the
+        model remains loaded.
         """
-        for _ in range(2):
+        attempts = 3
+        for attempt in range(attempts):
             try:
                 await self.unload_model(model_id=model_id)
             except Exception as e:
@@ -603,20 +645,26 @@ class LMStudioClient:
                 instances = await self.get_loaded_instances()
             except Exception as e:
                 logger.warning("State check failed", model=model_id, error=str(e))
-                continue
-            leftovers = [i for i in instances if i["model"] == model_id and i["instance_id"]]
-            if not leftovers:
-                self._loaded_models.pop(model_id, None)
-                return True
-            for inst in leftovers:
-                try:
-                    await self.unload_model(identifier=inst["instance_id"])
-                except Exception as e:
-                    logger.warning(
-                        "Forced unload failed",
-                        instance=inst["instance_id"],
-                        error=str(e),
-                    )
+                instances = None
+            if instances is not None:
+                leftovers = [
+                    i for i in instances if i["model"] == model_id and i["instance_id"]
+                ]
+                if not leftovers:
+                    self._loaded_models.pop(model_id, None)
+                    return True
+                for inst in leftovers:
+                    try:
+                        await self.unload_model(identifier=inst["instance_id"])
+                    except Exception as e:
+                        logger.warning(
+                            "Forced unload failed",
+                            instance=inst["instance_id"],
+                            error=str(e),
+                        )
+            # Give the server a moment to drop the instance before retrying.
+            if attempt < attempts - 1:
+                await asyncio.sleep(1.0 if attempt == 0 else 2.5)
         try:
             instances = await self.get_loaded_instances()
         except Exception:

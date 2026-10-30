@@ -82,7 +82,7 @@ class TestDashboardRenders:
         from pathlib import Path
 
         base = Path("lm_optimizer/ui/static/js")
-        for js in ("app", "history", "results", "settings"):
+        for js in ("app", "history", "results", "settings", "lab"):
             text = (base / f"{js}.js").read_text(encoding="utf-8")
             assert "document.readyState" in text, f"{js}.js boot is DOMContentLoaded-only"
 
@@ -92,7 +92,10 @@ class TestDashboardRenders:
         with TestClient(app) as client:
             for path, module in (("/", "app.js"), ("/history", "history.js"),
                                  ("/results/x", "results.js"),
-                                 ("/settings", "settings.js")):
+                                 ("/settings", "settings.js"),
+                                 ("/lab", "lab.js"),
+                                 ("/experiments", "experiments.js"),
+                                 ("/models/x", "model-detail.js")):
                 html = client.get(path).text
                 assert "main-content" in html, path
                 # Boot reporter turns silent blank pages into visible errors.

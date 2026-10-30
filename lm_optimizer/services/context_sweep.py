@@ -17,23 +17,41 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from lm_optimizer.services.context_explorer import MIN_DECODE_TPS
+
 ProbeFn = Callable[[int], Awaitable[dict[str, Any]]]
 
 
-def geometric_contexts(min_ctx: int, max_ctx: int) -> list[int]:
-    """Doubling ladder clamped to [min_ctx, max_ctx], always incl. endpoints."""
+def geometric_contexts(
+    min_ctx: int,
+    max_ctx: int,
+    factor: float = 2.0,
+    round_to: int = 1,
+) -> list[int]:
+    """Geometric ladder clamped to [min_ctx, max_ctx], always incl. endpoints.
+
+    `factor` controls the growth (default 2.0 = classic doubling; use 1.5 for
+    finer 1.5x bracketing per spec section 8.3, which can land on boundaries
+    like 76 288 instead of only powers of two). `round_to` snaps rungs to a
+    selectable granularity (512/1024).
+    """
     if min_ctx <= 0:
         min_ctx = 512
     if max_ctx < min_ctx:
         max_ctx = min_ctx
+    round_to = max(1, int(round_to or 1))
     out = []
-    v = min_ctx
-    while v < max_ctx:
-        out.append(v)
-        nxt = v * 2
-        if nxt >= max_ctx:
+    v = float(min_ctx)
+    guard = 0
+    while v < max_ctx and guard < 256:
+        guard += 1
+        rung = int(round(v / round_to) * round_to)
+        rung = max(min_ctx, rung)
+        if rung >= max_ctx:
             break
-        v = nxt
+        if not out or rung > out[-1]:
+            out.append(rung)
+        v *= factor
     if not out or out[-1] != max_ctx:
         out.append(max_ctx)
     # Guarantee the first geometric step exists even for narrow ranges.
@@ -89,6 +107,7 @@ async def sweep(
     max_ctx: int = 65536,
     step: int = 1000,
     precheck=None,
+    min_tps: float = MIN_DECODE_TPS,
 ) -> dict:
     """Full sweep: geometric phase then refinement. Returns report dict.
 
@@ -114,7 +133,7 @@ async def sweep(
                 break
         res = await probe(ctx)
         phase1.append({"ctx": ctx, **res})
-        if res.get("ok"):
+        if res.get("ok") and (res.get("tok_s", 0) or 0) >= min_tps:
             last_pass = ctx
         else:
             first_fail = ctx
@@ -131,7 +150,7 @@ async def sweep(
         max_stable, failed_boundary = None, first_fail
 
     # Capacity vs recommendation split over ALL passing points.
-    passing = [p for p in (phase1 + refinement) if p.get("ok")]
+    passing = [p for p in (phase1 + refinement) if p.get("ok") and (p.get("tok_s", 0) or 0) >= min_tps]
     perf_optimal = None
     balanced = None
     peak = 0.0
@@ -150,6 +169,22 @@ async def sweep(
         "balanced_recommended": balanced,
         "peak_tok_s": peak,
     }
+
+
+def pick_quality_rungs(report: dict, n: int) -> list[int]:
+    """Top-N empirically stable contexts, descending (for quality suites).
+
+    Only points with a REAL passing load count; precheck-only `estimated`
+    points never count as proof. Returns [] for n <= 0 or no stable points.
+    """
+    if n <= 0 or not isinstance(report, dict):
+        return []
+    points = list(report.get("geometric") or []) + list(report.get("refinement") or [])
+    stable = sorted(
+        {p["ctx"] for p in points if p.get("ok") and not p.get("estimated")},
+        reverse=True,
+    )
+    return stable[:n]
 
 
 def format_report(report: dict, model: str) -> str:

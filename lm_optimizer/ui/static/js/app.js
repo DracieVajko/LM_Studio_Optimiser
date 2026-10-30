@@ -1,9 +1,9 @@
 // LM Studio Auto Optimizer - Main Application
 
-import { API } from './api.js?v=6';
-import { UI } from './ui.js?v=6';
-import { Charts } from './charts.js?v=6';
-import { WebSocketManager } from './websocket.js?v=6';
+import { API } from './api.js?v=17';
+import { UI } from './ui.js?v=17';
+import { Charts } from './charts.js?v=17';
+import { WebSocketManager } from './websocket.js?v=17';
 
 // Application State
 const App = {
@@ -97,9 +97,10 @@ const App = {
         const main = document.getElementById('main-content');
         let lastError = '';
         try {
-            const [status, models] = await Promise.all([
+            const [status, models, stats] = await Promise.all([
                 API.getStatus(),
-                API.getModels().catch(() => ({ models: [] }))
+                API.getModels().catch(() => ({ models: [] })),
+                API.getStats().catch(() => ({}))
             ]);
 
             // Keep for later use (model meta, etc.)
@@ -109,7 +110,7 @@ const App = {
             // Update the header badge immediately (not only on interval).
             UI.updateStatusIndicator(status);
 
-            const html = UI.renderDashboard(status, models);
+            const html = UI.renderDashboard(status, models, stats);
             main.innerHTML = html;
 
             // Attach event listeners
@@ -155,7 +156,7 @@ const App = {
         });
 
         // Custom weights validation
-        ['w-gen','w-prompt','w-ctx','w-mem','w-qual','w-stab'].forEach(id => {
+        ['w-gen','w-prompt','w-ttft','w-ctx','w-mem','w-qual','w-stab'].forEach(id => {
             const el = document.getElementById(id);
             if (el) el.addEventListener('input', () => this._validateWeights());
         });
@@ -263,13 +264,44 @@ const App = {
     },
 
     _validateWeights() {
-        const ids = ['w-gen','w-prompt','w-ctx','w-mem','w-qual','w-stab'];
-        const sum = ids.reduce((s,id) => s + (parseInt(document.getElementById(id)?.value||0)), 0);
+        const ids = ['w-gen','w-prompt','w-ttft','w-ctx','w-mem','w-qual','w-stab'];
+        const vals = ids.map(id => parseFloat(document.getElementById(id)?.value || '0') || 0);
+        const sum = vals.reduce((a, b) => a + b, 0);
         const el = document.getElementById('weights-total');
         if (el) {
-            el.textContent = `Total: ${sum}% ${sum===100 ? '✓' : '✗ must be 100%'}`;
-            el.className = sum===100 ? 'text-xs mt-2 text-green-600' : 'text-xs mt-2 text-red-600';
+            if (sum <= 0) {
+                el.textContent = 'Share: set at least one priority above 0';
+                el.className = 'text-xs mt-2 text-red-600';
+            } else {
+                el.textContent = 'Share: ' + vals.map(v => Math.round((v / sum) * 100) + '%').join(' / ');
+                el.className = 'text-xs mt-2 text-green-600';
+            }
         }
+    },
+
+    _customWeights() {
+        const profile = document.querySelector('input[name="profile"]:checked');
+        if (!profile || profile.value !== 'custom') return null;
+        const map = {
+            generation_speed: 'w-gen',
+            prompt_speed: 'w-prompt',
+            ttft: 'w-ttft',
+            context: 'w-ctx',
+            memory_efficiency: 'w-mem',
+            quality: 'w-qual',
+            stability: 'w-stab',
+        };
+        const raw = {};
+        let sum = 0;
+        for (const [key, id] of Object.entries(map)) {
+            const v = Math.max(0, parseFloat(document.getElementById(id)?.value || '0') || 0);
+            raw[key] = v;
+            sum += v;
+        }
+        if (sum <= 0) return null;
+        const out = {};
+        for (const [key, v] of Object.entries(raw)) out[key] = v / sum;
+        return out;
     },
 
     async loadHistory() {
@@ -376,8 +408,13 @@ const App = {
             model_id: modelSelect.value,
             profile: profile?.value || 'balanced',
             quality_threshold: parseFloat(qualityThreshold?.value || '0.97'),
+            min_generation_tok_s: parseFloat(
+                document.getElementById('min-generation-tok-s')?.value || '2'
+            ) || 0,
             advanced_settings: this.getAdvancedSettings(),
         };
+        const customWeights = this._customWeights();
+        if (customWeights) request.custom_weights = customWeights;
 
         try {
             UI.showLoading('Starting optimization...');
@@ -394,6 +431,8 @@ const App = {
     },
 
     getAdvancedSettings() {
+        const skip_phases = ['speed', 'quality', 'recovery', 'validation', 'context']
+            .filter((phase) => document.getElementById(`skip-${phase}`)?.checked === true);
         return {
             min_context: parseInt(document.getElementById('min-context')?.value || '2048'),
             max_context: parseInt(document.getElementById('max-context')?.value || '32768'),
@@ -405,6 +444,12 @@ const App = {
             test_kv_cpu: document.getElementById('test-kv-cpu')?.checked !== false,
             auto_batch: document.getElementById('auto-batch')?.checked !== false,
             optimize_context: document.getElementById('optimize-context')?.checked === true,
+            min_generation_tok_s: parseFloat(
+                document.getElementById('min-generation-tok-s')?.value || '2'
+            ) || 0,
+            skip_phases,
+            warmup_runs: Math.min(5, Math.max(0,
+                parseInt(document.getElementById('warmup-runs')?.value || '1', 10) || 0)),
         };
     },
 

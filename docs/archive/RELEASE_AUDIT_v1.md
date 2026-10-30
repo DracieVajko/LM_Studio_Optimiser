@@ -50,7 +50,7 @@ The repository has been prepared for a public GitHub v1.0.0-beta release. This i
 - [x] `README.md` rewritten for public GitHub: description (empirically validated, not “objectively best”), screenshots placeholder, features, platforms, requirements, installation, LM Studio setup, configuration, first optimization, profiles (with thresholds/weights), advanced settings, results, presets, troubleshooting, architecture (single authoritative per responsibility), methodology, limitations, development, testing, license
 - [x] `CHANGELOG.md` — added `1.0.0-beta` entry summarizing correctness pass + v1.0 readiness (breaking changes, removed, etc.)
 - [x] `docs/OPTIMIZATION_METHOD.md` — 13 sections: candidate generation, normalization (run-/model-/hardware-relative), TTFT, quality heuristics, profiles, baseline, explainability, Pareto, limitations, remaining constants justification (15% headroom, epsilon, seed, etc.)
-- [x] `docs/RELEASE_AUDIT_v1.md` — this file
+- [x] `docs/archive/RELEASE_AUDIT_v1.md` — this file
 - [x] `LICENSE` — MIT added
 - [x] `SECURITY.md` / `CONTRIBUTING.md` — present, version table will be updated to 1.0.0-beta
 - [x] `TROUBLESHOOTING.md` — generic URLs, updated paths to `data/`
@@ -161,7 +161,7 @@ No data loss on upgrade: DB migrations `006`/`007` add columns, preserve existin
 - [x] `.gitignore` (covers `data/`, `*.db`, `__pycache__/`, `*.log`, etc.)
 - [x] `pyproject.toml` (1.0.0-beta, runtime/dev deps separated, 3.11+)
 - [x] `docs/OPTIMIZATION_METHOD.md` (methodology)
-- [x] `docs/RELEASE_AUDIT_v1.md` (this file)
+- [x] `docs/archive/RELEASE_AUDIT_v1.md` (this file)
 - [x] `.github/workflows/ci.yml` (Windows/Linux/macOS, no GPU required)
 - [x] No `100.101.20.64` in source (only `127.0.0.1`/`192.168.1.100` examples)
 - [x] No `RTX 3060`/`6 GB` as hardcoded scoring (only generic examples/docs)

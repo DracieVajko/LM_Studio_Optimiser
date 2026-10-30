@@ -19,9 +19,6 @@
             renderPresets();
         });
     });
-    renderPresets();
-    document.querySelector('.sb-kind').classList.add('btn-primary');
-    document.querySelector('.sb-kind').classList.remove('btn-outline');
 
     var PRESETS = {
         text: [
@@ -48,6 +45,15 @@
         + 'automatic 360-degree orbit. Lights: AmbientLight plus DirectionalLight with shadows. '
         + 'Performance: grouped meshes, requestAnimationFrame 60 FPS loop, dynamic resize handling, vanilla JS only. '
         + 'Output only the complete HTML code, starting directly with <!DOCTYPE html>.';
+
+    // Initialise AFTER PRESETS exists: calling renderPresets() earlier threw
+    // a TypeError and aborted the whole script (no presets, no run handler).
+    renderPresets();
+    var firstKind = document.querySelector('.sb-kind');
+    if (firstKind) {
+        firstKind.classList.add('btn-primary');
+        firstKind.classList.remove('btn-outline');
+    }
 
     function renderPresets() {
         var box = el('sb-presets');

@@ -222,7 +222,7 @@ class TestFinalStates:
         cfgs = [_cfg_result(status=ConfigurationStatus.FAILED, err="timeout x")]
         assert best_passed(cfgs) is None
 
-    def test_partial_success(self):
+    def test_validated_winner_with_failed_candidates_is_success(self):
         from lm_optimizer.services.run_summary import classify_run, best_passed
 
         cfgs = [
@@ -230,8 +230,11 @@ class TestFinalStates:
             _cfg_result(ctx=8192, status=ConfigurationStatus.FAILED, err="boom"),
         ]
         state, info = classify_run(cfgs)
-        assert state == "PARTIAL_SUCCESS"
+        # A validated winner makes the RUN success; candidate failure never
+        # downgrades the whole optimization.
+        assert state == "SUCCESS"
         assert info["successful"] == 1 and info["failed"] == 1
+        assert info["validated_winner"] is True
         best = best_passed(cfgs)
         assert best is not None and best.status == ConfigurationStatus.PASSED
         assert best.context_length == 4096
@@ -249,11 +252,12 @@ class TestFinalStates:
         from lm_optimizer.services.run_summary import final_status_for_run
 
         assert final_status_for_run(_run([_cfg_result()])) == RunStatus.SUCCESS
+        # Winner + a failed candidate => still SUCCESS (not partial).
         assert (
             final_status_for_run(
                 _run([_cfg_result(), _cfg_result(status=ConfigurationStatus.FAILED, err="x")])
             )
-            == RunStatus.PARTIAL_SUCCESS
+            == RunStatus.SUCCESS
         )
         assert (
             final_status_for_run(_run([_cfg_result(status=ConfigurationStatus.FAILED, err="x")]))

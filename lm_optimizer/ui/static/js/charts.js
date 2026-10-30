@@ -225,7 +225,7 @@ export const Charts = {
 
         const tooltip = document.createElement('div');
         tooltip.id = 'chart-tooltip';
-        tooltip.className = 'fixed z-50 bg-gray-900 text-white p-4 rounded-lg shadow-xl max-w-xs pointer-events-none';
+        tooltip.className = 'fixed z-50 bg-gray-900 text-white p-4 rounded-lg shadow-xl max-w-xs max-h-[80vh] overflow-auto pointer-events-none';
         tooltip.style.left = `${event.clientX + 10}px`;
         tooltip.style.top = `${event.clientY + 10}px`;
 
@@ -251,6 +251,19 @@ export const Charts = {
         `;
 
         document.body.appendChild(tooltip);
+        // Clamp inside the viewport so the panel is never clipped off-screen.
+        const rect = tooltip.getBoundingClientRect();
+        const pad = 12;
+        let left = event.clientX + 12;
+        let top = event.clientY + 12;
+        if (left + rect.width + pad > window.innerWidth) {
+            left = Math.max(pad, event.clientX - rect.width - 12);
+        }
+        if (top + rect.height + pad > window.innerHeight) {
+            top = Math.max(pad, window.innerHeight - rect.height - pad);
+        }
+        tooltip.style.left = `${left}px`;
+        tooltip.style.top = `${top}px`;
 
         // Remove on click outside
         setTimeout(() => {

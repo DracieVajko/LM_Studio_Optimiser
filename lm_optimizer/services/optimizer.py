@@ -1,8 +1,12 @@
 """Adaptive optimization engine - hardware-agnostic scoring."""
 
 import asyncio
+import json
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 from uuid import UUID
 
@@ -35,6 +39,14 @@ from lm_optimizer.scoring.normalization import (
     weighted_score,
 )
 from lm_optimizer.services.benchmark import BenchmarkService
+from lm_optimizer.services.foreign_watchdog import BACKEND_LMSTUDIO, ForeignModelWatchdog
+from lm_optimizer.services.fingerprint import (
+    compute_fingerprint,
+    fingerprint_diff,
+    hardware_fingerprint,
+    should_revalidate_config,
+    filter_configs_for_revalidation,
+)
 from lm_optimizer.services.lm_studio import LMStudioClient
 from lm_optimizer.services.quality import QualityEvaluator
 from lm_optimizer.services.search_space import SearchSpace, SearchSpaceGenerator
@@ -54,14 +66,16 @@ EXPERIMENTAL_REASONS = {
 
 
 def parse_experimental_flags(
-    enable_rope: bool = False,
-    enable_cpu_moe: bool = False,
-    enable_speculative: bool = False,
+    enable_rope: bool | None = False,
+    enable_cpu_moe: bool | None = False,
+    enable_speculative: bool | None = False,
 ) -> dict:
     """Experimental tail opt-ins. All default OFF.
 
     RoPE / CPU-MoE / speculative probes run only as a tail after the FINAL
-    winner, never inside the main sweep.
+    winner, never inside the main sweep. `None` means "not specified" and
+    resolves to OFF (use `resolve_experimental_optins` when the distinction
+    between unspecified and explicit OFF matters for prompting).
     """
     return {
         "enable_rope": bool(enable_rope),
@@ -70,8 +84,41 @@ def parse_experimental_flags(
     }
 
 
+EXPERIMENTAL_QUESTIONS = {
+    "enable_rope": "Enable RoPE (rotary position embedding) probes?",
+    "enable_cpu_moe": "Enable CPU-MoE (Mixture of Experts) probes?",
+    "enable_speculative": "Enable Speculative decoding probes?",
+}
+
+
+def resolve_experimental_optins(
+    requested: dict,
+    ask: Callable[[str], bool] | None = None,
+) -> dict:
+    """Resolve experimental opt-ins distinguishing unspecified from explicit OFF.
+
+    - Explicit True/False values always win (explicit False counts as a user
+      decision and is never re-prompted).
+    - `None` (unspecified) values are asked via `ask(question)` when an
+      asker is provided, otherwise resolve to OFF.
+    - `ask` must never be called for explicitly decided flags.
+    """
+    resolved: dict = {}
+    for key in ("enable_rope", "enable_cpu_moe", "enable_speculative"):
+        value = (requested or {}).get(key)
+        if value is None:
+            resolved[key] = bool(ask(EXPERIMENTAL_QUESTIONS[key])) if ask is not None else False
+        else:
+            resolved[key] = bool(value)
+    return resolved
+
+
 def apply_experimental_mark(run: OptimizationRun, flags: dict | None) -> OptimizationRun:
     """Mark a run experimental when any opt-in flag is set.
+
+    `is_experimental` means "any experiment resolved ON at request time"
+    (requested→resolved mapping in `build_experimental_detail`). It does NOT
+    mean the tail probe actually ran — see `exercised` in the detail dict.
 
     Any True flag sets `run.is_experimental = True` with a reason string;
     all-False (or missing) flags leave the run clean.
@@ -85,6 +132,238 @@ def apply_experimental_mark(run: OptimizationRun, flags: dict | None) -> Optimiz
         run.is_experimental = False
         run.experimental_reason = None
     return run
+
+
+EXPERIMENTAL_FLAGS = ("enable_rope", "enable_cpu_moe", "enable_speculative")
+
+
+# ============================================================
+# Preset Definitions (spec §4.2)
+# ============================================================
+
+PRESET_DEFINITIONS: dict[str, dict] = {
+    "quick": {
+        "max_speed_probes": 12,
+        "max_finalists": 2,
+        "benchmark_repetitions": 1,
+        "validation_repetitions_min": 2,
+        "validation_repetitions_max": 2,
+        "recovery_budget": 1,
+        "selected_stages": ["speed", "quality", "validation"],
+        "context_strategy_modes": ["winner"],
+        "final_sandbox_mode": "off",
+    },
+    "standard": {
+        "max_speed_probes": 25,
+        "max_finalists": 4,
+        "benchmark_repetitions": 3,
+        "validation_repetitions_min": 2,
+        "validation_repetitions_max": 5,
+        "recovery_budget": 3,
+        "selected_stages": ["speed", "quality", "recovery", "validation"],
+        "context_strategy_modes": ["winner", "model_first_kv_cpu"],
+        "final_sandbox_mode": "off",
+    },
+    "thorough": {
+        "max_speed_probes": 40,
+        "max_finalists": 6,
+        "benchmark_repetitions": 3,
+        "validation_repetitions_min": 3,
+        "validation_repetitions_max": 5,
+        "recovery_budget": 5,
+        "selected_stages": ["speed", "quality", "recovery", "validation", "context"],
+        "context_strategy_modes": [
+            "winner",
+            "gpu_resident",
+            "model_first_kv_cpu",
+            "system_spillover",
+        ],
+        "final_sandbox_mode": "all",
+    },
+    "custom": {
+        # User-defined values - no defaults, must be provided
+    },
+}
+
+VALID_PRESETS = frozenset(PRESET_DEFINITIONS.keys())
+VALID_STAGES = frozenset(
+    [
+        "preflight",
+        "speed",
+        "quality",
+        "recovery",
+        "validation",
+        "context",
+        "sandbox",
+        "experimental",
+    ]
+)
+VALID_CONTEXT_STRATEGIES = frozenset(
+    [
+        "winner",  # frozen runtime from Phase A
+        "gpu_resident",  # GPU-resident weights + KV on GPU
+        "model_first_kv_cpu",  # model on GPU, KV on CPU
+        "system_spillover",  # partial GPU offload (if CLI channel available)
+    ]
+)
+VALID_SANDBOX_MODES = frozenset(["off", "one", "all", "custom"])
+
+
+def resolve_preset(
+    preset: str, overrides: dict | None = None
+) -> tuple[dict, list[str]]:
+    """Resolve a preset to concrete budgets, applying user overrides.
+
+    Returns (resolved_settings, warnings).
+    """
+    if preset not in VALID_PRESETS:
+        raise ValueError(
+            f"Unknown preset: {preset}. Valid: {', '.join(sorted(VALID_PRESETS))}"
+        )
+
+    base = PRESET_DEFINITIONS[preset].copy()
+    overrides = overrides or {}
+    warnings: list[str] = []
+
+    # Apply overrides. Custom mode accepts any documented key (it has no
+    # defaults of its own); named presets only extend their own keys.
+    _known_keys = {
+        "max_speed_probes",
+        "max_finalists",
+        "benchmark_repetitions",
+        "validation_repetitions_min",
+        "validation_repetitions_max",
+        "recovery_budget",
+        "selected_stages",
+        "context_strategy_modes",
+        "final_sandbox_mode",
+        "final_sandbox_preset_ids",
+        "final_sandbox_custom_prompts",
+        "sandbox_compare_baseline",
+    }
+    if preset == "custom":
+        base = {k: v for k, v in overrides.items() if k in _known_keys}
+    else:
+        for key, value in overrides.items():
+            if key in base:
+                base[key] = value
+            elif key in _known_keys:
+                # A documented budget the preset did not define: accept it.
+                base[key] = value
+            else:
+                warnings.append(f"Unknown preset override: {key}")
+
+    # Validate stage dependencies
+    stage_warnings = validate_stage_dependencies(base.get("selected_stages", []))
+    warnings.extend(stage_warnings)
+
+    # Validate context strategies
+    for strat in base.get("context_strategy_modes", []):
+        if strat not in VALID_CONTEXT_STRATEGIES:
+            warnings.append(f"Unknown context strategy: {strat}")
+
+    # Validate sandbox mode
+    sandbox_mode = base.get("final_sandbox_mode", "off")
+    if sandbox_mode not in VALID_SANDBOX_MODES:
+        warnings.append(f"Unknown sandbox mode: {sandbox_mode}")
+
+    return base, warnings
+
+
+def validate_stage_dependencies(selected_stages: list[str]) -> list[str]:
+    """Validate stage dependencies and return warnings.
+
+    Rules:
+    - preflight is mandatory (safety + context baseline)
+    - quality requires speed (or a user-selected compatible saved config)
+    - recovery requires quality failure + safe rollback reference
+    - validation requires quality-passing candidate (or explicit prior config)
+    - context requires a selected runtime config
+    - sandbox requires a valid selected config
+    - experimental requires explicit opt-in
+    """
+    warnings: list[str] = []
+    stages = set(selected_stages)
+
+    # preflight is always implied
+    if "preflight" not in stages:
+        warnings.append("'preflight' is mandatory for safety; implicitly added")
+        stages.add("preflight")
+
+    if "quality" in stages and "speed" not in stages:
+        warnings.append(
+            "'quality' requires 'speed' phase (or a compatible saved config); "
+            "results will be marked 'quality not verified'"
+        )
+
+    if "recovery" in stages:
+        if "quality" not in stages:
+            warnings.append(
+                "'recovery' requires 'quality' phase; will be skipped if no quality failure"
+            )
+
+    if "validation" in stages:
+        if "quality" not in stages:
+            warnings.append(
+                "'validation' normally requires 'quality-passing' candidate; "
+                "without it, labeled 'benchmark-retested but quality not verified'"
+            )
+
+    if "context" in stages:
+        if not stages & {"speed", "quality", "validation"}:
+            warnings.append(
+                "'context' requires a selected runtime config from a prior phase"
+            )
+
+    if "sandbox" in stages:
+        if not stages & {"validation", "context"}:
+            warnings.append(
+                "'sandbox' runs against a validated config; "
+                "without prior validation, labeled 'unvalidated config'"
+            )
+
+    if "experimental" in stages:
+        warnings.append("'experimental' runs only with explicit opt-in and is marked experimental")
+
+    return warnings
+
+
+def build_experimental_detail(
+    requested_raw: dict | None,
+    resolved: dict | None,
+    advanced_settings: dict | None = None,
+) -> dict:
+    """Requested vs resolved vs applied vs exercised experimental metadata.
+
+    - `requested`: raw CLI/API values (True/False/None; None = unspecified).
+    - `resolved`: bool dict after prompting/default-OFF (what `is_experimental` uses).
+    - `applied`: resolved minus capability blocks (speculative without a usable
+      draft model is never applied).
+    - `exercised`: all False until a tail probe actually runs (no tail runner
+      exists yet; the runner flips its flag to True when it runs).
+    - `skipped`: {flag: reason} for capability blocks.
+    """
+    requested_raw = requested_raw or {}
+    resolved = resolved or {}
+    advanced_settings = advanced_settings or {}
+    requested = {k: requested_raw.get(k) for k in EXPERIMENTAL_FLAGS}
+    resolved_b = {k: bool(resolved.get(k, False)) for k in EXPERIMENTAL_FLAGS}
+    applied = dict(resolved_b)
+    skipped: dict[str, str] = {}
+    draft = advanced_settings.get("speculative_draft_model") or advanced_settings.get(
+        "speculative_draft"
+    )
+    if resolved_b.get("enable_speculative") and not draft:
+        applied["enable_speculative"] = False
+        skipped["enable_speculative"] = "no usable draft model"
+    exercised = {k: False for k in EXPERIMENTAL_FLAGS}
+    return {
+        "requested": requested,
+        "resolved": resolved_b,
+        "applied": applied,
+        "exercised": exercised,
+        "skipped": skipped,
+    }
 
 
 def format_diagnostic(exc: BaseException) -> dict:
@@ -101,6 +380,234 @@ def format_diagnostic(exc: BaseException) -> dict:
         "message": str(exc) or type(exc).__name__,
         "traceback": "".join(_tb.format_exception(type(exc), exc, exc.__traceback__)),
     }
+
+
+# Canonical skippable phases (CLI --skip-phases, API skip_phases, GUI).
+PHASE_SKIP_NAMES = ("speed", "quality", "recovery", "validation", "context")
+
+
+def parse_phase_skips(value) -> set[str]:
+    """Parse user phase skips into a validated set (case-insensitive).
+
+    Accepts a comma string or a list/tuple/set. Raises ValueError naming
+    the first unknown phase (callers fail fast: CLI exit 2).
+    """
+    # Typer may hand us an OptionInfo object when a CLI default is not
+    # resolved (e.g. resume() called directly from optimize()). Unwrap it.
+    try:
+        import typer.models as _tm
+        if isinstance(value, _tm.OptionInfo):
+            value = getattr(value, "default", None)
+    except Exception:
+        pass
+    if value is None:
+        return set()
+    if isinstance(value, str):
+        items = [p.strip() for p in value.split(",")]
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        items = [str(p).strip() for p in value]
+    else:
+        # Unknown scalar -> skip nothing (never crash on a default value).
+        return set()
+    names = {p.lower() for p in items if p}
+    unknown = sorted(names - set(PHASE_SKIP_NAMES))
+    if unknown:
+        raise ValueError(
+            f"Unknown phase(s) to skip: {', '.join(unknown)} "
+            f"(expected one of: {', '.join(PHASE_SKIP_NAMES)})"
+        )
+    return names
+
+
+def phase_skips_of(advanced_settings) -> set[str]:
+    """Lenient skip set for run/resume paths (warn + ignore unknowns)."""
+    try:
+        return parse_phase_skips((advanced_settings or {}).get("skip_phases"))
+    except ValueError as e:
+        logger.warning("Ignoring invalid skip_phases", error=str(e)[:160])
+        return set()
+
+
+def compose_granular_skips(advanced_settings) -> list[str]:
+    """Merge granular mode flags into an explicit phase-skip list.
+
+    Shared by the CLI preflight and the web start endpoint so both surfaces
+    produce the SAME skip set for the same flags (§23 acceptance: the web
+    endpoint accepts granular flags).
+    """
+    adv = advanced_settings or {}
+    skips: set[str] = set()
+    if adv.get("skip_phases"):
+        try:
+            skips |= parse_phase_skips(adv.get("skip_phases"))
+        except ValueError:
+            pass
+    if adv.get("speed_only"):
+        skips |= {"quality", "recovery", "validation", "context"}
+    if adv.get("quality_only") or adv.get("reasoning_sweep"):
+        skips |= {"speed", "recovery", "validation", "context"}
+    if adv.get("mtp_test"):
+        skips |= {"quality", "recovery", "validation", "context"}
+    return sorted(skips)
+
+
+def granular_quality_frontier(
+    skips: set[str], advanced: dict | None, baseline_result
+) -> dict:
+    """Frontier for quality-only / reasoning-only runs (speed phase skipped).
+
+    Granular quality modes have no speed frontier; the baseline (anchor)
+    config becomes the single candidate so the quality battery still measures
+    something meaningful. Returns the frontier dict (empty finalists when no
+    baseline is available).
+    """
+    frontier = {"winner": None, "finalists": [], "contrarian": None}
+    if "speed" not in skips:
+        return frontier
+    adv = advanced or {}
+    if not (adv.get("quality_only") or adv.get("reasoning_sweep")):
+        return frontier
+    if baseline_result is not None:
+        frontier["finalists"] = [baseline_result]
+    return frontier
+
+
+def run_skip_phases(run) -> set[str]:
+    """Skip set for a persisted run: memory first, DB fallback.
+
+    `advanced_settings` lives only in memory; `benchmark_params` is the
+    persisted copy (written by prepare_run and _apply_resume_skips).
+    """
+    skips = phase_skips_of(getattr(run, "advanced_settings", None))
+    if skips:
+        return skips
+    return phase_skips_of(getattr(run, "benchmark_params", None))
+
+
+def resolve_phase_contexts(advanced_settings, model_limit) -> tuple[int, int]:
+    """Frozen Phase-A contexts (speed, quality), clamped to the model limit.
+
+    - speed: explicit ``speed_context`` wins, else the derived default.
+    - quality: explicit ``quality_context`` wins, else the legacy derivation.
+
+    The explicit quality default (8192 from CLI/API) prevents the old
+    behaviour where ``--max-context 32768`` silently made the quality suite run
+    at 32K, costing 2-4x for no extra evidence.
+    """
+    from lm_optimizer.services.speed_probe import (
+        quality_context_for,
+        speed_context_for,
+    )
+
+    adv = advanced_settings or {}
+    user_cap = adv.get("max_context")
+    try:
+        limit = int(model_limit or 0) or None
+    except (TypeError, ValueError):
+        limit = None
+
+    speed = None
+    explicit_speed = adv.get("speed_context")
+    if explicit_speed:
+        try:
+            speed = int(explicit_speed)
+        except (TypeError, ValueError):
+            speed = None
+    if speed is None:
+        speed = speed_context_for(user_cap, model_limit)
+    speed = max(256, speed)
+    if limit:
+        speed = min(speed, limit)
+
+    quality = None
+    explicit_quality = adv.get("quality_context")
+    if explicit_quality:
+        try:
+            quality = int(explicit_quality)
+        except (TypeError, ValueError):
+            quality = None
+    if quality is None:
+        quality = quality_context_for(user_cap, model_limit, speed)
+    quality = max(speed, max(256, quality))
+    if limit:
+        quality = min(quality, limit)
+    return speed, quality
+
+
+def validate_artifact_test_id(value):
+    """Validate a scheduled artifact-test selector and return it normalised.
+
+    Accepts a built-in ``SANDBOX_TASKS`` id or ``custom:<path.json>`` (validated
+    with the same custom-prompt schema as the sandbox). Raises ValueError with
+    an actionable message; never silently turns an invalid choice off.
+    """
+    if not value:
+        return None
+    from lm_optimizer.services.sandbox_lab import SANDBOX_TASKS, validate_custom_prompt
+
+    text = str(value).strip()
+    if text in SANDBOX_TASKS:
+        return text
+    if text.startswith("custom:"):
+        path = Path(text.split(":", 1)[1]).expanduser()
+        if not path.is_file():
+            raise ValueError(f"custom artifact test file not found: {path}")
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as e:
+            raise ValueError(f"custom artifact test is not valid JSON: {e}") from None
+        validate_custom_prompt(payload)
+        return text
+    raise ValueError(
+        f"unknown artifact test {text!r}; use one of "
+        f"{', '.join(sorted(SANDBOX_TASKS))} or custom:<path.json>"
+    )
+
+
+#: Run fields frozen at start and restored verbatim on resume (spec §9).
+PERSISTED_RUN_SETTINGS = (
+    "min_generation_tok_s",
+    "enforce_min_generation_speed",
+    "run_preset",
+    "selected_stages",
+    "max_speed_probes",
+    "max_finalists",
+    "benchmark_repetitions_override",
+    "validation_repetitions_min",
+    "validation_repetitions_max",
+    "recovery_budget",
+    "context_strategy_modes",
+    "final_sandbox_mode",
+    "final_sandbox_preset_ids",
+    "final_sandbox_custom_prompts",
+    "sandbox_compare_baseline",
+    "artifact_test_id",
+)
+
+
+def build_resolved_settings(run) -> dict:
+    """Snapshot of every frozen run setting (persisted in benchmark_params)."""
+    return {key: getattr(run, key, None) for key in PERSISTED_RUN_SETTINGS}
+
+
+def apply_persisted_run_settings(run):
+    """Restore frozen settings on resume; legacy runs keep safe defaults.
+
+    New fields are not DB columns (no migration). They are persisted as
+    ``benchmark_params["resolved_settings"]`` so a resumed run keeps its
+    original meaning even when global defaults changed meanwhile.
+    """
+    params = getattr(run, "benchmark_params", None) or {}
+    saved = params.get("resolved_settings")
+    if not isinstance(saved, dict):
+        return run
+    for key in PERSISTED_RUN_SETTINGS:
+        if key in saved and saved[key] is not None:
+            try:
+                setattr(run, key, saved[key])
+            except Exception:
+                continue
+    return run
 
 
 @dataclass
@@ -237,9 +744,53 @@ class AdaptiveOptimizer:
         advanced_settings = advanced_settings or {}
         self.benchmark.style = style
 
-        # Experimental tail opt-ins - ALL DISABLED by default.
-        # RoPE / CPU-MoE / speculative probes run only as a tail after the
-        # FINAL winner, never inside the main sweep.
+        # --- Resolve preset and apply budgets (spec §2, §4.2) ---
+        preset = advanced_settings.get("run_preset", "standard")
+
+        def _override(key):
+            """Explicit non-empty override only; empty CLI lists are 'unset'."""
+            value = advanced_settings.get(key)
+            if isinstance(value, (list, tuple)) and not value:
+                return None
+            return value
+
+        preset_overrides = {
+            k: _override(k)
+            for k in (
+                "max_speed_probes",
+                "max_finalists",
+                "benchmark_repetitions",
+                "validation_repetitions_min",
+                "validation_repetitions_max",
+                "recovery_budget",
+                "selected_stages",
+                "context_strategy_modes",
+                "final_sandbox_mode",
+                "final_sandbox_preset_ids",
+                "final_sandbox_custom_prompts",
+                "sandbox_compare_baseline",
+            )
+            if _override(k) is not None
+        }
+        resolved_preset, preset_warnings = resolve_preset(preset, preset_overrides)
+        for w in preset_warnings:
+            logger.warning("Preset resolution", warning=w)
+
+        # --- Speed floor (spec §3) ---
+        min_generation_tok_s = advanced_settings.get("min_generation_tok_s", 2.0)
+        enforce_min_generation_speed = advanced_settings.get(
+            "enforce_min_generation_speed", True
+        )
+
+        # --- Scheduled artifact test (fourth option) ---
+        # Fail fast on an unknown task: silently disabling it would let a run
+        # claim "full" while skipping the requested artifact evidence.
+        artifact_test_id = validate_artifact_test_id(
+            advanced_settings.get("artifact_test_id")
+        )
+
+        # --- Experimental tail opt-ins ---
+        requested_raw = {k: advanced_settings.get(k) for k in EXPERIMENTAL_FLAGS}
         exp_flags = parse_experimental_flags(
             enable_rope=advanced_settings.get("enable_rope", False),
             enable_cpu_moe=advanced_settings.get("enable_cpu_moe", False),
@@ -247,7 +798,6 @@ class AdaptiveOptimizer:
         )
         advanced_settings.update(exp_flags)
         if exp_flags["enable_rope"]:
-            # RoPE requires stronger quality validation
             quality_threshold = max(quality_threshold, 0.98)
             logger.warning(
                 "RoPE experimental enabled - applying stronger quality validation",
@@ -255,7 +805,6 @@ class AdaptiveOptimizer:
             )
 
         # Use profile's default threshold if not explicitly overridden
-        # Profiles have intentional thresholds: speed 0.95, balanced 0.97, context/quality higher
         if quality_threshold is None:
             from lm_optimizer.profiles.registry import ProfileRegistry
 
@@ -266,12 +815,75 @@ class AdaptiveOptimizer:
             except Exception:
                 quality_threshold = 0.97
 
+        # Keep the quality evaluator in sync with the (possibly RoPE-raised)
+        # threshold. Otherwise the run stores 0.98 while evaluation uses 0.97.
+        try:
+            if getattr(self, "quality", None) is not None and getattr(
+                self.quality, "config", None
+            ) is not None:
+                self.quality.config.minimum_score = quality_threshold
+        except Exception:
+            pass
+
         # Resolve profile weights
         resolved_weights = profile_weights or DEFAULT_PROFILE_WEIGHTS.get(profile)
         if resolved_weights:
             weights_dict = resolved_weights.to_dict()
         else:
             weights_dict = {}
+
+        # Compose phase skips from preset + granular flags
+        ordered_stages: list[str] = []
+        # Custom mode: an explicit stage list is the authority (--stage).
+        if preset == "custom":
+            explicit = (
+                advanced_settings.get("selected_stages")
+                or resolved_preset.get("selected_stages")
+                or []
+            )
+            ordered_stages = [s for s in explicit if s in VALID_STAGES]
+        else:
+            ordered_stages = list(resolved_preset.get("selected_stages", []))
+        preset_stages = set(ordered_stages)
+        # An explicit --optimize-context opt-in wins over a preset that does
+        # not list the context stage (granular flags can still skip it).
+        if advanced_settings.get("optimize_context") and "context" not in preset_stages:
+            preset_stages.add("context")
+            ordered_stages.append("context")
+        granular_skips = set(compose_granular_skips(advanced_settings))
+        if preset_stages:
+            # Preset stages define what TO run; convert to skip set.
+            all_stages = {"speed", "quality", "recovery", "validation", "context"}
+            preset_skips = sorted(all_stages - preset_stages)
+            final_skips = sorted(set(preset_skips) | granular_skips)
+        else:
+            # No stage plan: granular skips + explicit skip_phases only.
+            explicit_skips = set(phase_skips_of(advanced_settings))
+            final_skips = sorted(explicit_skips | granular_skips)
+
+        # Resolve budget parameters from preset (explicit overrides win).
+        def _budget(key: str):
+            value = advanced_settings.get(key)
+            if value is None:
+                value = resolved_preset.get(key)
+            return value
+
+        max_speed_probes = _budget("max_speed_probes")
+        max_finalists = _budget("max_finalists")
+        benchmark_repetitions = _budget("benchmark_repetitions")
+        validation_repetitions_min = _budget("validation_repetitions_min")
+        validation_repetitions_max = _budget("validation_repetitions_max")
+        recovery_budget = _budget("recovery_budget")
+
+        # Apply the resolved repetition budget to the benchmark service so a
+        # preset actually changes the workload (previously it was only stored).
+        try:
+            if benchmark_repetitions is not None and getattr(
+                self.benchmark, "config", None
+            ) is not None:
+                self.benchmark.config.repetitions = max(1, int(benchmark_repetitions))
+        except (TypeError, ValueError) as e:
+            logger.warning("Invalid benchmark_repetitions override", error=str(e))
 
         # Create run
         run = OptimizationRun(
@@ -284,9 +896,12 @@ class AdaptiveOptimizer:
             search_space={},
             is_experimental=False,
             experimental_reason=None,
+            advanced_settings=advanced_settings or {},
             benchmark_params={
-                "benchmark_repetitions": config.optimization.benchmark_runs,
-                "validation_repetitions": 5,
+                "benchmark_repetitions": benchmark_repetitions,
+                "validation_repetitions": validation_repetitions_max,
+                "validation_repetitions_min": validation_repetitions_min,
+                "validation_repetitions_max": validation_repetitions_max,
                 "warmup_runs": config.optimization.warmup_runs,
                 "seed": 42,
                 "deterministic": True,
@@ -296,13 +911,76 @@ class AdaptiveOptimizer:
                 "selection_threshold": float(advanced_settings.get("selection_threshold", 0.05)),
                 "workload_type": str(advanced_settings.get("workload_type", "interactive")).lower(),
                 "speed_probe_repetitions": advanced_settings.get("speed_probe_repetitions"),
-                "recovery_budget": advanced_settings.get("recovery_budget", 3),
-                "quality_finalist_limit": advanced_settings.get("quality_finalist_limit"),
+                "recovery_budget": recovery_budget,
+                "quality_finalist_limit": max_finalists,
+                "max_speed_probes": max_speed_probes,
                 "optimize_context": bool(advanced_settings.get("optimize_context", False)),
+                "skip_phases": final_skips,
+                # Preset metadata
+                "run_preset": preset,
+                "resolved_preset": resolved_preset,
             },
+            # Speed floor
+            min_generation_tok_s=min_generation_tok_s,
+            enforce_min_generation_speed=enforce_min_generation_speed,
+            # Preset
+            run_preset=preset,
+            # Stage selection
+            selected_stages=ordered_stages,
+            max_speed_probes=max_speed_probes,
+            max_finalists=max_finalists,
+            benchmark_repetitions_override=benchmark_repetitions,
+            validation_repetitions_min=validation_repetitions_min,
+            validation_repetitions_max=validation_repetitions_max,
+            recovery_budget=recovery_budget,
+            # Context strategies
+            context_strategy_modes=resolved_preset.get("context_strategy_modes", []),
+            # Sandbox
+            final_sandbox_mode=resolved_preset.get("final_sandbox_mode", "off"),
+            final_sandbox_preset_ids=resolved_preset.get("final_sandbox_preset_ids", []),
+            final_sandbox_custom_prompts=resolved_preset.get("final_sandbox_custom_prompts", []),
+            sandbox_compare_baseline=resolved_preset.get("sandbox_compare_baseline", False),
+            # Scheduled artifact test
+            artifact_test_id=artifact_test_id,
+            # Resolved preset for reporting
+            resolved_preset=resolved_preset,
         )
         # Any experimental opt-in marks the run (single marking path).
         apply_experimental_mark(run, exp_flags)
+        run.benchmark_params["experimental_detail"] = build_experimental_detail(
+            requested_raw, exp_flags, advanced_settings
+        )
+        # Freeze every resolved setting for resume/reporting (spec §9).
+        run.benchmark_params["resolved_settings"] = build_resolved_settings(run)
+
+        # Compute and store fingerprint for this run
+        from lm_optimizer.services import lms_cli as _lms_cli
+        from lm_optimizer.benchmark.suite_version import BENCHMARK_SUITE_VERSION
+
+        lms_version = "unknown"
+        try:
+            lms_version = _lms_cli.lms_version()
+        except Exception:
+            pass
+
+        hw_fp = hardware_fingerprint(hardware)
+        fp_components = {
+            "model_id": model.id,
+            "quantization": model.quantization,
+            "architecture": model.architecture,
+            "lm_studio_version": lms_version,
+            "hardware_fingerprint": hw_fp,
+            "benchmark_suite_version": BENCHMARK_SUITE_VERSION,
+        }
+        run.benchmark_params["fingerprint"] = compute_fingerprint(
+            fp_components["model_id"],
+            fp_components["quantization"],
+            fp_components["architecture"],
+            fp_components["lm_studio_version"],
+            fp_components["hardware_fingerprint"],
+            fp_components["benchmark_suite_version"],
+        )
+        run.benchmark_params["fingerprint_components"] = fp_components
 
         # Generate search space
         search_space = self.search_generator.generate(model, hardware, profile, advanced_settings)
@@ -499,6 +1177,87 @@ class AdaptiveOptimizer:
         except Exception:
             pass
 
+    # ---------- host guard: foreign model loads ----------
+
+    def _host_guard(self) -> "ForeignModelWatchdog | None":
+        """Watchdog protecting the model under test, or None when unavailable."""
+        w = getattr(self, "_watchdog", None)
+        if w is None:
+            try:
+                from lm_optimizer.services.foreign_watchdog import build_watchdog
+
+                self._watchdog = w = build_watchdog(
+                    self.client,
+                    BACKEND_LMSTUDIO,
+                    model_under_test=self.state.run.model.id,
+                    echo_probe_model=self._echo_probe_model(),
+                    allow_unload=bool(
+                        (self.state.run.benchmark_params or {}).get(
+                            "auto_unload_foreign", True
+                        )
+                    ),
+                )
+            except Exception as e:
+                logger.debug("Foreign watchdog unavailable", error=str(e))
+                return None
+        return w
+
+    def _echo_probe_model(self) -> str | None:
+        """Smallest non-embedding model: the one ``connect()`` legitimately loads."""
+        try:
+            models = list(getattr(self.client, "_models_cache", []) or [])
+            cands = [
+                m for m in models if "embed" not in (getattr(m, "id", "") or "").lower()
+            ]
+            if not cands:
+                return None
+            return min(cands, key=lambda m: getattr(m, "size_bytes", 0) or 0).id
+        except Exception:
+            return None
+
+    async def guard_host(self) -> dict:
+        """Clear foreign loads before a measurement; never touches our own models.
+
+        Returns a small record so the caller can mark a measurement as
+        contested when a foreign model was present during the attempt.
+        """
+        out = {"foreign": [], "unloaded": [], "failed": [], "inspected": False}
+        if self.state is None:
+            return out
+        wd = self._host_guard()
+        if wd is None:
+            return out
+        try:
+            report = await wd.check()
+        except Exception as e:
+            logger.warning("Host guard failed", error=f"{type(e).__name__}: {e}"[:160])
+            return out
+
+        out["inspected"] = report.inspected
+        out["foreign"] = [f.model.model_id for f in report.foreign]
+        out["unloaded"] = list(report.unloaded)
+        out["failed"] = list(report.unload_failed)
+
+        if report.foreign:
+            self._log_event(
+                "FOREIGN_MODEL_DETECTED",
+                f"backend={report.backend} models={out['foreign']} "
+                f"unloaded={out['unloaded']} failed={out['failed']}",
+            )
+            for f in report.foreign:
+                self.state.errors.append(
+                    f"foreign_model_loaded: {f.model.model_id}"
+                    + (f" instance={f.model.instance_id}" if f.model.instance_id else "")
+                )
+            try:
+                if self.state.event_log is not None:
+                    self.state.event_log = self.state.event_log[-200:]
+                if self.state.errors is not None:
+                    self.state.errors = self.state.errors[-50:]
+            except Exception:
+                pass
+        return out
+
     def checkpoint_now(self, reason: str = "manual") -> None:
         """Synchronous checkpoint for Cancel/shutdown paths (before ack)."""
         self._checkpoint(reason)
@@ -654,7 +1413,8 @@ class AdaptiveOptimizer:
             self.state.current_config_id = None
             self._log_event("Next candidate", f"ctx={cfg.context_length} gpu={cfg.gpu_ratio}")
             result = await self._test_config(
-                cfg, cfg.context_length or self.state.run.model.context_limit or 4096
+                cfg, cfg.context_length or self.state.run.model.context_limit or 4096,
+                min_speed=self.state.run.advanced_settings.get("min_speed", 0.0)
             )
 
             if result and result.status == ConfigurationStatus.PASSED:
@@ -874,7 +1634,7 @@ class AdaptiveOptimizer:
                     break
                 while self.state.should_pause:
                     await asyncio.sleep(1)
-                result = await self._test_config(cfg, cfg.context_length or 4096)
+                result = await self._test_config(cfg, cfg.context_length or 4096, min_speed=self.state.run.advanced_settings.get("min_speed", 0.0))
                 tested_keys.add(key)
                 if result and result.status == ConfigurationStatus.PASSED:
                     self.state.tested_configs.append(result)
@@ -917,7 +1677,7 @@ class AdaptiveOptimizer:
                             num_experts=bc.num_experts,
                         )
 
-                        result = await self._test_config(config, ctx)
+                        result = await self._test_config(config, ctx, min_speed=self.state.run.advanced_settings.get("min_speed", 0.0))
                         tested_keys.add(key)
                         if result and result.status == ConfigurationStatus.PASSED:
                             self.state.tested_configs.append(result)
@@ -1056,7 +1816,7 @@ class AdaptiveOptimizer:
             while self.state.should_pause:
                 await asyncio.sleep(1)
 
-            result = await self._test_config(config, best.context_length)
+            result = await self._test_config(config, best.context_length, min_speed=self.state.run.advanced_settings.get("min_speed", 0.0))
             if result and result.status == ConfigurationStatus.PASSED:
                 self.state.tested_configs.append(result)
                 self._update_best(result)
@@ -1129,7 +1889,7 @@ class AdaptiveOptimizer:
         for i in range(self.state.run.validation_repetitions):
             if self.state.should_cancel:
                 break
-            result = await self._test_config(config, best.context_length)
+            result = await self._test_config(config, best.context_length, min_speed=self.state.run.advanced_settings.get("min_speed", 0.0))
             if result and result.status == ConfigurationStatus.PASSED:
                 validation_results.append(result)
 
@@ -1247,6 +2007,9 @@ class AdaptiveOptimizer:
         load_config: LoadConfiguration,
         context_length: int,
         score_context: bool | None = None,
+        min_speed: float = 0.0,
+        keep_loaded: bool = False,
+        assume_loaded: bool = False,
     ) -> ConfigurationResult | None:
         """Test a single configuration through the strict phase machine.
 
@@ -1258,6 +2021,12 @@ class AdaptiveOptimizer:
 
         `score_context=False` zeroes the context score component (Phase A:
         context is frozen, §22). Defaults to the state's flow flag.
+
+        Duration convention: every returned (persisted) result from a started
+        attempt carries `duration_ms > 0` (wall time around the attempt).
+        Flash-skipped attempts return None (never started, nothing persisted).
+        Unexpected exceptions return a stamped failed result (score None,
+        never a winner) instead of None so the attempt is recorded.
         """
         from lm_optimizer.services.failure_states import classify_error, is_soft
 
@@ -1268,10 +2037,29 @@ class AdaptiveOptimizer:
         ):
             logger.info("Skipping flash-off config (server requires flash)")
             return None
+        if self._unverified_unload_block():
+            return None
+        t0 = time.perf_counter()
+
+        def _stamp(res: ConfigurationResult) -> ConfigurationResult:
+            try:
+                res.duration_ms = (time.perf_counter() - t0) * 1000.0
+            except Exception:
+                pass
+            return res
+
         try:
+            # Clear any foreign model load BEFORE measuring: a stray local
+            # client competes for VRAM and can abort this generation, which
+            # turns a real measurement into noise.
+            guard = await self.guard_host()
             self._log_event("LOAD_REQUESTED", f"ctx={context_length}")
             result = await self.benchmark.run_benchmark(
-                self.state.run.model.id, load_config, context_length
+                self.state.run.model.id,
+                load_config,
+                context_length,
+                keep_loaded=keep_loaded,
+                assume_loaded=assume_loaded,
             )
             result.run_id = self.state.run.id
             try:
@@ -1309,7 +2097,7 @@ class AdaptiveOptimizer:
                 # Learn server-mandated flash here (failures return early and
                 # never reach the passed-path note below).
                 self._note_flash_requirement(result)
-                return result
+                return _stamp(result)
 
             # LOADED + VERIFIED (benchmark success implies the load served).
             result.status = ConfigurationStatus.PASSED
@@ -1325,6 +2113,35 @@ class AdaptiveOptimizer:
                 )
             self._log_event("BENCHMARK_STARTED", f"ctx={context_length}")
             self._log_event("BENCHMARK_COMPLETED", f"ctx={context_length}")
+
+            # Check minimum speed threshold (if set)
+            if min_speed > 0.0:
+                gen_tok_s = result.get_avg_generation_tok_s()
+                if gen_tok_s < min_speed:
+                    result.status = ConfigurationStatus.FAILED
+                    result.error = f"Generation speed {gen_tok_s:.1f} tok/s below minimum threshold {min_speed:.1f} tok/s"
+                    result.score = None
+                    result.quality_score = None
+                    result.score_breakdown = None
+                    result.generation = {
+                        **(result.generation or {}),
+                        "stage": self.state.run.stage.value,
+                    }
+                    try:
+                        config_repo.save(result)
+                    except Exception as e:
+                        logger.error("Failure record save failed", error=str(e))
+                    self._log_event(
+                        "SPEED_BELOW_THRESHOLD",
+                        f"ctx={context_length} gen={gen_tok_s:.1f} tok/s < min={min_speed:.1f} tok/s",
+                    )
+                    logger.warning(
+                        "SPEED_BELOW_THRESHOLD",
+                        config_id=str(result.id),
+                        speed=gen_tok_s,
+                        min_speed=min_speed,
+                    )
+                    return _stamp(result)
 
             # Server demands flash attention (non-F16 KV quant): prune flash=False (R28)
             self._note_flash_requirement(result)
@@ -1372,7 +2189,7 @@ class AdaptiveOptimizer:
                     checks=f"{agg_quality.checks_passed}/{agg_quality.checks_total}",
                     threshold=self.quality.config.minimum_score,
                 )
-                return result
+                return _stamp(result)
             self._log_event(
                 "QUALITY_EVALUATED",
                 f"{agg_quality.checks_passed}/{agg_quality.checks_total}",
@@ -1400,14 +2217,35 @@ class AdaptiveOptimizer:
             )
             self._log_event("CONFIG_ELIGIBLE", f"score={result.score:.3f}")
 
-            return result
+            return _stamp(result)
 
         except Exception as e:
             logger.error("Config error", error=str(e))
             self.state.errors.append(f"{load_config}: {e!s}")
             self._log_event("Candidate failed", str(e)[:120])
-            await self.client.ensure_unloaded(self.state.run.model.id)
-            return None
+            try:
+                await self.client.ensure_unloaded(self.state.run.model.id)
+            except Exception:
+                pass
+            failed = ConfigurationResult(
+                config=load_config,
+                context_length=context_length,
+                status=classify_error(str(e)),
+                error=f"{type(e).__name__}: {e}"[:500],
+                tested_at=datetime.now(),
+                generation={"stage": self.state.run.stage.value},
+            )
+            failed.score = None
+            try:
+                failed.run_id = self.state.run.id
+            except Exception:
+                pass
+            _stamp(failed)
+            try:
+                config_repo.save(failed)
+            except Exception as se:
+                logger.error("Failure record save failed", error=str(se))
+            return failed
 
     def _update_best(self, result: ConfigurationResult) -> None:
         """Update best configuration using hardware-agnostic scores.
@@ -1783,6 +2621,30 @@ class AdaptiveOptimizer:
             flash_required=bool(self.state.flash_required),
         )
 
+    async def _granular_baseline_or_none(
+        self, model: ModelIdentity, baseline_config, skips: set[str]
+    ):
+        """Anchor config for the run; granular fallback keeps quality modes alive.
+
+        A cold server (nothing loaded) yields no capturable baseline; plain
+        campaigns survive because the speed plan seeds from defaults. Granular
+        quality modes (quality-only / reasoning-only) have no speed phase, so
+        with no anchor they would end instantly with an empty frontier
+        (n=0, Run FAILED). Fail-safe: use the S0 default anchor as baseline.
+        """
+        if baseline_config is not None:
+            return baseline_config
+        captured = await self._capture_baseline_config(model)
+        if captured is not None:
+            return captured
+        if "speed" in skips:
+            self._log_event(
+                "Baseline fallback",
+                "model not loaded; S0 default anchor used as quality baseline",
+            )
+            return self._default_anchor()
+        return None
+
     def _default_anchor(self) -> LoadConfiguration:
         """S0 anchor: captured as-loaded config, else server defaults."""
         ctx = self.state.speed_context or 2048
@@ -1808,6 +2670,39 @@ class AdaptiveOptimizer:
     @staticmethod
     def _candidate_key(cfg: LoadConfiguration) -> tuple:
         return tuple(sorted((k, v) for k, v in cfg.to_dict().items()))
+
+    def _unverified_unload_block(self) -> bool:
+        """Cancel BEFORE the next load when the previous unload is unverified.
+
+        Fail-closed: a leftover model that could not be verified unloaded is
+        still holding memory (or the endpoint state is unverifiable). Loading
+        another memory-heavy candidate would repeat the resource-guardrail
+        cascade (observed as load-failed storm in the Fable 27B campaign).
+        ``cancel()`` checkpoints everything measured so far; results, errors
+        and the checkpoint file are preserved for resume/inspection.
+        """
+        flag = getattr(self.benchmark, "last_unverified_unload", None)
+        if not (isinstance(flag, str) and flag):
+            return False
+        model = flag
+        try:
+            self.benchmark.last_unverified_unload = None
+        except Exception:
+            pass
+        self._log_event(
+            "UNLOAD_UNVERIFIED",
+            f"model={model} unload could not be verified; stopping before "
+            "next memory-heavy load (results checkpointed)",
+        )
+        try:
+            self.state.errors.append(
+                f"unload_not_verified: {model} still occupying memory; "
+                "refusing further memory-heavy loads"
+            )
+        except Exception:
+            pass
+        self.cancel()
+        return True
 
     async def _record_probe_result(
         self, result: ConfigurationResult, context_length: int
@@ -1858,6 +2753,11 @@ class AdaptiveOptimizer:
                 "RESUME_SKIP probe_completed", f"key attempts exhausted for {item.stage}"
             )
             return None
+        if self._unverified_unload_block():
+            return None
+        # Same host guard as the full-suite path: a foreign load poisons a
+        # speed probe just as badly as a quality run.
+        await self.guard_host()
         res = await self.benchmark.run_speed_probe(
             self.state.run.model.id,
             item.config,
@@ -1952,8 +2852,43 @@ class AdaptiveOptimizer:
         anchor = self._default_anchor()
         caps = self._speed_caps()
         plan, notes = build_speed_plan(anchor, speed_ctx, caps)
+        if getattr(self.benchmark, "mtp_test", None) is True:
+            # MTP-only mode: keep S0 (budget classification) plus the
+            # speculative/MTP probes; everything else is out of scope.
+            plan = plan[:1] + [
+                p for p in plan[1:] if str(p.stage).upper().startswith(("S1", "S2"))
+            ]
+            notes = list(notes)
+            spec_n = len(plan) - 1
+            notes.append(
+                f"MTP-only mode: {spec_n} speculative probe(s) retained"
+                if spec_n
+                else "MTP-only mode: no draft model discovered - S0 only, "
+                "speculative path not auto-probed"
+            )
+
+        # Preset/user probe cap (spec §4.2): bound the number of model loads.
+        # The plan is priority-ordered (S0, high-impact toggles first), so the
+        # cap drops the lowest-value tail rather than random probes.
+        probe_cap = (self.state.run.benchmark_params or {}).get("max_speed_probes")
+        try:
+            probe_cap = int(probe_cap) if probe_cap is not None else None
+        except (TypeError, ValueError):
+            probe_cap = None
+        if probe_cap is not None:
+            probe_cap = max(1, probe_cap)
+            if len(plan) > probe_cap:
+                notes = list(notes)
+                notes.append(
+                    f"probe cap {probe_cap}: {len(plan) - probe_cap} "
+                    "lower-priority probe(s) skipped"
+                )
+                plan = plan[:probe_cap]
+
         self.state.excluded_notes = notes
         self.state.planned_total = len(plan) + 2
+        # Checkpoint BEFORE DB save so checkpoint phase >= DB stage on crash
+        self._checkpoint("phase:speed:start")
         run_repo.save(self.state.run)
         self._log_event("SPEED discovery started", f"ctx={speed_ctx} probes~{len(plan)}")
         await self._pause_point()
@@ -1983,16 +2918,19 @@ class AdaptiveOptimizer:
             await self._pause_point()
             await self._safe_probe(item, speed_ctx, tested_keys)
 
-        # S5: interactions of the strongest settings only.
+        # S5: interactions of the strongest settings only, within the probe cap.
         passed = [c for c in self.state.tested_configs if c.status == ConfigurationStatus.PASSED]
         if passed:
             from lm_optimizer.services.speed_search import build_interaction_probes
 
             top = sorted(passed, key=lambda r: r.get_avg_generation_tok_s(), reverse=True)[:2]
             s5_items = build_interaction_probes([t.config for t in top], speed_ctx)
+            s5_budget = None if probe_cap is None else max(0, probe_cap - len(plan))
             s5_new = 0
             for item in s5_items:
                 if self.state.should_cancel:
+                    break
+                if s5_budget is not None and s5_new >= s5_budget:
                     break
                 await self._pause_point()
                 if self._candidate_key(item.config) in tested_keys:
@@ -2002,7 +2940,9 @@ class AdaptiveOptimizer:
             self._log_event(
                 "S5 interactions",
                 f"generated={len(s5_items)} already-tested={len(s5_items) - s5_new} "
-                f"new={s5_new} (duplicates never re-run)",
+                f"new={s5_new} (duplicates never re-run"
+                + (f"; cap={probe_cap}" if probe_cap is not None else "")
+                + ")",
             )
 
         probed = [
@@ -2025,7 +2965,7 @@ class AdaptiveOptimizer:
             self.state.speed_finalists.append(str(frontier["contrarian"].id))
         self._sync_phase_params()
         run_repo.save(self.state.run)
-        self._checkpoint("phase:speed")
+        self._checkpoint("phase:speed:complete")
         await self._broadcast({"stage": "speed_discovery", "event": "speed_complete"})
         return frontier
 
@@ -2069,9 +3009,79 @@ class AdaptiveOptimizer:
                 "RESUME_SKIP quality_completed",
                 f"config={str(result.id)[:8]} status={status}",
             )
+        # P3: deterministic Quality Lab on every PASSING finalist, with hard
+        # gates that can veto the winner (a broken output never wins).
+        if (
+            getattr(self.benchmark, "quality_lab", False)
+            and result.status == ConfigurationStatus.PASSED
+            and existing is None
+        ):
+            lab = await self._run_quality_lab(self.state.run.model.id)
+            if result.quality_score is not None:
+                try:
+                    result.quality_score.details["quality_lab"] = lab
+                except Exception:
+                    pass
+            if lab.get("hard_gate_failures"):
+                result.status = ConfigurationStatus.QUALITY_FAILED
+                self._log_event(
+                    "QUALITY_LAB hard gate failed",
+                    ",".join(lab["hard_gate_failures"])[:180],
+                )
+                try:
+                    config_repo.save(result)
+                except Exception as e:
+                    logger.error("Quality Lab result save failed", error=str(e))
+            else:
+                self._log_event(
+                    "QUALITY_LAB passed",
+                    f"mean={lab.get('mean', 0):.3f} tasks={lab.get('tasks', 0)}",
+                )
         if result.id not in [c.id for c in self.state.tested_configs]:
             self.state.tested_configs.append(result)
         return result
+
+    async def _run_quality_lab(self, model_id: str) -> dict:
+        """Run the deterministic Quality Lab tasks against the loaded model.
+
+        Returns a compact summary merged into the configuration's quality
+        details: mean score, task count and the hard gates that failed.
+        Every task is a real generation on the currently loaded config.
+        """
+        import statistics as _stats
+
+        from lm_optimizer.services.quality_lab import default_tasks, run_task
+
+        async def _chat(prompt: str, max_tokens: int) -> str:
+            response = await self.client.chat_completion(
+                model=model_id,
+                input_text=prompt,
+                temperature=0.0,
+                max_output_tokens=max_tokens,
+            )
+            choices = response.get("choices") or []
+            if not choices:
+                return ""
+            return choices[0].get("message", {}).get("content", "") or ""
+
+        outcomes = []
+        hard_gate_failures: list[str] = []
+        for task in default_tasks():
+            try:
+                outcome = await run_task(task, _chat)
+            except Exception as e:  # noqa: BLE001 - one task must not abort the suite
+                logger.warning("Quality Lab task failed", task=task.id, error=str(e)[:160])
+                continue
+            outcomes.append(outcome.as_dict())
+            if not outcome.gate_passed:
+                hard_gate_failures.append(task.id)
+        scores = [o["score"] for o in outcomes]
+        return {
+            "mean": _stats.fmean(scores) if scores else 0.0,
+            "tasks": len(outcomes),
+            "hard_gate_failures": hard_gate_failures,
+            "outcomes": outcomes,
+        }
 
     def _quality_result_exists(
         self, candidate_key: tuple, context_length: int
@@ -2144,12 +3154,27 @@ class AdaptiveOptimizer:
         except (TypeError, ValueError):
             return 4
 
+    @staticmethod
+    def rotate_order(items: list, offset: int) -> list:
+        """Rotate a list so a different candidate leads each round.
+
+        Master spec §7.3: finalists must be rotated (ABC/BCA/CAB) so a later
+        candidate is not systematically penalized by thermal throttling -
+        the first-measured finalist always runs on the coolest machine.
+        """
+        if not items or offset <= 0:
+            return list(items)
+        k = int(offset) % len(items)
+        return list(items[k:]) + list(items[:k])
+
     async def _phase_quality(self, frontier: dict) -> tuple[list, list]:
         """QUALITY: full suite on frozen finalists at the frozen quality ctx."""
         self.state.phase = OptimizationPhase.QUALITY.value
         self.state.run.phase = OptimizationPhase.QUALITY.value
         self.state.run.stage = OptimizationStage.QUALITY_CHECK
         quality_ctx = self.state.quality_context or 8192
+        # Checkpoint BEFORE DB save so checkpoint phase >= DB stage on crash
+        self._checkpoint("phase:quality:start")
         run_repo.save(self.state.run)
         ordered = list(frontier.get("finalists") or [])
         contrarian = frontier.get("contrarian")
@@ -2157,6 +3182,15 @@ class AdaptiveOptimizer:
             ordered.append(contrarian)
         limit = self._finalist_limit()
         ordered = ordered[: max(limit + 1, 1)]
+        # Rotate the finalist order per run so the coolest first slot is not
+        # always the same candidate (spec §7.3: ABC/BCA/CAB rotation).
+        if len(ordered) > 1:
+            seed = str(self.state.run.id).replace("-", "")
+            try:
+                offset = int(seed[:8], 16) % len(ordered)
+            except ValueError:
+                offset = 0
+            ordered = self.rotate_order(ordered, offset)
         self.state.planned_total += len(ordered)  # one suite per finalist
         self._log_event("QUALITY validation started", f"ctx={quality_ctx} n={len(ordered)}")
 
@@ -2189,20 +3223,33 @@ class AdaptiveOptimizer:
             )
         self._sync_phase_params()
         run_repo.save(self.state.run)
-        self._checkpoint("phase:quality")
+        self._checkpoint("phase:quality:complete")
         await self._broadcast({"stage": "quality_check", "event": "quality_complete"})
         return safe, failed
 
     async def _recheck_quality(
         self, cfg: LoadConfiguration, ctx: int, test_names: list[str]
     ) -> tuple[bool, object, ConfigurationResult | None]:
-        """Rerun ONLY named quality tests (recovery subset, never full suite)."""
+        """Rerun ONLY named quality tests (recovery subset, never full suite).
+
+        The measurement context comes from `cfg`, not from `ctx`. A rollback
+        changes cfg (e.g. context_length 32768 -> 4096) while `ctx` still holds
+        the FAILED result's context; measuring at `ctx` would silently re-run
+        the exact configuration recovery just decided to abandon, at 8x the
+        cost, and record a quality_after that describes a run that never
+        happened. `ctx` is only the fallback when cfg carries no context.
+        """
+        effective_ctx = int(getattr(cfg, "context_length", None) or ctx)
         cases = [
-            c for c in self.benchmark.create_cases_for_context(ctx) if c.name in set(test_names)
+            c
+            for c in self.benchmark.create_cases_for_context(effective_ctx)
+            if c.name in set(test_names)
         ]
         if not cases:
             return False, None, None
-        res = await self.benchmark.run_cases(self.state.run.model.id, cfg, ctx, cases)
+        res = await self.benchmark.run_cases(
+            self.state.run.model.id, cfg, effective_ctx, cases
+        )
         try:
             scores = self.quality.evaluate_all(self.state.run.model.id, res.metrics)
             agg = self.quality.aggregate_quality(scores)
@@ -2230,6 +3277,8 @@ class AdaptiveOptimizer:
         self.state.phase = OptimizationPhase.RECOVERY.value
         self.state.run.phase = OptimizationPhase.RECOVERY.value
         self.state.run.stage = OptimizationStage.RECOVERY
+        # Checkpoint BEFORE DB save so checkpoint phase >= DB stage on crash
+        self._checkpoint("phase:recovery:start")
         run_repo.save(self.state.run)
         from lm_optimizer.services.recovery import rank_failed_tests
 
@@ -2344,8 +3393,14 @@ class AdaptiveOptimizer:
     async def _admit_recovered(
         self, rolled: LoadConfiguration, ctx: int
     ) -> ConfigurationResult | None:
-        """Full-suite admission of a subset-passing rollback (PASSED + scored)."""
-        admitted = await self._test_config(rolled, ctx, score_context=False)
+        """Full-suite admission of a subset-passing rollback (PASSED + scored).
+
+        Admission must measure `rolled`, not the failed result's context, for
+        the same reason `_recheck_quality` does - otherwise a recovered config
+        is validated under settings it will never run with.
+        """
+        effective_ctx = int(getattr(rolled, "context_length", None) or ctx)
+        admitted = await self._test_config(rolled, effective_ctx, score_context=False, min_speed=self.state.run.advanced_settings.get("min_speed", 0.0))
         if admitted is not None and admitted.status == ConfigurationStatus.PASSED:
             self._tag_phase(admitted, OptimizationPhase.RECOVERY.value)
             if admitted.id not in [c.id for c in self.state.tested_configs]:
@@ -2411,6 +3466,8 @@ class AdaptiveOptimizer:
         self.state.phase = OptimizationPhase.FINAL_VALIDATION.value
         self.state.run.phase = OptimizationPhase.FINAL_VALIDATION.value
         self.state.run.stage = OptimizationStage.FINAL_VALIDATION
+        # Checkpoint BEFORE DB save so checkpoint phase >= DB stage on crash
+        self._checkpoint("phase:final_validation:start")
         run_repo.save(self.state.run)
         best = self.state.best_config
         if best is None:
@@ -2427,6 +3484,11 @@ class AdaptiveOptimizer:
             and c.get_avg_generation_tok_s() > 0
         ]
         reps = self.state.run.validation_repetitions or 5
+        try:
+            vmin = max(1, int(getattr(self.state.run, "validation_repetitions_min", 2) or 2))
+            vmax = max(vmin, int(getattr(self.state.run, "validation_repetitions_max", 5) or 5))
+        except (TypeError, ValueError):
+            vmin, vmax = 2, 5
         if len(speeds) >= 2:
             import statistics as _stats
 
@@ -2438,30 +3500,60 @@ class AdaptiveOptimizer:
             stability = getattr(best, "stability_score", 0.0) or 0.0
         if len(speeds) >= 2 or getattr(best, "stability_score", None):
             reps = 2 if stability >= 0.95 else (3 if stability >= 0.85 else reps)
-        reps = max(2, min(reps, 5))
+        # Preset bounds (spec §2): never fewer than min, never more than max.
+        reps = max(vmin, min(reps, vmax))
         self.state.planned_total += reps  # one unit per validation repetition
-        self._log_event("Final validation", f"reps={reps}")
+        self._log_event(
+            "Final validation", f"reps={reps} bounds={vmin}..{vmax}"
+        )
         validated: list[ConfigurationResult] = []
-        for _i in range(reps):
-            if self.state.should_cancel:
-                break
-            data = {k: v for k, v in best.config.to_dict().items()}
-            vcfg = LoadConfiguration(
-                **{k: v for k, v in data.items() if hasattr(LoadConfiguration, k)}
-            )
-            result = await self._test_config(vcfg, best.context_length, score_context=False)
-            if result is not None and result.status == ConfigurationStatus.PASSED:
-                self._tag_phase(result, OptimizationPhase.FINAL_VALIDATION.value)
-                validated.append(result)
-                if result.id not in [c.id for c in self.state.tested_configs]:
-                    self.state.tested_configs.append(result)
+        warm = False
+        try:
+            for _i in range(reps):
+                if self.state.should_cancel:
+                    break
+                data = {k: v for k, v in best.config.to_dict().items()}
+                vcfg = LoadConfiguration(
+                    **{k: v for k, v in data.items() if hasattr(LoadConfiguration, k)}
+                )
+                # Winner invariant: validation must run at the OUTER context
+                # (best.context_length). The nested config copy can lag behind
+                # (e.g. speed 4096 vs quality 32768 winner) — never validate stale ctx.
+                vcfg.context_length = best.context_length
+                result = await self._test_config(
+                    vcfg,
+                    best.context_length,
+                    score_context=False,
+                    min_speed=self.state.run.advanced_settings.get("min_speed", 0.0),
+                    # Warm validation: keep the winner loaded between reps and
+                    # reuse it when the echo matches (saves one load per rep).
+                    keep_loaded=True,
+                    assume_loaded=warm,
+                )
+                if result is not None and result.status == ConfigurationStatus.PASSED:
+                    warm = True
+                    self._tag_phase(result, OptimizationPhase.FINAL_VALIDATION.value)
+                    validated.append(result)
+                    if result.id not in [c.id for c in self.state.tested_configs]:
+                        self.state.tested_configs.append(result)
+        finally:
+            # Always verify the host is clean after validation: a failed
+            # warm-load attempt must not leave a model behind.
+            try:
+                if not await self.client.ensure_unloaded(self.state.run.model.id):
+                    logger.warning(
+                        "Warm validation left model loaded",
+                        model=self.state.run.model.id,
+                    )
+            except Exception as e:
+                logger.warning("Warm validation unload failed", error=str(e))
         if validated:
             self.state.best_config = self._median_result(validated)
             self.state.run.best_config_id = self.state.best_config.id
         self.state.pareto_frontier = self._compute_pareto_frontier(self.state.tested_configs)
         self.state.run.pareto_config_ids = [c.id for c in self.state.pareto_frontier]
         run_repo.save(self.state.run)
-        self._checkpoint("phase:final_validation")
+        self._checkpoint("phase:final_validation:complete")
 
     def _phase_b_failed(self, error: str) -> dict:
         """Contained Phase B failure (optional phase never fails the run)."""
@@ -2485,6 +3577,8 @@ class AdaptiveOptimizer:
         self.state.phase = OptimizationPhase.CONTEXT_OPTIONAL.value
         self.state.run.phase = OptimizationPhase.CONTEXT_OPTIONAL.value
         self.state.run.stage = OptimizationStage.CONTEXT_OPTIONAL
+        # Checkpoint BEFORE DB save so checkpoint phase >= DB stage on crash
+        self._checkpoint("phase:context_optional:start")
         run_repo.save(self.state.run)
         model = self.state.run.model
         model_limit = model.context_limit or 131072
@@ -2554,7 +3648,7 @@ class AdaptiveOptimizer:
         self.state.run.phase_b_result = result
         self._sync_phase_params()
         run_repo.save(self.state.run)
-        self._checkpoint("phase:context_optional")
+        self._checkpoint("phase:context_optional:complete")
         await self._broadcast({"stage": "context_optional", "event": "context_complete"})
         return result
 
@@ -2596,15 +3690,10 @@ class AdaptiveOptimizer:
         self, advanced_settings: dict, baseline_config: LoadConfiguration | None
     ) -> None:
         """Phase A/B orchestration: SPEED → QUALITY → RECOVERY → validation → B."""
-        from lm_optimizer.services.speed_probe import (
-            quality_context_for,
-            speed_context_for,
-        )
-
         model = self.state.run.model
-        user_cap = (advanced_settings or {}).get("max_context")
-        speed_ctx = speed_context_for(user_cap, model.context_limit)
-        quality_ctx = quality_context_for(user_cap, model.context_limit, speed_ctx)
+        speed_ctx, quality_ctx = resolve_phase_contexts(
+            advanced_settings, model.context_limit
+        )
         self.state.speed_context = speed_ctx
         self.state.quality_context = quality_ctx
         self.state.run.speed_context = speed_ctx
@@ -2616,7 +3705,8 @@ class AdaptiveOptimizer:
         run_repo.save(self.state.run)
 
         # Anchor source only (no expensive baseline benchmark; S0 is the anchor).
-        captured = baseline_config or await self._capture_baseline_config(model)
+        skips = phase_skips_of(advanced_settings)
+        captured = await self._granular_baseline_or_none(model, baseline_config, skips)
         if captured is not None and self.state.baseline_result is None:
             self.state.baseline_result = ConfigurationResult(
                 config=captured,
@@ -2627,16 +3717,40 @@ class AdaptiveOptimizer:
             "Phase A contexts frozen", f"speed={speed_ctx} quality={quality_ctx}"
         )
 
-        frontier = await self._phase_speed()
+        if skips:
+            self._log_event(
+                "Phase skips active", f"skipped: {', '.join(sorted(skips))}"
+            )
+
+        if "speed" in skips:
+            self._log_event("Phase SPEED skipped", "--skip-phases")
+            frontier = granular_quality_frontier(
+                skips, advanced_settings, self.state.baseline_result
+            )
+            if frontier["finalists"]:
+                self._log_event(
+                    "QUALITY candidates from baseline",
+                    "granular mode without speed phase: baseline config only",
+                )
+        else:
+            frontier = await self._phase_speed()
         if self.state.should_cancel:
             raise asyncio.CancelledError()
-        safe, failed = await self._phase_quality(frontier)
+        if "quality" in skips:
+            self._log_event("Phase QUALITY skipped", "--skip-phases (no winner path)")
+            safe, failed = [], []
+        else:
+            safe, failed = await self._phase_quality(frontier)
         if self.state.should_cancel:
             raise asyncio.CancelledError()
 
         # Recovery reference: fastest safe config, else passed S0 anchor.
         ref_config, ref_kind = self._recovery_reference(safe)
-        recovered, _ref = await self._recover_failed(failed, ref_config, ref_kind)
+        if "recovery" in skips:
+            self._log_event("Phase RECOVERY skipped", "--skip-phases")
+            recovered, _ref = [], None
+        else:
+            recovered, _ref = await self._recover_failed(failed, ref_config, ref_kind)
         if self.state.should_cancel:
             raise asyncio.CancelledError()
 
@@ -2646,10 +3760,17 @@ class AdaptiveOptimizer:
             self.state.best_config = fastest
             self.state.run.best_config_id = fastest.id
         await self._pause_point()
-        await self._phase_final_validation()
+        if "validation" in skips:
+            self._log_event("Phase FINAL_VALIDATION skipped", "--skip-phases")
+        else:
+            await self._phase_final_validation()
         if self.state.should_cancel:
             raise asyncio.CancelledError()
         await self._pause_point()
+        if "context" in skips and self.state.phase_b_enabled:
+            self._log_event("Phase CONTEXT skipped", "--skip-phases (Phase B off)")
+            self.state.phase_b_enabled = False
+            self.state.run.phase_b_enabled = False
         if self.state.phase_b_enabled and self.state.best_config is not None:
             await self._phase_context_optional(self.state.best_config)
 
@@ -2665,11 +3786,61 @@ class AdaptiveOptimizer:
         if self.state.best_config and self.state.best_config.status != ConfigurationStatus.PASSED:
             self.state.best_config = None
             self.state.run.best_config_id = None
+
+        # --- Speed floor enforcement (spec §3) ---
+        speed_floor = getattr(self.state.run, "min_generation_tok_s", 2.0)
+        enforce_floor = getattr(self.state.run, "enforce_min_generation_speed", True)
+        speed_floor_met = False
+        diagnostic_candidate = None
+        diagnostic_speed = None
+        if self.state.best_config:
+            diagnostic_candidate = self.state.best_config
+            diagnostic_speed = self.state.best_config.get_avg_generation_tok_s()
+            speed_floor_met = diagnostic_speed >= speed_floor
+            if enforce_floor and not speed_floor_met:
+                # The fastest candidate stays visible as a diagnostic result;
+                # it is simply not eligible to be the recommended winner.
+                self.state.best_config = None
+                self.state.run.best_config_id = None
+                self.state.run.no_winner_reason = "NO_CONFIG_MEETS_SPEED_FLOOR"
+                self._log_event(
+                    "Speed floor not met",
+                    f"best={diagnostic_speed:.2f} tok/s < floor={speed_floor:.2f} tok/s (enforced)",
+                )
+            elif not enforce_floor and not speed_floor_met:
+                self._log_event(
+                    "Speed floor not met (informational)",
+                    f"best={diagnostic_speed:.2f} tok/s < floor={speed_floor:.2f} tok/s (not enforced)",
+                )
+
         if self.state.best_config:
             self.state.run.best_config_id = self.state.best_config.id
+
         # Record run-level pruning for reports (no schema change: search_space JSON)
         if self.state.flash_required:
             self.state.run.search_space["flash_pruned"] = True
+        # Record speed floor status
+        self.state.run.search_space["speed_floor"] = {
+            "value": speed_floor,
+            "enforced": enforce_floor,
+            "met": speed_floor_met,
+            # Diagnostic fastest candidate stays visible even when it is not
+            # eligible as a winner (spec §3.3 "never fabricate a passing winner").
+            "fastest_candidate_id": (
+                str(diagnostic_candidate.id) if diagnostic_candidate is not None else None
+            ),
+            "fastest_tok_s": (
+                round(float(diagnostic_speed), 3)
+                if diagnostic_speed is not None
+                else None
+            ),
+        }
+        # Persist the explicit no-winner reason (no DB column: benchmark_params
+        # JSON is the durable carrier, so resume/reports keep the same meaning).
+        if self.state.run.no_winner_reason:
+            self.state.run.benchmark_params["no_winner_reason"] = (
+                self.state.run.no_winner_reason
+            )
 
         # Calculate percentage changes vs baseline if available
         if self.state.run.baseline_metrics and self.state.best_config:
@@ -2714,18 +3885,54 @@ class AdaptiveOptimizer:
                 pass
 
         # Explicit terminal state: SUCCESS / PARTIAL_SUCCESS / FAILED.
-        final_status = final_status_for_run(self.state.run)
-        self.state.run.status = final_status
+        # If speed floor enforced and not met, use a special status
+        if enforce_floor and not speed_floor_met:
+            self.state.run.status = RunStatus.COMPLETED_NO_WINNER
+            self._log_event(
+                "Run completed: no config meets speed floor",
+                f"floor={speed_floor:.2f} tok/s enforced",
+            )
+        else:
+            final_status = final_status_for_run(self.state.run)
+            self.state.run.status = final_status
+
         # Keep COMPLETED readable in legacy UIs: stage is always COMPLETE here.
         self.state.run.stage = OptimizationStage.COMPLETE
-        state_name, info = classify_run(list(self.state.tested_configs))
+        state_name, info = classify_run(list(self.state.tested_configs), self.state.run)
         self._log_event(
             f"Run {state_name}",
-            f"successful={info['successful']} failed={info['failed']}",
+            f"successful={info['successful']} failed={info['failed']} "
+            f"validated_winner={info['validated_winner']}",
         )
         run_repo.save(self.state.run)
         self._checkpoint(f"final:{state_name}")
         await self._broadcast({"stage": "complete", "event": "complete", "final": state_name})
+
+        # --- Context strategies (spec §5) ---
+        # Gated by the run's skip plan: granular modes (--reasoning-only,
+        # --speed-only, --quality-only, --skip-phases context) must not run
+        # extra context sweeps after the run (observed 2026-10-26: a
+        # reasoning-only resume spent ~2x40 min on unintended strategies).
+        _skips = run_skip_phases(self.state.run)
+        if (
+            self.state.best_config
+            and self.state.run.context_strategy_modes
+            and "context" not in _skips
+        ):
+            await self._run_context_strategies(self.state.best_config)
+        elif self.state.run.context_strategy_modes and "context" in _skips:
+            self._log_event(
+                "Context strategies skipped",
+                "context phase skipped by the run plan",
+            )
+
+        # --- Final sandbox (spec §6) ---
+        if self.state.best_config and self.state.run.final_sandbox_mode != "off":
+            await self._run_final_sandbox(self.state.best_config)
+
+        # --- Scheduled artifact test (fourth option, runs last) ---
+        if self.state.best_config and self.state.run.artifact_test_id:
+            await self._run_artifact_test(self.state.best_config)
 
     def pause(self) -> None:
         """Pause optimization."""
@@ -2892,13 +4099,19 @@ class AdaptiveOptimizer:
         self,
         run_id: Any,
         revalidate: bool = False,
+        revalidate_fingerprint: bool = False,
+        fingerprint_diff_fields: list[str] | None = None,
+        fingerprint_components: dict | None = None,
         style: str = "balanced",
     ) -> OptimizationRun:
         """Resume a run from its interrupt checkpoint + DB state.
 
-        Completed candidates are NOT re-run unless revalidate=True, their DB
-        record is missing/corrupted, the model identity changed, or the LM
-        Studio config changed incompatibly (capability mismatch -> revalidate).
+        Completed candidates are NOT re-run unless:
+        - revalidate=True (explicit re-run of all completed)
+        - revalidate_fingerprint=True and fingerprint_diff indicates affected configs
+        - their DB record is missing/corrupted
+        - the model identity changed
+        - the LM Studio config changed incompatibly (capability mismatch -> revalidate)
         """
         from lm_optimizer.storage.run_checkpoint import load_checkpoint
 
@@ -2916,6 +4129,9 @@ class AdaptiveOptimizer:
         # Rebuild in-memory state from DB (source of truth for results).
         full = run_repo.get(str(run_id))
         assert full is not None
+        # Restore the frozen settings before anything reads them (legacy runs
+        # without the snapshot keep safe defaults).
+        apply_persisted_run_settings(full)
         space = self._rebuild_resume_space(full, ckpt)
         # Restore model/hardware identity for scoring.
         model = full.model
@@ -2930,6 +4146,72 @@ class AdaptiveOptimizer:
 
         self.state = OptimizationState(run=full, search_space=space)
         self._restore_tested_state(full, ckpt)
+
+        # Fingerprint-based revalidation: if fingerprint changed, revalidate affected configs
+        if revalidate_fingerprint:
+            from lm_optimizer.services import lms_cli as _lms_cli
+            from lm_optimizer.benchmark.suite_version import BENCHMARK_SUITE_VERSION
+
+            lms_version = "unknown"
+            try:
+                lms_version = _lms_cli.lms_version()
+            except Exception:
+                pass
+
+            hw_fp = hardware_fingerprint(hw) if hw else "unknown"
+            current_fp = fingerprint_components or {
+                "model_id": full.model.id,
+                "quantization": full.model.quantization,
+                "architecture": full.model.architecture,
+                "lm_studio_version": lms_version,
+                "hardware_fingerprint": hw_fp,
+                "benchmark_suite_version": BENCHMARK_SUITE_VERSION,
+            }
+            old_fp = full.benchmark_params.get("fingerprint_components", {})
+            actual_diff = fingerprint_diff_fields or fingerprint_diff(old_fp, current_fp)
+            if actual_diff:
+                self._log_event(
+                    "FINGERPRINT_REVALIDATE",
+                    f"diff={actual_diff} revalidating affected configs",
+                )
+                keep, reval = filter_configs_for_revalidation(
+                    self.state.tested_configs, actual_diff
+                )
+                self.state.tested_configs = keep
+                self._log_event(
+                    "FINGERPRINT_REVALIDATE",
+                    f"kept={len(keep)} revalidate={len(reval)}",
+                )
+        else:
+            # Backfill: a run created before fingerprinting has no stored
+            # fingerprint. Adopt the current one so the NEXT auto-run can
+            # compare honestly instead of treating absence as a mismatch.
+            try:
+                from lm_optimizer.benchmark.suite_version import BENCHMARK_SUITE_VERSION
+                from lm_optimizer.services import lms_cli as _lms_cli
+
+                try:
+                    lms_version = _lms_cli.lms_version()
+                except Exception:
+                    lms_version = "unknown"
+                comps = {
+                    "model_id": full.model.id,
+                    "quantization": full.model.quantization,
+                    "architecture": full.model.architecture,
+                    "lm_studio_version": lms_version,
+                    "hardware_fingerprint": hardware_fingerprint(hw) if hw else "unknown",
+                    "benchmark_suite_version": BENCHMARK_SUITE_VERSION,
+                }
+                if not (full.benchmark_params or {}).get("fingerprint"):
+                    full.benchmark_params = dict(full.benchmark_params or {})
+                    full.benchmark_params["fingerprint"] = compute_fingerprint(**comps)
+                    full.benchmark_params["fingerprint_components"] = comps
+                    self._log_event("FINGERPRINT_BACKFILL", f"fp={full.benchmark_params['fingerprint'][:16]}")
+            except Exception as e:
+                logger.debug("Fingerprint backfill skipped", error=str(e))
+
+        # Reconcile phase/winner state if DB and checkpoint disagree
+        self._reconcile_phase_and_winner(full, ckpt)
         # Resumed runs always continue under Phase A/B scoring rules.
         self.state.score_context = False
         # A resumed run is running again: drop any stale pause marker so
@@ -3168,6 +4450,94 @@ class AdaptiveOptimizer:
             pass
         return {"recovery_log": merged_log, "recovery_cursor": merged_cursor}
 
+    def _reconcile_phase_and_winner(self, full: Any, ckpt: dict) -> None:
+        """Reconcile phase progression and winner state between DB and checkpoint.
+
+        Authority rules:
+        - Completed candidate results: DB is authoritative (source of truth)
+        - Current phase/search state: checkpoint is authoritative for in-progress work
+        - Winner selection: if DB has eligible quality-passed configs but no best_config_id,
+          reconstruct winner from DB completed work.
+        - If checkpoint phase is ahead of DB stage, trust checkpoint (in-progress phase started).
+        - If DB stage is ahead of checkpoint phase, trust DB completed work and reconstruct.
+        """
+        try:
+            db_pab = ((full.benchmark_params or {}).get("phase_ab") or {})
+            ckpt_pab = ((ckpt or {}).get("phase_ab") or {})
+
+            db_phase = db_pab.get("phase", "speed")
+            ckpt_phase = ckpt_pab.get("phase", "speed")
+            db_stage = getattr(full.stage, "value", str(full.stage))
+            ckpt_stage = ckpt.get("stage", "speed_discovery")
+
+            # Phase order for comparison
+            phase_order = {
+                "speed": 0,
+                "quality": 1,
+                "recovery": 2,
+                "final_validation": 3,
+                "context_optional": 4,
+            }
+            db_phase_ord = phase_order.get(db_phase, 0)
+            ckpt_phase_ord = phase_order.get(ckpt_phase, 0)
+
+            # Log reconciliation
+            self._log_event(
+                "PHASE_RECONCILE",
+                f"db_phase={db_phase} ckpt_phase={ckpt_phase} db_stage={db_stage} ckpt_stage={ckpt_stage}",
+            )
+
+            # If DB has completed quality work but no winner, reconstruct from DB
+            if (full.best_config_id is None
+                and db_phase_ord >= phase_order["quality"]
+                and self.state.tested_configs):
+
+                # Find quality-passed configs at quality_context
+                quality_ctx = self.state.quality_context or 8192
+                safe_candidates = []
+                for c in self.state.tested_configs:
+                    if c.context_length != quality_ctx:
+                        continue
+                    if c.status != ConfigurationStatus.PASSED:
+                        continue
+                    gen = c.generation or {}
+                    # Quality completed marker or backfill
+                    if gen.get("quality_completed") is True:
+                        safe_candidates.append(c)
+                    elif gen.get("quality_by_test") and c.quality_score:
+                        # Backfill for older records
+                        safe_candidates.append(c)
+
+                if safe_candidates:
+                    # Select fastest quality-passing config (Phase A rule R14)
+                    fastest = max(safe_candidates, key=lambda r: r.get_avg_generation_tok_s())
+                    self.state.best_config = fastest
+                    self.state.run.best_config_id = fastest.id
+                    self._log_event(
+                        "WINNER_RECONSTRUCTED",
+                        f"config={str(fastest.id)[:8]} speed={fastest.get_avg_generation_tok_s():.1f} tok/s",
+                    )
+                    try:
+                        run_repo.save(self.state.run)
+                    except Exception as e:
+                        logger.error("Winner reconstruction save failed", error=str(e))
+
+            # Sync phase from the more advanced source
+            if ckpt_phase_ord > db_phase_ord:
+                # Checkpoint has started a newer phase; adopt it
+                self.state.phase = ckpt_phase
+                self.state.run.phase = ckpt_phase
+                self._log_event("PHASE_ADOPTED_FROM_CKPT", f"phase={ckpt_phase}")
+            elif db_phase_ord > ckpt_phase_ord:
+                # DB has advanced further (completed work); keep DB phase but note mismatch
+                self.state.phase = db_phase
+                self.state.run.phase = db_phase
+                self._log_event("PHASE_ADOPTED_FROM_DB", f"phase={db_phase}")
+
+        except Exception as e:
+            logger.error("Phase/winner reconciliation failed", error=str(e))
+            # Non-fatal: resume will proceed with restored state
+
     async def _resume_legacy_pipeline(self) -> None:
         """Legacy stage sequence for pre-Phase-A/B runs."""
         await self._stage_coarse_search()
@@ -3186,7 +4556,23 @@ class AdaptiveOptimizer:
 
     async def _resume_phase_pipeline(self) -> None:
         """Phase continuation for Phase A/B runs (all steps skip tested)."""
-        frontier = await self._phase_speed()
+        skips = run_skip_phases(self.state.run)
+        if skips:
+            self._log_event(
+                "Phase skips active", f"skipped: {', '.join(sorted(skips))}"
+            )
+        if "speed" in skips:
+            self._log_event("Phase SPEED skipped", "--skip-phases")
+            frontier = granular_quality_frontier(
+                skips, self.state.run.advanced_settings, self.state.baseline_result
+            )
+            if frontier["finalists"]:
+                self._log_event(
+                    "QUALITY candidates from baseline",
+                    "granular mode without speed phase: baseline config only",
+                )
+        else:
+            frontier = await self._phase_speed()
         if self.state.should_cancel:
             raise asyncio.CancelledError()
         # Prefer checkpoint-recorded finalists that are still tested.
@@ -3199,17 +4585,36 @@ class AdaptiveOptimizer:
                 "finalists": [by_id[i] for i in kept if i in by_id],
                 "contrarian": frontier.get("contrarian"),
             }
-        safe, failed = await self._phase_quality(frontier)
+        if "quality" in skips:
+            self._log_event("Phase QUALITY skipped", "--skip-phases (no winner path)")
+            safe, failed = [], []
+        else:
+            safe, failed = await self._phase_quality(frontier)
         if self.state.should_cancel:
             raise asyncio.CancelledError()
-        await self._resume_recover(safe, failed)
+        if "recovery" in skips:
+            self._log_event("Phase RECOVERY skipped", "--skip-phases")
+            all_safe = [r for r in safe if r.status == ConfigurationStatus.PASSED]
+            if all_safe:
+                fastest = max(all_safe, key=lambda r: r.get_avg_generation_tok_s())
+                self.state.best_config = fastest
+                self.state.run.best_config_id = fastest.id
+        else:
+            await self._resume_recover(safe, failed)
         if self.state.should_cancel:
             raise asyncio.CancelledError()
         await self._pause_point()
-        await self._phase_final_validation()
+        if "validation" in skips:
+            self._log_event("Phase FINAL_VALIDATION skipped", "--skip-phases")
+        else:
+            await self._phase_final_validation()
         if self.state.should_cancel:
             raise asyncio.CancelledError()
         await self._pause_point()
+        if "context" in skips and self.state.phase_b_enabled:
+            self._log_event("Phase CONTEXT skipped", "--skip-phases (Phase B off)")
+            self.state.phase_b_enabled = False
+            self.state.run.phase_b_enabled = False
         if self.state.phase_b_enabled and self.state.best_config is not None:
             await self._phase_context_optional(self.state.best_config)
         self._recompute_all_scores()
@@ -3265,6 +4670,433 @@ class AdaptiveOptimizer:
             fastest = max(all_safe, key=lambda r: r.get_avg_generation_tok_s())
             self.state.best_config = fastest
             self.state.run.best_config_id = fastest.id
+
+    # ============================================================
+    # Context Strategies (spec §5)
+    # ============================================================
+
+    async def _run_context_strategies(self, winner: ConfigurationResult) -> None:
+        """Run multiple context strategies on the winner config (spec §5.1).
+
+        Each strategy produces a separate configuration/result that is recorded
+        independently. The user can then choose which strategy's recommendation
+        to prefer.
+        """
+        from lm_optimizer.services.context_sweep import sweep, geometric_contexts
+        from lm_optimizer.services.context_explorer import MIN_DECODE_TPS
+
+        strategies = getattr(self.state.run, "context_strategy_modes", [])
+        if not strategies:
+            return
+
+        model = self.state.run.model
+        model_limit = getattr(model, "context_limit", 0) or 65536
+        min_ctx = getattr(self.state.run, "min_context", 2048) or 2048
+        max_ctx = getattr(self.state.run, "max_context", model_limit) or model_limit
+        min_tps = getattr(self.state.run, "min_generation_tok_s", 2.0)
+
+        base_config = winner.config
+        results: dict[str, dict] = {}
+
+        for strat_name in strategies:
+            if self.state.should_cancel:
+                break
+            if strat_name not in VALID_CONTEXT_STRATEGIES:
+                self._log_event("Context strategy skipped", f"unknown: {strat_name}")
+                continue
+
+            self._log_event("Context strategy started", f"strategy={strat_name}")
+            await self._pause_point()
+
+            # Build strategy-specific config
+            strat_config = await self._build_strategy_config(base_config, strat_name, model)
+            if strat_config is None:
+                self._log_event("Context strategy unavailable", f"{strat_name} (capability gate)")
+                results[strat_name] = {"available": False, "reason": "capability not supported"}
+                continue
+
+            # Probe function for this strategy
+            async def _probe_at(ctx: int, _cfg=strat_config) -> dict:
+                try:
+                    res = await self._test_config(_cfg, ctx, min_speed=min_tps)
+                    if res is None or res.status != ConfigurationStatus.PASSED:
+                        return {"ok": False, "tok_s": 0.0, "error": res.error if res else "load failed"}
+                    return {
+                        "ok": True,
+                        "tok_s": res.get_avg_generation_tok_s(),
+                        "retrieval_passed": getattr(res, "retrieval_passed", False),
+                    }
+                except Exception as e:
+                    return {"ok": False, "tok_s": 0.0, "error": str(e)[:160]}
+
+            try:
+                sweep_result = await sweep(
+                    _probe_at,
+                    min_ctx=min_ctx,
+                    max_ctx=max_ctx,
+                    min_tps=min_tps,
+                )
+                results[strat_name] = {
+                    "available": True,
+                    "config": strat_config.to_dict(),
+                    **sweep_result,
+                }
+                self._log_event(
+                    "Context strategy complete",
+                    f"{strat_name}: max_stable={sweep_result.get('max_stable_context')}, "
+                    f"max_usable={sweep_result.get('max_usable_context')}",
+                )
+            except Exception as e:
+                logger.error("Context strategy sweep failed", strategy=strat_name, error=str(e))
+                results[strat_name] = {"available": False, "reason": f"sweep failed: {e}"}
+
+        # Store all strategy results
+        self.state.run.phase_b_result = {
+            **(self.state.run.phase_b_result or {}),
+            "context_strategies": results,
+        }
+        self._sync_phase_params()
+        run_repo.save(self.state.run)
+        self._checkpoint("phase:context_strategies:complete")
+        await self._broadcast({"stage": "context_strategies", "event": "context_strategies_complete"})
+
+    async def _build_strategy_config(
+        self, base: LoadConfiguration, strategy: str, model: ModelIdentity
+    ) -> LoadConfiguration | None:
+        """Build a strategy-specific load configuration (spec §5.1).
+
+        Gates modes through live LM Studio capability registry.
+        """
+        from lm_optimizer.services.lm_studio import LMStudioClient
+
+        # Check capabilities
+        caps = getattr(self.client, "_capabilities", None)
+        if caps is None:
+            # Best effort - assume supported
+            pass
+
+        data = {k: v for k, v in base.to_dict().items()}
+
+        if strategy == "winner":
+            # Frozen runtime from Phase A - no changes
+            pass
+
+        elif strategy == "gpu_resident":
+            # GPU-resident weights + KV on GPU
+            data["offload_kv_cache_to_gpu"] = True
+            data["gpu_ratio"] = 1.0
+            # Verify capability
+            if caps and not caps.supports_kv_cache_placement:
+                return None
+
+        elif strategy == "model_first_kv_cpu":
+            # Model on GPU, KV on CPU
+            data["offload_kv_cache_to_gpu"] = False
+            # Keep model layers on GPU as much as possible
+            if data.get("gpu_ratio") is None or data.get("gpu_ratio", 0) < 1.0:
+                data["gpu_ratio"] = 1.0
+            if caps and not caps.supports_kv_cache_placement:
+                return None
+
+        elif strategy == "system_spillover":
+            # Partial GPU offload requires the verified CLI channel (REST
+            # cannot set gpu_ratio).
+            try:
+                from lm_optimizer.services import lms_cli as _lms_cli
+
+                cli_channel = bool(
+                    getattr(self.benchmark, "gpu_via_cli", False)
+                    and _lms_cli.lms_available()
+                )
+            except Exception:
+                cli_channel = False
+            if not cli_channel:
+                return None
+            data["gpu_ratio"] = 0.5
+            data["offload_kv_cache_to_gpu"] = False
+
+        # Create LoadConfiguration with only valid fields
+        valid_fields = {k: v for k, v in data.items() if hasattr(LoadConfiguration, k) and v is not None}
+        return LoadConfiguration(**valid_fields)
+
+    # ============================================================
+    # Scheduled Artifact Test (fourth option)
+    # ============================================================
+
+    async def _run_artifact_test(self, winner: ConfigurationResult) -> None:
+        """Run the user-selected artifact task against the exact winner config.
+
+        This is the scheduled fourth option of a full run: it runs last, uses
+        the same verified load channel, records requested/applied config and
+        never changes optimizer scores. Results live in
+        ``benchmark_params["artifact_test"]`` so history/compare can filter by
+        task id.
+        """
+        from lm_optimizer.services.sandbox_lab import (
+            SANDBOX_TASKS,
+            SandboxTask,
+            get_task_by_id,
+            validate_custom_prompt,
+        )
+        from lm_optimizer.services.sandbox_runner import (
+            run_manual_prompt,
+            run_sandbox_task,
+        )
+
+        selector = self.state.run.artifact_test_id
+        if not selector:
+            return
+
+        model_id = self.state.run.model.id
+        config = winner.config
+        spec: dict | None = None
+        task: SandboxTask | None = None
+
+        if selector in SANDBOX_TASKS:
+            task = get_task_by_id(selector)
+        elif selector.startswith("custom:"):
+            path = Path(selector.split(":", 1)[1]).expanduser()
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            spec = validate_custom_prompt(raw)
+            task = SandboxTask(
+                id=spec["id"],
+                kind=spec["task_kind"],
+                title=spec["name"],
+                prompt=spec["prompt"],
+                checks=spec["checks"],
+                max_repair_attempts=0,
+                timeout_s=spec["timeout_s"],
+            )
+        if task is None:
+            self._log_event("Artifact test skipped", f"unknown task {selector!r}")
+            return
+
+        self._log_event("Artifact test started", f"{task.id} ({task.kind.value})")
+        await self._pause_point()
+
+        entry: dict
+        try:
+            if task.kind.value == "text" and not task.checks:
+                result = await run_manual_prompt(
+                    self.client,
+                    model_id,
+                    config,
+                    task.prompt,
+                    run_id=str(self.state.run.id),
+                    max_output_tokens=(spec or {}).get("max_output_tokens", 2048),
+                    temperature=(spec or {}).get("temperature", 0.2),
+                    timeout_s=task.timeout_s,
+                )
+                score = None
+            else:
+                result = await run_sandbox_task(
+                    self.client, model_id, config, task, run_id=str(self.state.run.id)
+                )
+                score = (result.get("result") or {}).get("penalized_score")
+            entry = {
+                "task_id": task.id,
+                "task_kind": task.kind.value,
+                "selector": selector,
+                "config_id": str(winner.id),
+                "config_fingerprint": (self.state.run.benchmark_params or {}).get(
+                    "fingerprint"
+                ),
+                "success": bool(result.get("success")),
+                "score": score,
+                "manual_review_only": bool(result.get("manual_review_only", False)),
+                "artifacts": (result.get("result") or {}).get("artifacts", []),
+                "config_applied": result.get("config_applied"),
+                "echo_mismatches": result.get("echo_mismatches"),
+                "unloaded": result.get("unloaded"),
+                "duration_s": result.get("duration_s"),
+                "error": result.get("error"),
+            }
+        except Exception as e:  # noqa: BLE001 - artifact failure is contained
+            logger.error("Artifact test failed", task=task.id, error=str(e))
+            entry = {
+                "task_id": task.id,
+                "task_kind": task.kind.value,
+                "selector": selector,
+                "config_id": str(winner.id),
+                "success": False,
+                "error": f"{type(e).__name__}: {e}"[:200],
+            }
+
+        self.state.run.benchmark_params["artifact_test"] = entry
+        self._sync_phase_params()
+        run_repo.save(self.state.run)
+        self._checkpoint("phase:artifact_test:complete")
+        await self._broadcast({"stage": "artifact_test", "event": "artifact_test_complete"})
+
+    # ============================================================
+    # Final Sandbox (spec §6)
+    # ============================================================
+
+    async def _run_final_sandbox(self, winner: ConfigurationResult) -> None:
+        """Run sandbox tasks against the actual optimizer winner config (spec §6)."""
+        from lm_optimizer.services.sandbox_lab import (
+            SandboxTask,
+            BUILTIN_TASKS,
+            get_task_by_id,
+            validate_custom_prompt,
+        )
+        from lm_optimizer.services.sandbox_runner import run_manual_prompt, run_sandbox_task
+
+        mode = self.state.run.final_sandbox_mode
+        preset_ids = self.state.run.final_sandbox_preset_ids
+        custom_prompts = self.state.run.final_sandbox_custom_prompts
+        compare_baseline = self.state.run.sandbox_compare_baseline
+
+        if mode == "off":
+            return
+
+        tasks_to_run: list[SandboxTask] = []
+        invalid_custom: list[dict] = []
+        manual_specs: dict[str, dict] = {}
+
+        if mode == "one":
+            for pid in preset_ids[:1]:
+                task = get_task_by_id(pid)
+                if task is None:
+                    self._log_event("Final sandbox: unknown preset", str(pid))
+                else:
+                    tasks_to_run.append(task)
+        elif mode == "all":
+            # "all" means every registered compatible built-in (single source
+            # of truth: SANDBOX_TASKS / BUILTIN_TASKS).
+            tasks_to_run.extend(BUILTIN_TASKS.values())
+        elif mode == "custom":
+            for raw in custom_prompts:
+                try:
+                    spec = validate_custom_prompt(raw)
+                except ValueError as e:
+                    invalid_custom.append({"spec": raw, "error": str(e)})
+                    continue
+                if spec["manual_review_only"]:
+                    # Handled by the generation-only path below; no score.
+                    manual_specs[spec["id"]] = spec
+                    tasks_to_run.append(
+                        SandboxTask(
+                            id=spec["id"],
+                            kind=spec["task_kind"],
+                            title=spec["name"],
+                            prompt=spec["prompt"],
+                            checks=[],
+                            max_repair_attempts=0,
+                            timeout_s=spec["timeout_s"],
+                        )
+                    )
+                else:
+                    tasks_to_run.append(
+                        SandboxTask(
+                            id=spec["id"],
+                            kind=spec["task_kind"],
+                            title=spec["name"],
+                            prompt=spec["prompt"],
+                            checks=spec["checks"],
+                            max_repair_attempts=0,
+                            timeout_s=spec["timeout_s"],
+                        )
+                    )
+
+        if not tasks_to_run:
+            self._log_event("Final sandbox skipped", "no valid tasks to run")
+            self.state.run.benchmark_params["final_sandbox"] = {
+                "mode": mode,
+                "tasks": [],
+                "invalid_custom_prompts": invalid_custom,
+            }
+            run_repo.save(self.state.run)
+            return
+
+        self._log_event("Final sandbox started", f"mode={mode} tasks={len(tasks_to_run)}")
+        await self._pause_point()
+
+        model_id = self.state.run.model.id
+        winner_config = winner.config
+
+        sandbox_results: list[dict] = []
+
+        async def _run_one(cfg, task: SandboxTask, slot: str) -> None:
+            if task.kind.value == "text" and not task.checks:
+                spec = manual_specs.get(task.id) or {}
+                result = await run_manual_prompt(
+                    self.client,
+                    model_id,
+                    cfg,
+                    task.prompt,
+                    run_id=str(self.state.run.id),
+                    max_output_tokens=spec.get("max_output_tokens", 2048),
+                    temperature=spec.get("temperature", 0.2),
+                    timeout_s=task.timeout_s,
+                )
+            else:
+                result = await run_sandbox_task(
+                    self.client,
+                    model_id,
+                    cfg,
+                    task,
+                    run_id=str(self.state.run.id),
+                )
+            sandbox_results.append(
+                {
+                    "task_id": task.id,
+                    "task_kind": task.kind.value,
+                    "config": slot,
+                    "result": result,
+                }
+            )
+
+        for task in tasks_to_run:
+            if self.state.should_cancel:
+                break
+            self._log_event("Sandbox task", f"{task.id} ({task.kind.value})")
+            try:
+                await _run_one(winner_config, task, "winner")
+            except Exception as e:
+                logger.error("Sandbox task failed", task=task.id, error=str(e))
+                sandbox_results.append(
+                    {
+                        "task_id": task.id,
+                        "task_kind": task.kind.value,
+                        "config": "winner",
+                        "error": str(e)[:200],
+                    }
+                )
+
+        # Optional baseline comparison (separate A/B, never mixed into scores).
+        if compare_baseline and self.state.run.baseline_config_id:
+            baseline_cfg = self.state.run.get_baseline_config()
+            if baseline_cfg:
+                self._log_event("Sandbox baseline comparison", "running")
+                for task in tasks_to_run:
+                    if self.state.should_cancel:
+                        break
+                    try:
+                        await _run_one(baseline_cfg.config, task, "baseline")
+                    except Exception as e:
+                        sandbox_results.append(
+                            {
+                                "task_id": task.id,
+                                "task_kind": task.kind.value,
+                                "config": "baseline",
+                                "error": str(e)[:200],
+                            }
+                        )
+
+        # Store sandbox results (kept OUT of optimizer scores/Pareto).
+        self.state.run.benchmark_params["final_sandbox"] = {
+            "mode": mode,
+            "tasks": sandbox_results,
+            "invalid_custom_prompts": invalid_custom,
+            "winner_config_id": str(winner.id),
+            "winner_config": winner_config.to_dict(),
+            "affects_optimizer_score": False,
+        }
+        self._sync_phase_params()
+        run_repo.save(self.state.run)
+        self._checkpoint("phase:final_sandbox:complete")
+        await self._broadcast({"stage": "final_sandbox", "event": "final_sandbox_complete"})
 
 
 # Type alias for LoadConfig

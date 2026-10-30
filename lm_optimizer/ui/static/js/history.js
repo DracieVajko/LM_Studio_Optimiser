@@ -1,7 +1,7 @@
 // LM Studio Auto Optimizer - History Page
 
-import { API } from './api.js?v=6';
-import { UI } from './ui.js?v=6';
+import { API } from './api.js?v=17';
+import { UI } from './ui.js?v=17';
 
 const HistoryPage = {
     state: {
@@ -16,6 +16,11 @@ const HistoryPage = {
         await this.loadDuels();
         this.render();
         this.attachEvents();
+        // Deep link from the Sandbox page to its history section.
+        if (window.location.hash === '#sandbox-history') {
+            const el = document.getElementById('sandbox-history');
+            if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
     },
 
     async loadDuels() {
@@ -61,11 +66,21 @@ const HistoryPage = {
                         <p class="text-gray-500 mt-1">View and manage all optimization runs</p>
                     </div>
                     <div class="flex gap-2">
+                        <button id="resume-all-pending" class="btn btn-success" title="Resume all paused runs from checkpoints">
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"></path>
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                            </svg>
+                            Resume All Pending
+                        </button>
                         <button id="refresh-history" class="btn btn-outline">
                             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
                             </svg>
                             Refresh
+                        </button>
+                        <button id="reconcile-runs" class="btn btn-outline" title="Mark dead 'running' runs interrupted (keeps history + checkpoints)">
+                            Reconcile Stale
                         </button>
                     </div>
                 </div>
@@ -95,8 +110,12 @@ const HistoryPage = {
                                 <label class="form-label">Filter by Status</label>
                                 <select id="filter-status" class="form-input form-select">
                                     <option value="">All Statuses</option>
-                                    <option value="completed">Completed</option>
+                                    <option value="success">Success (validated winner)</option>
+                                    <option value="completed_no_validated_winner">Completed, no validated winner</option>
+                                    <option value="partial_success">Partial success</option>
                                     <option value="running">Running</option>
+                                    <option value="paused">Paused</option>
+                                    <option value="interrupted">Interrupted</option>
                                     <option value="failed">Failed</option>
                                     <option value="cancelled">Cancelled</option>
                                 </select>
@@ -114,7 +133,7 @@ const HistoryPage = {
                 </div>
 
                 <!-- Sandbox Duels -->
-                <div class="flex items-center justify-between mt-8 mb-2">
+                <div class="flex items-center justify-between mt-8 mb-2" id="sandbox-history">
                     <h2 class="text-xl font-bold text-gray-900">Sandbox Duels</h2>
                     <button id="delete-duels" class="btn btn-outline btn-sm" disabled>Delete selected</button>
                 </div>
@@ -239,11 +258,19 @@ const HistoryPage = {
         }
 
         return `
+            <div class="card-body border-b flex items-center gap-2 flex-wrap">
+                <span id="bulk-count" class="text-sm text-gray-500">0 selected</span>
+                <button id="bulk-compare" class="btn btn-outline btn-sm" disabled>Compare selected</button>
+                <button id="bulk-rerun" class="btn btn-outline btn-sm" disabled>Re-run selected</button>
+                <button id="bulk-delete" class="btn btn-danger btn-sm" disabled>Delete selected</button>
+                <button id="bulk-clear" class="btn btn-outline btn-sm">Clear</button>
+            </div>
             <div class="card-body p-0">
                 <div class="table-container">
-                    <table class="table">
+                    <table class="table history-table">
                         <thead>
                             <tr>
+                                <th class="w-10"><input type="checkbox" id="select-all-runs" title="Select all visible runs"></th>
                                 <th>Date</th>
                                 <th>Model</th>
                                 <th>Profile</th>
@@ -258,8 +285,9 @@ const HistoryPage = {
                         <tbody>
                             ${this.state.filteredRuns.map(r => `
                                 <tr class="run-row hover:bg-gray-50 cursor-pointer" data-run-id="${r.id}">
+                                    <td class="text-center"><input type="checkbox" class="run-select" value="${r.id}"></td>
                                     <td class="font-mono text-sm">${new Date(r.created_at).toLocaleString()}</td>
-                                    <td>
+                                    <td class="model-cell">
                                         <div class="font-medium">${r.model.name}</div>
                                         <div class="text-xs text-gray-500 font-mono">${r.model.id}</div>
                                     </td>
@@ -284,18 +312,35 @@ const HistoryPage = {
     },
 
     getBestGenSpeed(run) {
-        if (!run.best_config_id || !run.configurations) return '—';
-        const best = run.configurations.find(c => c.id === run.best_config_id);
-        return best?.avg_generation_tok_s ? best.avg_generation_tok_s.toFixed(1) : '—';
+        // Server-computed winner metrics (list rows carry no full configs).
+        if (run.best_gen_tok_s !== undefined && run.best_gen_tok_s !== null) {
+            return Number(run.best_gen_tok_s).toFixed(1);
+        }
+        if (run.configurations && run.best_config_id) {
+            const best = run.configurations.find(c => c.id === run.best_config_id);
+            if (best?.avg_generation_tok_s) return best.avg_generation_tok_s.toFixed(1);
+        }
+        return '—';
     },
 
     getBestQuality(run) {
-        if (!run.best_config_id || !run.configurations) return '—';
-        const best = run.configurations.find(c => c.id === run.best_config_id);
-        return best?.quality?.overall ? best.quality.overall.toFixed(3) : '—';
+        if (run.best_quality !== undefined && run.best_quality !== null) {
+            return Number(run.best_quality).toFixed(3);
+        }
+        if (run.configurations && run.best_config_id) {
+            const best = run.configurations.find(c => c.id === run.best_config_id);
+            if (best?.quality?.overall) return best.quality.overall.toFixed(3);
+        }
+        return '—';
     },
 
     attachEvents() {
+        // Resume All Pending
+        document.getElementById('resume-all-pending')?.addEventListener('click', () => this.resumeAllPending());
+
+        // Reconcile stale running runs (preview → confirm → apply).
+        document.getElementById('reconcile-runs')?.addEventListener('click', () => this.reconcileStaleRuns());
+
         // Refresh
         document.getElementById('refresh-history')?.addEventListener('click', () => this.loadRuns());
 
@@ -314,6 +359,91 @@ const HistoryPage = {
                 if (el) el.value = '';
             });
             this.applyFilters();
+        });
+
+        // Bulk selection (delete / re-run / compare)
+        const boxes = () => Array.from(document.querySelectorAll('.run-select'));
+        const selectedIds = () => boxes().filter(b => b.checked).map(b => b.value);
+        const updateBulk = () => {
+            const n = selectedIds().length;
+            const count = document.getElementById('bulk-count');
+            if (count) count.textContent = `${n} selected`;
+            const del = document.getElementById('bulk-delete');
+            const rerun = document.getElementById('bulk-rerun');
+            const cmp = document.getElementById('bulk-compare');
+            if (del) del.disabled = n === 0;
+            if (rerun) rerun.disabled = n === 0;
+            if (cmp) cmp.disabled = n < 2;
+        };
+        boxes().forEach(b => {
+            b.addEventListener('click', e => e.stopPropagation());
+            b.addEventListener('change', updateBulk);
+        });
+        document.getElementById('select-all-runs')?.addEventListener('change', (e) => {
+            boxes().forEach(b => { b.checked = e.target.checked; });
+            updateBulk();
+        });
+        document.getElementById('bulk-clear')?.addEventListener('click', () => {
+            boxes().forEach(b => { b.checked = false; });
+            const all = document.getElementById('select-all-runs');
+            if (all) all.checked = false;
+            updateBulk();
+        });
+        document.getElementById('bulk-delete')?.addEventListener('click', async () => {
+            const ids = selectedIds();
+            if (!ids.length) return;
+            if (!window.confirm(`Delete ${ids.length} selected run(s) and their configurations?`)) return;
+            let ok = 0, failed = 0;
+            for (const id of ids) {
+                try { await API.deleteRun(id); ok++; }
+                catch (err) { failed++; }
+            }
+            UI.showToast(`Deleted ${ok} run(s)${failed ? `, ${failed} failed (live runs are refused)` : ''}`, failed ? 'warning' : 'success');
+            await this.refresh();
+        });
+        document.getElementById('bulk-rerun')?.addEventListener('click', async () => {
+            const ids = selectedIds();
+            if (!ids.length) return;
+            const run = (this.state.runs || []).find(r => r.id === ids[0]);
+            if (!run) { UI.showToast('Selected run not found', 'error'); return; }
+            try {
+                await API.startOptimization({
+                    model_id: run.model.id,
+                    profile: run.profile,
+                    advanced_settings: {},
+                });
+                UI.showToast(`Re-run started: ${run.model.id}${ids.length > 1 ? ' (only the first selected model was started)' : ''}`, 'success');
+            } catch (err) {
+                UI.showToast((err && err.message) || 'Re-run failed', 'error');
+            }
+        });
+        document.getElementById('bulk-compare')?.addEventListener('click', () => {
+            const ids = selectedIds();
+            if (ids.length < 2) return;
+            const runs = ids
+                .map(id => (this.state.runs || []).find(r => r.id === id))
+                .filter(Boolean);
+            const dash = v => (v === null || v === undefined || v === '') ? '—' : v;
+            const rows = runs.map(r => `
+                <tr>
+                    <td class="font-mono text-xs">${r.model.id}</td>
+                    <td>${r.profile}</td>
+                    <td>${r.status}</td>
+                    <td class="text-right">${r.best_gen_tok_s != null ? Number(r.best_gen_tok_s).toFixed(1) : '—'}</td>
+                    <td class="text-right">${r.best_quality != null ? Number(r.best_quality).toFixed(3) : '—'}</td>
+                    <td class="text-right">${dash(r.best_context_length)}</td>
+                    <td class="text-right">${r.duration_seconds ? Math.round(r.duration_seconds) + 's' : '—'}</td>
+                </tr>`).join('');
+            UI.openModal(
+                '<div class="overflow-auto max-h-[65vh]">'
+                + '<table class="table text-sm"><thead><tr>'
+                + '<th>Model</th><th>Profile</th><th>Status</th><th>Gen tok/s</th>'
+                + '<th>Quality</th><th>Context</th><th>Duration</th>'
+                + '</tr></thead><tbody>' + rows + '</tbody></table></div>'
+                + '<p class="text-xs text-gray-500 mt-2">Winner metrics per selected run; '
+                + 'failed runs are shown too.</p>',
+                'Compare selected runs'
+            );
         });
 
         // View run buttons
@@ -446,6 +576,69 @@ const HistoryPage = {
         await this.loadDuels();
         this.state.filteredRuns = this.state.runs;
         this.render(); // full re-render: fresh nodes, single attachEvents
+    },
+
+    async reconcileStaleRuns() {
+        const btn = document.getElementById('reconcile-runs');
+        if (btn) btn.disabled = true;
+        try {
+            const preview = await API.reconcileRuns(false);
+            const changed = (preview && preview.changed) || 0;
+            if (!changed) {
+                UI.showToast('No stale running runs found', 'info');
+                return;
+            }
+            if (!window.confirm(`Mark ${changed} dead 'running' run(s) as interrupted? History and checkpoints are preserved.`)) {
+                return;
+            }
+            const applied = await API.reconcileRuns(true);
+            UI.showToast(`Reconciled ${(applied && applied.changed) || 0} stale run(s)`, 'success');
+            await this.refresh();
+        } catch (err) {
+            UI.showToast((err && err.message) || 'Reconcile failed', 'error');
+        } finally {
+            if (btn) btn.disabled = false;
+        }
+    },
+
+    async resumeAllPending() {
+        const btn = document.getElementById('resume-all-pending');
+        if (btn) btn.disabled = true;
+        UI.showLoading('Resuming all unfinished runs...');
+        try {
+            // Finishable states: paused, partial_success, interrupted.
+            // Live (running/resumed) and explicitly cancelled runs are left alone.
+            const resumable = ['paused', 'partial_success', 'interrupted'];
+            const pendingRuns = this.state.runs.filter(r => resumable.includes(r.status));
+            if (!pendingRuns.length) {
+                UI.hideLoading();
+                UI.showToast('No unfinished runs to resume', 'info');
+                if (btn) btn.disabled = false;
+                return;
+            }
+            let successCount = 0;
+            let errorCount = 0;
+            for (const run of pendingRuns) {
+                try {
+                    await API.resumeRunFromCheckpoint(run.id);
+                    successCount++;
+                } catch (error) {
+                    errorCount++;
+                    console.error(`Failed to resume ${run.id}:`, error);
+                }
+            }
+            UI.hideLoading();
+            if (successCount > 0) {
+                UI.showToast(`Resumed ${successCount} run(s)${errorCount ? `, ${errorCount} failed` : ''}`, 'success');
+            } else {
+                UI.showToast(`All ${errorCount} resume attempts failed`, 'error');
+            }
+            await this.refresh();
+        } catch (error) {
+            UI.hideLoading();
+            UI.showToast(error.message || 'Resume all failed', 'error');
+            if (btn) btn.disabled = false;
+        }
     },
 };
 

@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Brewery - LM Studio Auto Optimizer</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="/static/css/app.css">
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%232563eb' stroke-width='2'%3E%3Cpath stroke-linecap='round' stroke-linejoin='round' d='M13 10V3L4 14h7v7l9-11h-7z'/%3E%3C/svg%3E">
+    <script src="/static/js/theme.js?v=17"></script>
+    <script src="/static/js/navstatus.js?v=17"></script>
+</head>
+<body class="bg-gray-50 min-h-screen">
+    <div id="app">
+        <nav class="bg-white border-b border-gray-200 sticky top-0 z-40">
+            <div class="container mx-auto px-4">
+                <div class="flex items-center justify-between h-16">
+                    <div class="flex items-center space-x-8">
+                        <a href="/" class="flex items-center space-x-2">
+                            <svg class="w-8 h-8 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path>
+                            </svg>
+                            <span class="text-xl font-bold text-gray-900">LM Optimizer</span>
+                        </a>
+                        <div class="hidden md:flex space-x-6">
+                            <a href="/" class="nav-link text-gray-600 hover:text-blue-600 font-medium">Dashboard</a>
+                            <a href="/history" class="nav-link text-gray-600 hover:text-blue-600 font-medium">History</a>
+                            <a href="/sandbox" class="nav-link text-gray-600 hover:text-blue-600 font-medium">Sandbox</a>
+                            <a href="/brewery" class="nav-link text-blue-600 font-medium">Brewery</a>
+                            <a href="/settings" class="nav-link text-gray-600 hover:text-blue-600 font-medium">Settings</a>
+                        </div>
+                    </div>
+                    <div class="flex items-center space-x-4">
+                        <button class="theme-toggle btn btn-outline btn-sm" aria-label="Toggle dark mode">dYOT</button>
+                        <span id="lm-status" class="status-badge status-offline text-sm font-medium">
+                            <span class="status-dot"></span>Disconnected
+                        </span>
+                    </div>
+                </div>
+            </div>
+        </nav>
+
+        <main class="container mx-auto px-4 py-8" id="main-content">
+            <div class="flex items-center justify-between mb-2"><h1 class="text-2xl font-bold">Brewery</h1><a class="btn btn-outline btn-sm" href="/experiments" title="Experiment Builder: mode -> model -> budget -> review -> run">Experiment builder &rarr;</a></div>
+            <p class="text-sm text-gray-500 mb-6">
+                Context Explorer, Quality Lab, Model Recommender and Duel &mdash; the workflows that are
+                <em>not</em> the runtime optimizer. Local measurements always outrank community priors.
+            </p>
+
+            <div class="flex gap-2 mb-6 flex-wrap" id="lab-tabs">
+                <button class="btn btn-outline lab-tab" data-tab="recommend" title="Model fit for this hardware (size and bits/weight)">Recommender</button>
+                <button class="btn btn-outline lab-tab" data-tab="tasks" title="Deterministic quality tasks with hard gates">Quality tasks</button>
+                <button class="btn btn-outline lab-tab" data-tab="duels" title="Blind A/B model duels with a judge">Duel types</button>
+                <button class="btn btn-outline lab-tab" data-tab="sandbox" title="Isolated artifact tasks with automatic acceptance checks">Sandbox</button>
+                <button class="btn btn-outline lab-tab" data-tab="experiments" title="Experiment Builder: mode -> model -> budget -> review -> run">Experiments</button>
+            </div>
+
+            <!-- Recommender -->
+            <section id="lab-panel-recommend" class="lab-panel">
+                <div class="card"><div class="card-body">
+                    <h2 class="font-semibold mb-1">Model recommendations for this hardware</h2>
+                    <p class="text-sm text-gray-500 mb-4">
+                        Fit is decided by file size and bits/weight &mdash; never by parameter count.
+                        A 27B at Q1_0 (4.4 GB) fits a 6 GB card; the same 27B at Q4_K_M (17.4 GB) does not.
+                    </p>
+                    <div class="grid md:grid-cols-4 gap-4 mb-4">
+                        <div>
+                            <label class="font-medium text-sm">Min tok/s</label>
+                            <input id="lab-min-tps" class="input w-full mt-1" type="number" value="5" step="0.5">
+                        </div>
+                        <div>
+                            <label class="font-medium text-sm">Min context</label>
+                            <input id="lab-min-ctx" class="input w-full mt-1" type="number" value="8192" step="1024">
+                        </div>
+                        <div>
+                            <label class="font-medium text-sm">Use case</label>
+                            <select id="lab-use-case" class="input w-full mt-1">
+                                <option value="general">general</option>
+                                <option value="coding">coding</option>
+                                <option value="reasoning">reasoning</option>
+                                <option value="fast">fast</option>
+                                <option value="long_context">long context</option>
+                                <option value="tools">tools</option>
+                            </select>
+                        </div>
+                        <div class="flex items-end">
+                            <label class="flex items-center gap-2 text-sm">
+                                <input id="lab-vram-only" type="checkbox"> VRAM only (no RAM spill)
+                            </label>
+                        </div>
+                    </div>
+                    <button id="lab-run-recommend" class="btn btn-primary">Compute recommendations</button>
+                </div></div>
+
+                <div id="lab-recommend-result" class="mt-6"></div>
+            </section>
+
+            <!-- Quality tasks -->
+            <section id="lab-panel-tasks" class="lab-panel hidden">
+                <div class="card"><div class="card-body">
+                    <h2 class="font-semibold mb-1">Deterministic quality tasks</h2>
+                    <p class="text-sm text-gray-500 mb-4">
+                        Hard gates run BEFORE scoring: an empty output, a failed schema or a missing
+                        function caps the score at zero &mdash; a broken answer never wins on appearance.
+                        Run them with <code class="font-mono">lm-optimizer lab quality-lab &lt;model&gt;</code>.
+                    </p>
+                    <div id="lab-tasks-result" class="text-sm text-gray-500">Loading...</div>
+                </div></div>
+            </section>
+
+            <!-- Duel types -->
+            <section id="lab-panel-duels" class="lab-panel hidden">
+                <div class="card"><div class="card-body">
+                    <h2 class="font-semibold mb-1">Duel types</h2>
+                    <p class="text-sm text-gray-500 mb-4">
+                        Controlled duels use identical context, sampling and seed for both sides;
+                        the blind judge only ever sees &ldquo;Candidate A&rdquo; and &ldquo;Candidate B&rdquo;.
+                        Run them with <code class="font-mono">lm-optimizer lab duel &lt;a&gt; &lt;b&gt;</code>.
+                    </p>
+                    <div id="lab-duels-result" class="text-sm text-gray-500">Loading...</div>
+                </div></div>
+            </section>
+
+            <!-- Sandbox -->
+            <section id="lab-panel-sandbox" class="lab-panel hidden">
+                <div class="card"><div class="card-body">
+                    <h2 class="font-semibold mb-1">Sandbox tasks</h2>
+                    <p class="text-sm text-gray-500 mb-4">
+                        The model writes a solution into an isolated workdir; the acceptance
+                        criteria are checked automatically and a failed attempt gets
+                        evidence-only feedback for the repair loop. The artifacts land in
+                        <code class="font-mono">results/sandbox/&lt;task&gt;/&lt;timestamp&gt;/</code>
+                        for you to inspect.
+                    </p>
+                    <div class="grid md:grid-cols-3 gap-4 mb-4">
+                        <div>
+                            <label class="text-sm font-medium">Task</label>
+                            <select id="lab-sandbox-task" class="input w-full mt-1"></select>
+                        </div>
+                        <div>
+                            <label class="text-sm font-medium">Model</label>
+                            <select id="lab-sandbox-model" class="input w-full mt-1"></select>
+                        </div>
+                        <div class="flex items-end">
+                            <button id="lab-sandbox-run" class="btn btn-primary">Run task</button>
+                        </div>
+                    </div>
+                    <div id="lab-sandbox-checks" class="text-xs text-gray-500 mb-4"></div>
+                    <div id="lab-sandbox-result" class="text-sm text-gray-500"></div>
+                </div></div>
+            </section>
+                    <section id="lab-panel-experiments" class="lab-panel hidden">
+<p class="text-sm text-gray-500 mb-6">
+                Build a run step by step. The review step shows exactly what will be
+                measured &mdash; granular modes compose onto the phase-skip machinery,
+                so the plan you see is the plan that runs.
+            </p>
+
+            <div class="grid md:grid-cols-3 gap-6">
+                <div class="md:col-span-2 space-y-4">
+                    <!-- 1. mode -->
+                    <div class="card"><div class="card-body">
+                        <h2 class="font-semibold mb-2">1. Mode</h2>
+                        <div class="flex flex-wrap gap-2" id="ex-modes">
+                            <label class="btn btn-outline cursor-pointer">
+                                <input type="radio" name="ex-mode" value="full" checked title="All phases: speed discovery, quality suite, recovery, final validation" class="mr-2">Full campaign
+                            </label>
+                            <label class="btn btn-outline cursor-pointer">
+                                <input type="radio" name="ex-mode" value="speed" title="Speed probes only at a pinned context; no quality and no winner" class="mr-2">Speed only
+                            </label>
+                            <label class="btn btn-outline cursor-pointer">
+                                <input type="radio" name="ex-mode" value="quality" title="Quality suite on the baseline config; no speed discovery" class="mr-2">Quality only
+                            </label>
+                            <label class="btn btn-outline cursor-pointer">
+                                <input type="radio" name="ex-mode" value="reasoning" title="Five reasoning levels: off, low, medium, high, xhigh" class="mr-2">Reasoning only
+                            </label>
+                            <label class="btn btn-outline cursor-pointer">
+                                <input type="radio" name="ex-mode" value="mtp" title="Speculative decoding / MTP probes only" class="mr-2">MTP only
+                            </label>
+                        </div>
+                        <p class="text-xs text-gray-400 mt-2" id="ex-mode-hint"></p>
+                    </div></div>
+
+                    <!-- 2. model -->
+                    <div class="card"><div class="card-body">
+                        <h2 class="font-semibold mb-2">2. Model</h2>
+                        <select id="ex-model" class="input w-full">
+                            <option value="">Loading models...</option>
+                        </select>
+                    </div></div>
+
+                    <!-- 3. budget -->
+                    <div class="card"><div class="card-body">
+                        <h2 class="font-semibold mb-3">3. Budget and thresholds</h2>
+                        <div class="grid md:grid-cols-3 gap-4">
+                            <div>
+                                <label class="text-sm font-medium">Profile</label>
+                                <select id="ex-profile" title="Scoring profile weights (speed, balanced, context, quality)" class="input w-full mt-1">
+                                    <option value="balanced">balanced</option>
+                                    <option value="speed">speed</option>
+                                    <option value="context">context</option>
+                                    <option value="quality">quality</option>
+                                </select>
+                            </div>
+                            <div>
+                                <label class="text-sm font-medium">Quality threshold</label>
+                                <input id="ex-threshold" title="Hard floor: candidates below this correctness score cannot win" class="input w-full mt-1" type="number"
+                                       value="0.97" min="0.9" max="1" step="0.01">
+                            </div>
+                            <div>
+                                <label class="text-sm font-medium">Max context</label>
+                                <input id="ex-maxctx" class="input w-full mt-1" type="number"
+                                       value="32768" step="1024">
+                            </div>
+                            <div>
+                                <label class="text-sm font-medium">Min speed (tok/s)</label>
+                                <input id="ex-min-tps" title="Hard floor: median generation tok/s a winner must reach" class="input w-full mt-1" type="number"
+                                       value="2.0" min="0" step="0.1">
+                            </div>
+                            <div>
+                                <label class="text-sm font-medium">Quality context</label>
+                                <input id="ex-quality-ctx" title="Context for the quality suite, independent of max context" class="input w-full mt-1" type="number"
+                                       value="8192" min="256" step="512">
+                            </div>
+                            <div id="ex-speedctx-wrap" class="hidden">
+                                <label class="text-sm font-medium">Speed context (pinned)</label>
+                                <input id="ex-speedctx" title="Fixed context for speed probes (comparability, not a sweep)" class="input w-full mt-1" type="number"
+                                       value="16384" step="1024">
+                            </div>
+                            <div class="flex items-end">
+                                <label class="flex items-center gap-2 text-sm">
+                                    <input id="ex-quality-lab" title="Run deterministic hard-gate tasks on each quality finalist (can veto)" type="checkbox"> Quality Lab hard gates
+                                </label>
+                            </div>
+                        </div>
+                    </div></div>
+
+                    <!-- 4. review -->
+                    <div class="card"><div class="card-body">
+                        <h2 class="font-semibold mb-2">4. Review</h2>
+                        <pre id="ex-review" class="text-xs bg-gray-100 p-3 rounded overflow-auto"></pre>
+                        <button id="ex-start" class="btn btn-primary mt-3" disabled>Start run</button>
+                        <p id="ex-status" class="text-sm mt-2"></p>
+                    </div></div>
+                </div>
+
+                <div class="space-y-4">
+                    <div class="card"><div class="card-body">
+                        <h2 class="font-semibold mb-2">What the modes mean</h2>
+                        <ul class="text-xs text-gray-500 space-y-2">
+                            <li><strong>Full campaign</strong>: speed discovery, quality suite,
+                                recovery, final validation and the optional context phase.</li>
+                            <li><strong>Speed only</strong>: S0 budget classification plus the
+                                planned probes at a pinned context. No quality, no winner.</li>
+                            <li><strong>Quality only</strong>: one quality suite on the baseline
+                                config at the max context. No speed discovery.</li>
+                            <li><strong>Reasoning only</strong>: the 5-level reasoning sweep
+                                (off/low/medium/high/xhigh) on the baseline config.</li>
+                            <li><strong>MTP only</strong>: S0 plus the speculative/MTP probes at a
+                                pinned context, with an OFF baseline for the speedup ratio.</li>
+                        </ul>
+                    </div></div>
+                    <div class="card"><div class="card-body">
+                        <h2 class="font-semibold mb-2">Notes</h2>
+                        <p class="text-xs text-gray-500">
+                            A run holds the exclusive job lock: no other optimizer command can
+                            run until it finishes. Granular modes never fabricate a winner
+                            without the quality phase.
+                        </p>
+                    </div></div>
+                </div>
+            </div>
+            </section>
+        </main>
+    </div>
+    <script>
+    // Boot reporter: if the module below fails (syntax, import, CDN),
+    // the page explains itself instead of staying blank forever.
+    window.__bootError = null;
+    window.addEventListener('error', function (e) {
+        window.__bootError = (e && e.message) || 'script error';
+        var main = document.getElementById('main-content');
+        var stillLoading = main && main.querySelector('.spinner');
+        if (stillLoading) {
+            main.innerHTML = '<div class="card"><div class="card-body text-center py-12">'
+                + '<h3 class="text-lg font-medium text-gray-900">Lab failed to start.</h3>'
+                + '<p class="text-sm text-gray-500 mt-1">JavaScript error: '
+                + String(window.__bootError).slice(0, 300) + '</p>'
+                + '<p class="text-xs text-gray-400 mt-2">Check DevTools console (F12), then '
+                + '<a class="underline" href="/history">History</a> or '
+                + '<a class="underline" href="/settings">Settings</a>.</p>'
+                + '<button class="btn btn-outline mt-4" onclick="window.location.reload()">Retry</button>'
+                + '</div></div>';
+        }
+    }, true);
+    window.addEventListener('unhandledrejection', function (e) {
+        var reason = (e && e.reason && (e.reason.message || e.reason)) || 'request failed';
+        console.error('Unhandled rejection:', reason);
+    });
+    </script>
+    <script src="/static/js/lab.js?v=17"></script>
+    <script src="/static/js/experiments.js?v=17"></script>
+</body>
+</html>

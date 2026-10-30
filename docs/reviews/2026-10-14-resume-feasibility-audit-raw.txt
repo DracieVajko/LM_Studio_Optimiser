@@ -1,0 +1,83 @@
+﻿=== read-only inventory/checkpoint audit ===
+=== MODEL INVENTORY (DB `models` table, last-known; NOT live) ===
+  prism-ml/bonsai-27b
+    name=Bonsai 27B arch=qwen35 params=None
+    quant=Q1_0 ctx_limit=262144 size=4734614604 last_seen=2026-10-13T07:51:22.572575
+  qwen3.8-27b-uncensored-hauhaucs-aggressive-mtp
+    name=Qwen3.8 27B Uncensored HauhauCS Aggressive arch=qwen35 params=None
+    quant=IQ3_XS ctx_limit=262144 size=13106705408 last_seen=2026-10-13T20:41:56.929445
+  qwen3.8-9b-distill
+    name=Qwen3.8 9B arch=qwen35 params=None
+    quant=Q4_K_M ctx_limit=262144 size=5780090176 last_seen=2026-10-12T22:51:11.153072
+
+=== RUNS: phase_ab + status ===
+  3b1be9a9-9d55-4ffe-aeb2-0741fb87dcd3  model=prism-ml/bonsai-27b
+    status=running stage=speed_discovery best=None
+    phase_ab.present=True phase=speed phase_b_enabled=False recovery_cursor=None
+    configurations=13
+  a1ac6c9c-8269-4d4a-8602-14fde91a67ee  model=qwen3.8-9b-distill
+    status=running stage=recovery best=None
+    phase_ab.present=True phase=recovery phase_b_enabled=False recovery_cursor=4
+    configurations=22
+  d6580613-36c5-4407-98a2-aff7ff61f1b6  model=qwen3.8-9b-distill
+    status=running stage=recovery best=None
+    phase_ab.present=True phase=quality phase_b_enabled=False recovery_cursor=None
+    configurations=19
+  f518131b-359c-4a32-905c-9d528c7b4fbe  model=qwen3.8-9b-distill
+    status=running stage=recovery best=None
+    phase_ab.present=True phase=recovery phase_b_enabled=False recovery_cursor=2
+    configurations=19
+  bae3386f-cb2c-4ce6-9c2a-43892cd46357  model=qwen3.8-9b-distill
+    status=running stage=final_validation best=7425e701-9b64-4a5d-a900-97c1a2588854
+    phase_ab.present=True phase=recovery phase_b_enabled=False recovery_cursor=3
+    configurations=21
+  4aac923b-697c-405e-a562-2d6485f22bcf  model=qwen3.8-27b-uncensored-hauhaucs-aggressive-mtp
+    status=running stage=quality_check best=None
+    phase_ab.present=True phase=speed phase_b_enabled=False recovery_cursor=None
+    configurations=19
+
+=== CHECKPOINTS (read-only parse) ===
+  3b1be9a9-9d55-4ffe-aeb2-0741fb87dcd3
+    version=1 reason=started saved_at=2026-10-12T01:20:12.648047
+    model=prism-ml/bonsai-27b name=Bonsai 27B ctx_limit=262144
+    stage=discovery profile=balanced phase=speed speed_ctx=None quality_ctx=None
+    completed_candidate_ids=0 best_candidates=0 recovery_log=0
+  a1ac6c9c-8269-4d4a-8602-14fde91a67ee
+    version=1 reason=recovery:unrecovered:4 saved_at=2026-10-12T08:38:52.065469
+    model=qwen3.8-9b-distill name=Qwen3.8 9B ctx_limit=262144
+    stage=recovery profile=balanced phase=recovery speed_ctx=4096 quality_ctx=32768
+    completed_candidate_ids=21 best_candidates=0 recovery_log=4
+  d6580613-36c5-4407-98a2-aff7ff61f1b6
+    version=1 reason=phase:quality saved_at=2026-10-12T10:57:18.971221
+    model=qwen3.8-9b-distill name=Qwen3.8 9B ctx_limit=262144
+    stage=quality_check profile=balanced phase=quality speed_ctx=4096 quality_ctx=32768
+    completed_candidate_ids=19 best_candidates=0 recovery_log=0
+  f518131b-359c-4a32-905c-9d528c7b4fbe
+    version=1 reason=recovery:rollback:context_length:2 saved_at=2026-10-12T21:55:53.162933
+    model=qwen3.8-9b-distill name=Qwen3.8 9B ctx_limit=262144
+    stage=recovery profile=balanced phase=recovery speed_ctx=4096 quality_ctx=32768
+    completed_candidate_ids=19 best_candidates=0 recovery_log=2
+  bae3386f-cb2c-4ce6-9c2a-43892cd46357
+    version=1 reason=recovery:unrecovered:3 saved_at=2026-10-13T00:02:41.994189
+    model=qwen3.8-9b-distill name=Qwen3.8 9B ctx_limit=262144
+    stage=recovery profile=balanced phase=recovery speed_ctx=4096 quality_ctx=32768
+    completed_candidate_ids=20 best_candidates=1 recovery_log=3
+  4aac923b-697c-405e-a562-2d6485f22bcf
+    version=1 reason=phase:speed saved_at=2026-10-13T22:37:28.369151
+    model=qwen3.8-27b-uncensored-hauhaucs-aggressive-mtp name=Qwen3.8 27B Uncensored HauhauCS Aggressive ctx_limit=262144
+    stage=speed_discovery profile=balanced phase=speed speed_ctx=4096 quality_ctx=32768
+    completed_candidate_ids=18 best_candidates=0 recovery_log=0
+
+=== PRESETS for these models ===
+  prism-ml/bonsai-27b profile=balanced run_id=65f30d92-9c86-424b-8483-6ed9180f967a created=2026-10-13T08:42:33.673080
+  prism-ml/bonsai-27b profile=balanced run_id=cc6c6477-fb86-4fe4-a11c-a808f7191fe0 created=2026-10-09T01:07:33.659793
+  prism-ml/bonsai-27b profile=balanced run_id=b2c33261-02a9-44ab-b8ed-1371b8766ca7 created=2026-10-08T00:27:20.542069
+  qwen3.8-27b-uncensored-hauhaucs-aggressive-mtp profile=balanced run_id=94f3581d-caa7-4fb3-a423-6e8d07a2eb1c created=2026-10-01T13:35:24.658610
+  qwen3.8-9b-distill profile=balanced run_id=092369ac-ba21-4b2a-b0d2-53f8ad74cf6d created=2026-09-29T13:06:37.557054
+
+=== CAPABILITY SNAPSHOTS (recent) ===
+  run=45ec2b97-70b9-4db6-8ea5-7a65ca8841c8 at=2026-10-13 17:06:07 lms=CLI commit: dcefd5a backend=llama.cpp-win-x86_64-nvidia-cuda12-avx2 (2.55.0)
+  run=91e9422d-5cf8-44c0-965c-7b59d628038a at=2026-10-13 14:18:22 lms=CLI commit: dcefd5a backend=llama.cpp-win-x86_64-nvidia-cuda12-avx2 (2.55.0)
+  run=79c70669-f807-4426-adcd-b4c0272d9946 at=2026-10-13 11:13:12 lms=CLI commit: dcefd5a backend=llama.cpp-win-x86_64-nvidia-cuda12-avx2 (2.55.0)
+  run=65f30d92-9c86-424b-8483-6ed9180f967a at=2026-10-13 06:42:35 lms=CLI commit: dcefd5a backend=llama.cpp-win-x86_64-nvidia-cuda12-avx2 (2.55.0)
+  run=d945ffc1-a7f7-48a5-902f-baaacdb6d3d0 at=2026-10-09 22:22:38 lms=CLI commit: dcefd5a backend=llama.cpp-win-x86_64-nvidia-cuda12-avx2 (2.55.0)

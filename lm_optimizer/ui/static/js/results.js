@@ -1,9 +1,16 @@
 // LM Studio Auto Optimizer - Results Page
 
-import { API } from './api.js?v=6';
-import { UI } from './ui.js?v=6';
-import { Charts } from './charts.js?v=6';
-import { WebSocketManager } from './websocket.js?v=6';
+import { API } from './api.js?v=17';
+import { UI } from './ui.js?v=17';
+import { Charts } from './charts.js?v=17';
+import { WebSocketManager } from './websocket.js?v=17';
+
+const escapeHtml = (value) => String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 
 const ResultsPage = {
     state: {
@@ -182,17 +189,15 @@ const ResultsPage = {
                 ${this.renderLiveSection()}
                 ${this.renderHeader()}
                 ${this.renderTabs()}
-                <div id="tab-content" class="card">
-                    <div class="card-body" id="tab-panel">
-                        ${this.renderChartTab()}
-                    </div>
-                </div>
                 ${this.renderConfigTable()}
             </div>
         `;
 
-        // Render initial chart
-        setTimeout(() => this.renderChart(), 100);
+        // Render initial chart (single container: #tab-panels)
+        setTimeout(() => {
+            this.attachChartEvents();
+            this.renderChart();
+        }, 100);
     },
 
     renderHeader() {
@@ -249,11 +254,30 @@ const ResultsPage = {
                         </div>
                     </div>
                     <div class="flex gap-2">
+                        ${this.renderPauseResumeButtons(run.status)}
                         <button id="apply-best-btn" class="btn btn-success">
                             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path>
                             </svg>
                             Apply Best Config
+                        </button>
+                        <button id="save-lmstudio-config-btn" class="btn btn-outline" title="Download a reusable load-config JSON (llama.cpp: paste into My Models; vLLM: --engine-config-file)">
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1-4l-3 3m0 0L9 3m3 3V4"></path>
+                            </svg>
+                            Save LM Studio config
+                        </button>
+                        <button id="save-default-btn" class="btn btn-outline" title="Write the winner into LM Studio's per-model defaults. The previous file is backed up; the next load uses it (no restart).">
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16v3a1 1 0 01-1 1H8a1 1 0 01-1-1v-3M12 3v12m0 0l-4-4m4 4l4-4"></path>
+                            </svg>
+                            Save as LM Studio default
+                        </button>
+                        <button id="load-exact-btn" class="btn btn-outline" title="Apply the exact winning configuration to LM Studio (same as save-default, immediate load)">
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path>
+                            </svg>
+                            Load with exact config
                         </button>
                         <button id="export-btn" class="btn btn-outline">
                             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -301,6 +325,33 @@ const ResultsPage = {
             <div class="text-sm"><span class="text-gray-500">Quality-safe winner:</span> <span class="font-mono">${bestConfig?.context_length} ctx, ${tok(bestConfig)}</span></div>
             ${pb ? `<div class="text-sm mt-1"><span class="text-gray-500">Phase B:</span> <span class="font-mono">GPU-only ${pb.gpu_only_max ?? '—'} / system ${pb.system_max ?? '—'} / final ${pb.final_capacity ?? '—'}</span></div>` : ''}
         </div>`;
+    },
+
+    renderPauseResumeButtons(status) {
+        const isRunning = ['running', 'resumed'].includes(status);
+        const isPaused = status === 'paused';
+        if (!isRunning && !isPaused) return '';
+        
+        if (isRunning) {
+            return `
+                <button id="pause-run-btn" class="btn btn-warning" title="Pause at next safe boundary">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 9v6m4-6v6m7-3a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                    </svg>
+                    Pause
+                </button>`;
+        }
+        if (isPaused) {
+            return `
+                <button id="resume-run-btn" class="btn btn-success" title="Resume from checkpoint">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"></path>
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                    </svg>
+                    Resume
+                </button>`;
+        }
+        return '';
     },
 
     renderAlternatives(best) {
@@ -366,7 +417,7 @@ const ResultsPage = {
                     <button class="tab" data-tab="comparison">⚖️ Comparison</button>
                 </div>
                 <div class="card-body">
-                    <div id="tab-panels"></div>
+                    <div id="tab-panels">${this.renderChartTab()}</div>
                 </div>
             </div>
         `;
@@ -396,7 +447,7 @@ const ResultsPage = {
                     <canvas id="pareto-chart"></canvas>
                 </div>
                 <div class="mt-4">
-                    <h4 class="font-medium mb-2">Pareto Configurations</div>
+                    <h4 class="font-medium mb-2">Pareto Configurations</h4>
                     <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3" id="pareto-cards">
                         ${this.state.paretoConfigs.map(c => this.renderParetoCard(c)).join('')}
                     </div>
@@ -483,14 +534,28 @@ const ResultsPage = {
     renderConfigTable() {
         return `
             <div class="card">
-                <div class="card-header">
-                    <h3 class="font-semibold text-gray-900">All Tested Configurations</h3>
+                <div class="card-header flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+                    <div class="flex items-center gap-3">
+                        <h3 class="font-semibold text-gray-900">All Tested Configurations</h3>
+                        <p class="text-xs text-gray-500">Debug reveals the exact prompt, reasoning trace and model output of every test.</p>
+                    </div>
+                    <div class="flex items-center gap-2">
+                        <button id="ask-judge-btn" class="btn btn-primary" title="Select configurations or leave empty to evaluate all">
+                            <svg class="w-4 h-4 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z"></path></svg>
+                            Ask Judge
+                        </button>
+                        <button id="judge-history-btn" class="btn btn-outline" title="View judge history">
+                            <svg class="w-4 h-4 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.798 1.141a.999.999 0 001.396-.371.999.999 0 00-.371-1.396A7.04 7.04 0 0012 4c-3.866 0-7 2.889-7 6.5 0 3.61 2.834 6.5 6.5 6.5 1.15 0 2.218-.3 3.17-.843l.025-.013a.997.997 0 00-.51.048A8.99 8.99 0 0112 20c-4.963 0-9-3.577-9-8s3.577-8 8-8z"></path></svg>
+                            History
+                        </button>
+                    </div>
                 </div>
                 <div class="card-body p-0">
                     <div class="table-container">
                         <table class="table">
                             <thead>
                                 <tr>
+                                    <th class="w-10 text-center"><input type="checkbox" id="select-all-judge-configs" title="Select/deselect all visible configurations"></th>
                                     <th>Context</th>
                                     <th>GPU</th>
                                     <th>Flash</th>
@@ -503,7 +568,7 @@ const ResultsPage = {
                                     <th>Quality</th>
                                     <th>Score</th>
                                     <th>Status</th>
-                                    <th>Detail</th>
+                                    <th>Debug</th>
                                 </tr>
                             </thead>
                             <tbody>
@@ -511,6 +576,7 @@ const ResultsPage = {
                                     const cfg = c.config || {};
                                     return `
                                     <tr data-cfg-row-anchor="${c.id}" class="${c.status === 'passed' ? '' : 'bg-red-50'}">
+                                        <td class="text-center"><input type="checkbox" class="judge-config-checkbox" value="${c.id}"></td>
                                         <td class="font-mono">${c.context_length}</td>
                                         <td>${cfg.gpu_ratio != null ? (cfg.gpu_ratio * 100).toFixed(0) + '%' : 'Auto'}</td>
                                         <td>${cfg.flash_attention ? 'ON' : 'OFF'}</td>
@@ -523,7 +589,7 @@ const ResultsPage = {
                                         <td>${c.quality?.overall?.toFixed(3) || '—'}</td>
                                         <td class="font-mono font-medium">${c.score != null ? c.score.toFixed(3) : '—'}</td>
                                         <td><span class="badge ${this.getStatusBadge(c.status)}">${c.status}</span></td>
-                                        <td><button class="btn btn-outline btn-sm cfg-detail-btn" data-cfg="${c.id}">Detail</button></td>
+                                        <td><button class="btn btn-outline btn-sm cfg-detail-btn" data-cfg="${c.id}" title="Show prompt, reasoning and model output for every test of this config">Debug</button></td>
                                     </tr>
                                     <tr class="cfg-detail-row hidden" data-cfg-row="${c.id}">
                                         <td colspan="14">
@@ -581,6 +647,10 @@ const ResultsPage = {
     getStatusBadge(status) {
         const badges = {
             'passed': 'badge-success',
+            'success': 'badge-success',
+            'completed': 'badge-success',
+            'completed_no_validated_winner': 'badge-warning',
+            'partial_success': 'badge-warning',
             'failed': 'badge-error',
             'load_failed': 'badge-error',
             'verify_failed': 'badge-error',
@@ -595,6 +665,489 @@ const ResultsPage = {
         return badges[status] || 'badge-gray';
     },
 
+    // ==================== JUDGE UI ====================
+
+    openJudgeModal() {
+        UI.openModal(this.renderJudgeModal(), '🤖 Ask Judge');
+        this.attachJudgeModalEvents();
+    },
+
+    renderJudgeModal() {
+        const models = this.state.availableModels || [];
+        const passedConfigs = this.state.configurations.filter(c => c.status === 'passed');
+        const selectedCount = document.querySelectorAll('.judge-config-checkbox:checked').length;
+        const totalPassed = passedConfigs.length;
+        const evaluateAll = selectedCount === 0;
+        
+        return `
+            <div class="space-y-4 max-h-[70vh] overflow-y-auto">
+                <div class="p-3 bg-blue-50 rounded border border-blue-200">
+                    <p class="text-sm text-blue-800">
+                        <strong>Evaluation scope:</strong> ${evaluateAll 
+                            ? `All ${totalPassed} passed configurations (no selection = evaluate all)` 
+                            : `${selectedCount} selected configuration(s) of ${totalPassed} passed`}
+                    </p>
+                    <p class="text-xs text-blue-700 mt-1">The judge will analyze speed, quality, stability and provide per-model winners, overall winner, task-specific guidance, and avoid-list.</p>
+                </div>
+
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">Use Case</label>
+                        <select id="judge-use-case" class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
+                            <option value="general">General (balanced)</option>
+                            <option value="coding">Coding</option>
+                            <option value="chat">Chat / Instruction Following</option>
+                            <option value="reasoning">Reasoning / Math</option>
+                            <option value="structured">Structured Output (JSON)</option>
+                            <option value="custom">Custom Prompt</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">Priority</label>
+                        <div class="flex gap-2">
+                            <label class="flex-1 flex items-center gap-1"><input type="radio" name="judge-priority" value="speed" class="mr-1"> Speed</label>
+                            <label class="flex-1 flex items-center gap-1"><input type="radio" name="judge-priority" value="quality" class="mr-1"> Quality</label>
+                            <label class="flex-1 flex items-center gap-1"><input type="radio" name="judge-priority" value="balanced" checked class="mr-1"> Balanced</label>
+                            <label class="flex-1 flex items-center gap-1"><input type="radio" name="judge-priority" value="context" class="mr-1"> Context</label>
+                        </div>
+                    </div>
+                </div>
+
+                <div id="judge-custom-prompt-container" class="hidden">
+                    <label class="block text-sm font-medium text-gray-700 mb-1">Custom Prompt</label>
+                    <textarea id="judge-custom-prompt" rows="3" class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500" placeholder="Describe your specific evaluation criteria..."></textarea>
+                </div>
+
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">Backend</label>
+                        <div class="flex gap-2">
+                            <label class="flex-1 flex items-center gap-1"><input type="radio" name="judge-backend" value="heuristic" checked class="mr-1"> Heuristic (fast, no AI)</label>
+                            <label class="flex-1 flex items-center gap-1"><input type="radio" name="judge-backend" value="local" class="mr-1"> Local (LM Studio)</label>
+                            <label class="flex-1 flex items-center gap-1"><input type="radio" name="judge-backend" value="api" class="mr-1"> API (OpenRouter)</label>
+                        </div>
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">Judge Model</label>
+                        <select id="judge-model-select" class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500">
+                            <option value="heuristic" selected>Heuristic (no model)</option>
+                            ${models.filter(m => !m.id.startsWith('text-embedding')).map(m => 
+                                `<option value="${m.id}">${m.id} (${m.size_gb?.toFixed(1) || '?'} GB)</option>`
+                            ).join('')}
+                        </select>
+                    </div>
+                </div>
+
+                <div id="judge-api-settings" class="hidden space-y-3">
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">API Base URL</label>
+                        <input type="text" id="judge-api-base" value="https://openrouter.ai/api/v1" class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500" placeholder="https://openrouter.ai/api/v1">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">API Key</label>
+                        <input type="password" id="judge-api-key" class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500" placeholder="sk-...">
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">Top-N Detail <span id="judge-top-n-label">3</span></label>
+                        <input type="range" id="judge-top-n" min="1" max="10" value="3" class="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-blue-600">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-1">Options</label>
+                        <div class="flex flex-col gap-2 mt-1">
+                            <label class="flex items-center gap-2"><input type="checkbox" id="judge-include-reasoning" checked> Include reasoning matrix (off/low/medium/high/xhigh)</label>
+                            <label class="flex items-center gap-2"><input type="checkbox" id="judge-fastest-context"> Fastest @ max context preset</label>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="flex justify-end gap-2 pt-4 border-t border-gray-200">
+                    <button type="button" class="btn btn-outline" onclick="UI.closeModal()">Cancel</button>
+                    <button type="button" id="run-judge-btn" class="btn btn-primary">
+                        <svg class="w-4 h-4 mr-1 animate-spin hidden" id="judge-spinner" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
+                        <span>Run Judge</span>
+                    </button>
+                </div>
+            </div>
+        `;
+    },
+
+    renderVerdictModal(verdict, metadata = {}) {
+        const confidence = verdict.confidence || 0;
+        const confidenceColor = confidence >= 0.8 ? 'text-green-600' : confidence >= 0.6 ? 'text-yellow-600' : 'text-red-600';
+        const confidenceLabel = confidence >= 0.8 ? 'High' : confidence >= 0.6 ? 'Medium' : 'Low';
+        
+        const formatTask = (task) => {
+            if (!task) return '<span class="text-gray-500">—</span>';
+            return `<strong>${task.winner || '—'}</strong> ${task.runner_up ? `<span class="text-gray-500 ml-1">(runner-up: ${task.runner_up})</span>` : ''} ${task.reasoning ? `<p class="text-xs text-gray-500 mt-1">${task.reasoning}</p>` : ''}`;
+        };
+
+        return `
+            <div class="space-y-4 max-h-[80vh] overflow-y-auto">
+                <div class="flex items-center justify-between">
+                    <h3 class="text-lg font-semibold">Judge Verdict</h3>
+                    <span class="px-2 py-1 rounded-full text-xs font-medium ${confidenceColor} bg-opacity-10">
+                        Confidence: ${(confidence * 100).toFixed(0)}% (${confidenceLabel})
+                    </span>
+                </div>
+
+                <div class="tabs tabs-border" id="verdict-tabs">
+                    <button class="tab active" data-verdict-tab="overall">Overall</button>
+                    <button class="tab" data-verdict-tab="per-model">Per-Model</button>
+                    <button class="tab" data-verdict-tab="by-task">By Task</button>
+                    <button class="tab" data-verdict-tab="avoid">Avoid</button>
+                    <button class="tab" data-verdict-tab="raw">Raw JSON</button>
+                </div>
+
+                <div id="verdict-tab-panels" class="space-y-4">
+                    <!-- Overall -->
+                    <div id="verdict-panel-overall" class="verdict-panel">
+                        <div class="card">
+                            <div class="card-header"><h4 class="font-semibold">Overall Winner</h4></div>
+                            <div class="card-body">
+                                ${verdict.overall_winner ? `
+                                    <p><strong>Model:</strong> ${verdict.overall_winner.model_id || '—'}</p>
+                                    <p><strong>Config:</strong> ${verdict.overall_winner.config_id || '—'}</p>
+                                    <p><strong>Reasoning:</strong> ${verdict.overall_winner.reasoning || '—'}</p>
+                                ` : '<p class="text-gray-500">No overall winner determined.</p>'}
+                            </div>
+                        </div>
+                        ${verdict.per_model_winner ? `
+                        <div class="card mt-4">
+                            <div class="card-header"><h4 class="font-semibold">Per-Model Winners</h4></div>
+                            <div class="card-body">
+                                <p><strong>Model:</strong> ${verdict.per_model_winner.model_id || '—'}</p>
+                                <p><strong>Config:</strong> ${verdict.per_model_winner.config_id || '—'}</p>
+                                <p><strong>Reasoning:</strong> ${verdict.per_model_winner.reasoning || '—'}</p>
+                            </div>
+                        </div>` : ''}
+                        <div class="card mt-4">
+                            <div class="card-header"><h4 class="font-semibold">Metadata</h4></div>
+                            <div class="card-body">
+                                <p><strong>Backend:</strong> ${metadata.backend || '—'}</p>
+                                <p><strong>Judge Model:</strong> ${metadata.judge_model || '—'}</p>
+                                <p><strong>Use Case:</strong> ${metadata.use_case || '—'}</p>
+                                <p><strong>Priority:</strong> ${metadata.priority || '—'}</p>
+                                <p><strong>Configs Evaluated:</strong> ${metadata.configs_evaluated || '—'}</p>
+                                <p><strong>Latency:</strong> ${metadata.latency_ms ? metadata.latency_ms + ' ms' : '—'}</p>
+                                <p><strong>Created:</strong> ${metadata.created_at || '—'}</p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Per-Model -->
+                    <div id="verdict-panel-per-model" class="verdict-panel hidden">
+                        ${verdict.per_model_winner ? `
+                        <div class="card">
+                            <div class="card-header"><h4 class="font-semibold">Per-Model Winner</h4></div>
+                            <div class="card-body">
+                                <p><strong>Model:</strong> ${verdict.per_model_winner.model_id || '—'}</p>
+                                <p><strong>Config:</strong> ${verdict.per_model_winner.config_id || '—'}</p>
+                                <p><strong>Reasoning:</strong> ${verdict.per_model_winner.reasoning || '—'}</p>
+                            </div>
+                        </div>` : '<p class="text-gray-500">No per-model winner data.</p>'}
+                    </div>
+
+                    <!-- By Task -->
+                    <div id="verdict-panel-by-task" class="verdict-panel hidden">
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            <div class="card"><div class="card-header"><h4 class="font-semibold">Coding</h4></div><div class="card-body">${formatTask(verdict.task_breakdown?.coding)}</div></div>
+                            <div class="card"><div class="card-header"><h4 class="font-semibold">Chat</h4></div><div class="card-body">${formatTask(verdict.task_breakdown?.chat)}</div></div>
+                            <div class="card"><div class="card-header"><h4 class="font-semibold">Reasoning</h4></div><div class="card-body">${formatTask(verdict.task_breakdown?.reasoning)}</div></div>
+                            <div class="card"><div class="card-header"><h4 class="font-semibold">Structured Output</h4></div><div class="card-body">${formatTask(verdict.task_breakdown?.structured)}</div></div>
+                        </div>
+                    </div>
+
+                    <!-- Avoid -->
+                    <div id="verdict-panel-avoid" class="verdict-panel hidden">
+                        <div class="card">
+                            <div class="card-header"><h4 class="font-semibold text-red-600">Models/Configs to Avoid</h4></div>
+                            <div class="card-body">
+                                ${(verdict.avoid || []).length ? `
+                                    <ul class="space-y-2">
+                                        ${(verdict.avoid || []).map(a => `
+                                            <li class="flex items-start gap-2 p-2 bg-red-50 rounded">
+                                                <svg class="w-5 h-5 text-red-500 flex-shrink-0 mt-0.5" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293a1 1 0 00-1.414 0z" clip-rule="evenodd"></path></svg>
+                                                <div>
+                                                    <p class="font-medium text-red-800">${a.model_id || '—'}</p>
+                                                    <p class="text-sm text-red-600">${a.reason || '—'}</p>
+                                                </div>
+                                            </li>`).join('')}
+                                    </ul>
+                                ` : '<p class="text-gray-500">No avoid recommendations.'}</p>
+                                ${(verdict.warnings || []).length ? `
+                                    <h5 class="font-medium mt-4 mb-2 text-amber-700">Warnings</h5>
+                                    <ul class="space-y-1">
+                                        ${(verdict.warnings || []).map(w => `<li class="text-sm text-amber-700 flex items-center gap-1"><svg class="w-4 h-4" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clip-rule="evenodd"></path></svg>${w}</li>`).join('')}
+                                    </ul>
+                                ` : ''}
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Raw JSON -->
+                    <div id="verdict-panel-raw" class="verdict-panel hidden">
+                        <div class="card">
+                            <div class="card-header flex justify-between">
+                                <h4 class="font-semibold">Raw Verdict JSON</h4>
+                                <button class="btn btn-outline btn-sm" onclick="navigator.clipboard.writeText(JSON.stringify(${JSON.stringify(verdict).replace(/"/g, '\\"')}, null, 2))">Copy JSON</button>
+                            </div>
+                            <div class="card-body">
+                                <pre class="font-mono text-xs bg-gray-50 p-4 rounded overflow-auto max-h-96">${JSON.stringify(verdict, null, 2)}</pre>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        `;
+    },
+
+    renderHistoryModal(history) {
+        return `
+            <div class="space-y-4 max-h-[70vh] overflow-y-auto">
+                <p class="text-sm text-gray-600">${history.length} recent judge evaluation(s). Click a row to view details.</p>
+                <div class="overflow-x-auto">
+                    <table class="table">
+                        <thead>
+                            <tr>
+                                <th>Created</th>
+                                <th>Use Case</th>
+                                <th>Backend</th>
+                                <th>Judge Model</th>
+                                <th>Confidence</th>
+                                <th>Overall Winner</th>
+                                <th>Status</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${history.map(h => `
+                                <tr class="cursor-pointer hover:bg-gray-50" data-history-id="${h.id}">
+                                    <td class="text-xs font-mono">${h.created_at || '—'}</td>
+                                    <td>${h.use_case || '—'}</td>
+                                    <td>${h.backend || '—'}</td>
+                                    <td class="font-mono text-xs">${h.judge_model || '—'}</td>
+                                    <td class="font-mono">${h.confidence != null ? (h.confidence * 100).toFixed(0) + '%' : '—'}</td>
+                                    <td class="font-mono text-xs">${h.overall_winner_model || '—'}</td>
+                                    <td><span class="badge ${h.status === 'completed' ? 'badge-success' : h.status === 'failed' ? 'badge-error' : 'badge-warning'}">${h.status || '—'}</span></td>
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>
+                </div>
+                ${history.length === 0 ? '<p class="text-center text-gray-500 py-8">No judge evaluations yet.</p>' : ''}
+            </div>
+        `;
+    },
+
+    async loadAvailableModels() {
+        try {
+            const resp = await fetch('/api/models');
+            if (resp.ok) {
+                const data = await resp.json();
+                this.state.availableModels = data.data || data;
+            }
+        } catch (e) {
+            console.warn('Failed to load models for judge modal:', e);
+            this.state.availableModels = [];
+        }
+    },
+
+    attachJudgeModalEvents() {
+        // Use case change
+        const useCaseSelect = document.getElementById('judge-use-case');
+        if (useCaseSelect) {
+            useCaseSelect.addEventListener('change', (e) => {
+                document.getElementById('judge-custom-prompt-container').classList.toggle('hidden', e.target.value !== 'custom');
+            });
+        }
+
+        // Backend change
+        document.querySelectorAll('input[name="judge-backend"]').forEach(radio => {
+            radio.addEventListener('change', (e) => {
+                const isApi = e.target.value === 'api';
+                document.getElementById('judge-api-settings').classList.toggle('hidden', !isApi);
+                const modelSelect = document.getElementById('judge-model-select');
+                if (isApi) {
+                    // For API, allow any model name
+                    modelSelect.disabled = false;
+                    if (modelSelect.value === 'heuristic') {
+                        modelSelect.value = 'anthropic/claude-3.5-sonnet';
+                    }
+                } else {
+                    modelSelect.disabled = false;
+                }
+            });
+        });
+
+        // Top-N slider
+        const topNSlider = document.getElementById('judge-top-n');
+        if (topNSlider) {
+            topNSlider.addEventListener('input', (e) => {
+                document.getElementById('judge-top-n-label').textContent = e.target.value;
+            });
+        }
+
+        // Run Judge button
+        const runBtn = document.getElementById('run-judge-btn');
+        if (runBtn) {
+            runBtn.addEventListener('click', () => this.runJudge());
+        }
+
+        // Verdict tabs
+        document.querySelectorAll('#verdict-tabs .tab').forEach(tab => {
+            tab.addEventListener('click', () => this.switchVerdictTab(tab.dataset.verdictTab));
+        });
+
+        // History table clicks
+        document.querySelectorAll('[data-history-id]').forEach(row => {
+            row.addEventListener('click', () => this.openVerdictModalFromHistory(row.dataset.historyId));
+        });
+    },
+
+    switchVerdictTab(tabName) {
+        document.querySelectorAll('#verdict-tabs .tab').forEach(t => {
+            t.classList.toggle('active', t.dataset.verdictTab === tabName);
+        });
+        document.querySelectorAll('.verdict-panel').forEach(p => {
+            p.classList.toggle('hidden', p.id !== `verdict-panel-${tabName}`);
+        });
+    },
+
+    async runJudge() {
+        const runBtn = document.getElementById('run-judge-btn');
+        const spinner = document.getElementById('judge-spinner');
+        const btnText = runBtn.querySelector('span');
+        
+        runBtn.disabled = true;
+        spinner.classList.remove('hidden');
+        btnText.textContent = 'Evaluating...';
+        UI.showToast('Judge evaluation started...', 'info');
+
+        const runIds = [this.state.runId];
+        const configIds = Array.from(document.querySelectorAll('.judge-config-checkbox:checked')).map(cb => cb.value);
+        const evaluateAll = configIds.length === 0;
+
+        try {
+            const request = {
+                run_ids: runIds,
+                config_ids: evaluateAll ? undefined : configIds,
+                use_case: document.getElementById('judge-use-case').value,
+                custom_prompt: document.getElementById('judge-use-case').value === 'custom' ? document.getElementById('judge-custom-prompt').value : null,
+                priority: document.querySelector('input[name="judge-priority"]:checked')?.value || 'balanced',
+                backend: document.querySelector('input[name="judge-backend"]:checked')?.value || 'heuristic',
+                judge_model: document.getElementById('judge-model-select').value,
+                api_key: document.getElementById('judge-api-key').value || null,
+                api_base: document.getElementById('judge-api-base').value || null,
+                top_n_detail: parseInt(document.getElementById('judge-top-n').value, 10),
+                include_reasoning_matrix: document.getElementById('judge-include-reasoning').checked,
+                fastest_context_preset: document.getElementById('judge-fastest-context').checked,
+                wait: false,
+            };
+
+            const resp = await fetch('/api/judge', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(request),
+            });
+
+            if (!resp.ok) {
+                const err = await resp.json();
+                throw new Error(err.detail || 'Judge request failed');
+            }
+
+            const data = await resp.json();
+            
+            if (request.wait || data.status === 'completed') {
+                UI.closeModal();
+                this.showVerdictModal(data.verdict, data);
+            } else {
+                // Poll for completion
+                this.pollJudgeResult(data.judge_id);
+            }
+        } catch (error) {
+            UI.showToast('Judge failed: ' + error.message, 'error');
+        } finally {
+            runBtn.disabled = false;
+            document.getElementById('judge-spinner').classList.add('hidden');
+            btnText.textContent = 'Run Judge';
+        }
+    },
+
+    async pollJudgeResult(judgeId) {
+        const poll = async () => {
+            try {
+                const resp = await fetch(`/api/judge/${judgeId}`);
+                if (!resp.ok) throw new Error('Poll failed');
+                const data = await resp.json();
+                
+                if (data.status === 'completed') {
+                    UI.closeModal();
+                    this.showVerdictModal(data.verdict, data);
+                    UI.showToast('Judge evaluation complete', 'success');
+                } else if (data.status === 'failed') {
+                    UI.showToast('Judge failed: ' + data.error_message, 'error');
+                } else {
+                    // Still pending, poll again in 2 seconds
+                    setTimeout(poll, 2000);
+                }
+            } catch (e) {
+                console.error('Poll error:', e);
+                setTimeout(poll, 5000);
+            }
+        };
+        setTimeout(poll, 2000);
+    },
+
+    showVerdictModal(verdict, metadata) {
+        UI.openModal(this.renderVerdictModal(verdict, metadata), '🤖 Judge Verdict');
+        // Attach verdict tab events
+        setTimeout(() => {
+            document.querySelectorAll('#verdict-tabs .tab').forEach(tab => {
+                tab.addEventListener('click', () => this.switchVerdictTab(tab.dataset.verdictTab));
+            });
+        }, 0);
+    },
+
+    async openJudgeHistory() {
+        try {
+            const resp = await fetch('/api/judge/history?limit=50');
+            if (!resp.ok) throw new Error('Failed to load history');
+            const history = await resp.json();
+            UI.openModal(this.renderHistoryModal(history), '📜 Judge History');
+            // Attach click events for history rows
+            setTimeout(() => {
+                document.querySelectorAll('[data-history-id]').forEach(row => {
+                    row.addEventListener('click', () => this.openVerdictModalFromHistory(row.dataset.historyId));
+                });
+            }, 0);
+        } catch (e) {
+            UI.showToast('Failed to load judge history: ' + e.message, 'error');
+        }
+    },
+
+    async openVerdictModalFromHistory(judgeId) {
+        try {
+            const resp = await fetch(`/api/judge/${judgeId}`);
+            if (!resp.ok) throw new Error('Failed to load verdict');
+            const data = await resp.json();
+            UI.closeModal();
+            this.showVerdictModal(data.verdict, data);
+        } catch (e) {
+            UI.showToast('Failed to load verdict: ' + e.message, 'error');
+        }
+    },
+
+    switchVerdictTab(tabName) {
+        document.querySelectorAll('#verdict-tabs .tab').forEach(t => {
+            t.classList.toggle('active', t.dataset.verdictTab === tabName);
+        });
+        document.querySelectorAll('.verdict-panel').forEach(p => {
+            p.classList.toggle('hidden', p.id !== `verdict-panel-${tabName}`);
+        });
+    },
+
     attachEvents() {
         // Tab switching
         document.querySelectorAll('#results-tabs .tab').forEach(tab => {
@@ -606,10 +1159,75 @@ const ResultsPage = {
             btn.addEventListener('click', () => this.switchChart(btn.dataset.chart));
         });
 
+        // Judge: always available; empty selection means "evaluate all".
+        const askJudgeBtn = document.getElementById('ask-judge-btn');
+        if (askJudgeBtn) {
+            askJudgeBtn.addEventListener('click', () => this.openJudgeModal());
+        }
+
+        // Pause/Resume buttons
+        const pauseBtn = document.getElementById('pause-run-btn');
+        if (pauseBtn) {
+            pauseBtn.addEventListener('click', () => this.pauseRun());
+        }
+        const resumeBtn = document.getElementById('resume-run-btn');
+        if (resumeBtn) {
+            resumeBtn.addEventListener('click', () => this.resumeRun());
+        }
+
         // Apply best config
         const applyBtn = document.getElementById('apply-best-btn');
         if (applyBtn) {
             applyBtn.addEventListener('click', () => this.applyBestConfig());
+        }
+
+        // Save a reusable load-config JSON (LM Studio / vLLM)
+        const saveCfgBtn = document.getElementById('save-lmstudio-config-btn');
+        if (saveCfgBtn) {
+            saveCfgBtn.addEventListener('click', async () => {
+                try {
+                    const data = await API.exportLmStudioConfig(this.state.runId);
+                    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+                    const a = document.createElement('a');
+                    a.href = URL.createObjectURL(blob);
+                    a.download = `${(this.state.run.model.id || 'model').replace(/[^\w.-]+/g, '-')}-lmstudio-config.json`;
+                    a.click();
+                    URL.revokeObjectURL(a.href);
+                    UI.showToast('Config exported: llama.cpp values for My Models, vLLM engine-config included', 'success');
+                } catch (err) {
+                    UI.showToast((err && err.message) || 'Export failed', 'error');
+                }
+            });
+        }
+
+        // Persist the winner into LM Studio's per-model defaults.
+        const saveDefaultBtn = document.getElementById('save-default-btn');
+        if (saveDefaultBtn) {
+            saveDefaultBtn.addEventListener('click', () => this.saveLmStudioDefault());
+        }
+
+        // Load with exact winning config (applies exact best config, not defaults)
+        const loadExactBtn = document.getElementById('load-exact-btn');
+        if (loadExactBtn) {
+            loadExactBtn.addEventListener('click', async () => {
+                const bestConfig = this.state.run?.best_config;
+                if (!bestConfig || !this.state.run) {
+                    UI.showToast('No winning config to apply', 'error');
+                    return;
+                }
+                UI.showLoading('Applying exact winning config...');
+                try {
+                    await API.applyConfiguration({
+                        model_id: this.state.run.model?.id || '',
+                        config: bestConfig,
+                    });
+                    UI.hideLoading();
+                    UI.showToast('Exact winning config applied successfully', 'success');
+                } catch (err) {
+                    UI.hideLoading();
+                    UI.showToast(err.message || 'Failed to apply exact config', 'error');
+                }
+            });
         }
 
         // Export
@@ -663,10 +1281,6 @@ const ResultsPage = {
             });
         });
 
-        // Lazy full per-test output + quality
-        document.querySelectorAll('.cfg-full-output-btn').forEach(btn => {
-            btn.addEventListener('click', () => this.loadFullOutput(btn));
-        });
     },
 
     async loadGenerationProfiles() {
@@ -887,6 +1501,62 @@ const ResultsPage = {
         }
     },
 
+    async saveLmStudioDefault() {
+        const run = this.state.run;
+        if (!run || !run.best_config_id) return;
+
+        // Fetch diff before confirming so the user sees changes.
+        let diffNote = '';
+        try {
+            const d = await API.getDefaultDiff(this.state.runId);
+            const changes = d.changes || [];
+            diffNote = changes.length ? ('\n\nChanges: ' + changes.length + ' field(s) would change.') : '\n\nAlready up to date (no changes).';
+        } catch (e) {
+            diffNote = '\n\n(Diff unavailable)';
+        }
+
+        const ok = window.confirm(
+            'Save this run\'s winning configuration as the LM Studio default for '
+            + run.model.id + '?' + diffNote + '\n\n'
+            + 'This writes LM Studio\'s per-model defaults file. The previous file '
+            + 'is backed up next to it. The next load uses the new values; '
+            + 'LM Studio does not need a restart.'
+        );
+        if (!ok) return;
+
+        UI.showLoading('Saving LM Studio default...');
+        try {
+            const result = await API.saveLmStudioDefault(this.state.runId);
+            UI.hideLoading();
+            const rows = Object.entries(result.fields || {})
+                .map(([key, value]) => (
+                    '<tr><td class="font-mono text-xs">' + escapeHtml(key) + '</td>'
+                    + '<td class="text-right font-mono text-xs">'
+                    + escapeHtml(JSON.stringify(value)) + '</td></tr>'
+                ))
+                .join('');
+            UI.openModal(
+                '<p class="text-sm">Saved to <span class="font-mono text-xs">'
+                + escapeHtml(result.path) + '</span></p>'
+                + (result.backup_path
+                    ? '<p class="text-xs text-gray-500 mt-1">Backup: <span class="font-mono">'
+                      + escapeHtml(result.backup_path) + '</span></p>'
+                    : '')
+                + '<p class="text-xs text-gray-500 mt-1">Applied on the next load; '
+                + 'no LM Studio restart needed.</p>'
+                + '<div class="overflow-auto max-h-[45vh] mt-3">'
+                + '<table class="table text-sm"><thead><tr><th>Key</th>'
+                + '<th class="text-right">Value</th></tr></thead><tbody>'
+                + rows + '</tbody></table></div>',
+                'LM Studio default saved'
+            );
+            UI.showToast('Saved as LM Studio default', 'success');
+        } catch (error) {
+            UI.hideLoading();
+            UI.showToast(error.message || 'Failed to save LM Studio default', 'error');
+        }
+    },
+
     async exportResults() {
         try {
             const blob = await API.exportRun(this.state.runId, 'json');
@@ -899,6 +1569,40 @@ const ResultsPage = {
             UI.showToast('Results exported', 'success');
         } catch (error) {
             UI.showToast('Export failed', 'error');
+        }
+    },
+
+    async pauseRun() {
+        const btn = document.getElementById('pause-run-btn');
+        if (btn) btn.disabled = true;
+        UI.showLoading('Requesting pause...');
+        try {
+            const result = await API.pauseRun(this.state.runId);
+            UI.hideLoading();
+            UI.showToast(result.message || 'Pause requested — will take effect at next safe boundary', 'success');
+            // Reload run to show updated status
+            setTimeout(() => window.location.reload(), 1000);
+        } catch (error) {
+            UI.hideLoading();
+            UI.showToast(error.message || 'Pause failed', 'error');
+            if (btn) btn.disabled = false;
+        }
+    },
+
+    async resumeRun() {
+        const btn = document.getElementById('resume-run-btn');
+        if (btn) btn.disabled = true;
+        UI.showLoading('Resuming from checkpoint...');
+        try {
+            const result = await API.resumeRunFromCheckpoint(this.state.runId);
+            UI.hideLoading();
+            UI.showToast(`Resumed — ${result.completed || 0} configurations already completed`, 'success');
+            // Reload to show live progress
+            setTimeout(() => window.location.reload(), 1500);
+        } catch (error) {
+            UI.hideLoading();
+            UI.showToast(error.message || 'Resume failed', 'error');
+            if (btn) btn.disabled = false;
         }
     },
 

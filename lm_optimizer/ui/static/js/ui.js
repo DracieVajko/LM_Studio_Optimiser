@@ -41,7 +41,7 @@ export const UI = {
     },
 
     // Dashboard Rendering
-    renderDashboard(status, modelsResponse) {
+    renderDashboard(status, modelsResponse, stats) {
         const models = modelsResponse.models || [];
         const hardware = status.hardware || {};
         const connected = !!(status.lm_studio && status.lm_studio.connected);
@@ -78,7 +78,7 @@ export const UI = {
 
                 <!-- Quick Stats -->
                 <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
-                    ${this.renderQuickStats(models)}
+                    ${this.renderQuickStats(stats, models)}
                 </div>
             </div>
         `;
@@ -188,8 +188,7 @@ export const UI = {
                     <label class="form-label flex items-center justify-between">
                         Model <span class="text-xs text-red-500">*required — select one</span>
                     </label>
-                    <input type="text" id="model-search" placeholder="Search models..." class="form-input mb-2" oninput="UI.filterModels(this.value)">
-                    <select id="model-select" class="form-input form-select" required size="6" style="height:auto; min-height: 140px;">
+                    <select id="model-select" class="form-input form-select" required>
                         <option value="" disabled selected>— Choose a model —</option>
                         ${modelOptions}
                     </select>
@@ -205,19 +204,22 @@ export const UI = {
                         ${this.renderProfileOption('balanced', 'Balanced', 'Best compromise: speed, context, memory, correctness', '⚖️', true)}
                         ${this.renderProfileOption('context', 'Context', 'Maximize stable context (25% weight)', '📏')}
                         ${this.renderProfileOption('quality', 'Quality', 'Prioritize correctness (0.99) & stability', '✨')}
-                        ${this.renderProfileOption('custom', 'Custom', 'Edit weights manually (must total 100%)', '🎛️')}
+                        ${this.renderProfileOption('custom', 'Custom', 'Set your own priorities (0.00-1.00, auto-normalized)', '🎛️')}
                     </div>
                     <div id="custom-weights" class="hidden mt-4 p-4 bg-gray-50 rounded-lg border">
-                        <p class="text-sm font-medium mb-2">Custom Weights (must total 100%)</p>
-                        <div class="grid grid-cols-2 md:grid-cols-3 gap-3 text-sm">
-                            <label>Generation speed <input type="number" id="w-gen" value="30" min="0" max="100" class="form-input w-full">%</label>
-                            <label>Prompt speed <input type="number" id="w-prompt" value="10" min="0" max="100" class="form-input w-full">%</label>
-                            <label>Context <input type="number" id="w-ctx" value="20" min="0" max="100" class="form-input w-full">%</label>
-                            <label>Memory <input type="number" id="w-mem" value="10" min="0" max="100" class="form-input w-full">%</label>
-                            <label>Correctness <input type="number" id="w-qual" value="20" min="0" max="100" class="form-input w-full">%</label>
-                            <label>Stability <input type="number" id="w-stab" value="10" min="0" max="100" class="form-input w-full">%</label>
+                        <p class="text-sm font-medium mb-1">Custom priorities (0.00 – 1.00)</p>
+                        <p class="text-xs text-gray-500 mb-3">Relative importance only — values are normalized automatically. Hard targets live in Quality threshold and Minimum speed below.</p>
+                        <div class="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
+                            <label title="Weight for measured generation speed">Generation speed <input type="number" id="w-gen" value="0.25" min="0" max="1" step="0.05" class="form-input w-full"></label>
+                            <label title="Weight for prompt-processing speed">Prompt speed <input type="number" id="w-prompt" value="0.10" min="0" max="1" step="0.05" class="form-input w-full"></label>
+                            <label title="Weight for time-to-first-token">TTFT <input type="number" id="w-ttft" value="0.10" min="0" max="1" step="0.05" class="form-input w-full"></label>
+                            <label title="Weight for usable context length">Context <input type="number" id="w-ctx" value="0.15" min="0" max="1" step="0.05" class="form-input w-full"></label>
+                            <label title="Weight for memory efficiency (VRAM/RAM)">Memory <input type="number" id="w-mem" value="0.10" min="0" max="1" step="0.05" class="form-input w-full"></label>
+                            <label title="Weight for correctness/quality evidence">Correctness <input type="number" id="w-qual" value="0.20" min="0" max="1" step="0.05" class="form-input w-full"></label>
+                            <label title="Weight for measurement stability">Stability <input type="number" id="w-stab" value="0.10" min="0" max="1" step="0.05" class="form-input w-full"></label>
+                            <label title="Hard floor: configs slower than this cannot win">Min speed (tok/s) <input type="number" id="min-generation-tok-s" value="2.0" min="0" step="0.1" class="form-input w-full"></label>
                         </div>
-                        <div id="weights-total" class="text-xs mt-2 text-gray-500">Total: 100% ✓</div>
+                        <div id="weights-total" class="text-xs mt-2 text-gray-500">Share: normalized automatically</div>
                     </div>
                 </div>
 
@@ -273,17 +275,6 @@ export const UI = {
         `;
     },
 
-    filterModels(query) {
-        const sel = document.getElementById('model-select');
-        if (!sel) return;
-        const q = query.toLowerCase();
-        for (const opt of sel.options) {
-            if (!opt.value) continue;
-            const txt = opt.textContent.toLowerCase();
-            opt.hidden = q && !txt.includes(q);
-        }
-    },
-
     updateModelMeta(modelId, models) {
         const meta = document.getElementById('model-meta');
         const btn = document.getElementById('start-optimization');
@@ -332,6 +323,8 @@ export const UI = {
                         Quality: full 5-test suite on finalists only, then bounded recovery<br>
                         Validation: adaptive (2–5 reps by stability)<br>
                         Phase B max-context: ${advanced.optimize_context ? 'ON (opt-in)' : 'OFF'}<br>
+                        ${(advanced.skip_phases && advanced.skip_phases.length)
+                            ? `Skipped phases: ${advanced.skip_phases.join(', ')}<br>` : ''}
                     </div>
                     <div><span class="text-gray-500">Estimated probes</span><br><span class="font-mono font-medium">${est}</span></div>
                     <div><span class="text-gray-500">Speed repetitions</span> adaptive by model speed &nbsp; <span class="text-gray-500">Validation</span> 2–5</div>
@@ -407,26 +400,82 @@ export const UI = {
                     <label for="auto-batch">Auto optimize eval batch size (64-1024)</label>
                 </div>
 
+                <div>
+                    <label class="form-label">Warmup suite passes per config (0-5, 0 = fastest)</label>
+                    <input type="number" id="warmup-runs" value="1" class="form-input" min="0" max="5">
+                </div>
+
                 <div class="form-checkbox">
                     <input type="checkbox" id="optimize-context" class="form-checkbox-input advanced-toggle">
                     <label for="optimize-context">Optimize Maximum Context (Phase B, optional — runs after the runtime winner is final, runtime settings stay frozen)</label>
+                </div>
+
+                <div>
+                    <label class="form-label">Skip phases (unchecked phases run normally)</label>
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mt-2">
+                        <div class="form-checkbox">
+                            <input type="checkbox" id="skip-speed" class="form-checkbox-input">
+                            <label for="skip-speed">Skip SPEED discovery</label>
+                        </div>
+                        <div class="form-checkbox">
+                            <input type="checkbox" id="skip-quality" class="form-checkbox-input">
+                            <label for="skip-quality">Skip QUALITY suites (no winner path)</label>
+                        </div>
+                        <div class="form-checkbox">
+                            <input type="checkbox" id="skip-recovery" class="form-checkbox-input">
+                            <label for="skip-recovery">Skip RECOVERY rollback</label>
+                        </div>
+                        <div class="form-checkbox">
+                            <input type="checkbox" id="skip-validation" class="form-checkbox-input">
+                            <label for="skip-validation">Skip FINAL VALIDATION</label>
+                        </div>
+                        <div class="form-checkbox">
+                            <input type="checkbox" id="skip-context" class="form-checkbox-input">
+                            <label for="skip-context">Skip CONTEXT phase (Phase B off)</label>
+                        </div>
+                    </div>
                 </div>
             </div>
         `;
     },
 
-    renderQuickStats(models) {
-        const stats = [
-            { label: 'Models Available', value: models.length, icon: '📦' },
-            { label: 'Optimized', value: 0, icon: '⚡' }, // Would come from presets
-            { label: 'Runs Today', value: 0, icon: '📊' },
+    renderQuickStats(stats, models) {
+        const s = stats || {};
+        // Fall back to the models list only if the stats endpoint failed.
+        const modelsAvailable = (s.models_available !== undefined && s.models_available !== null)
+            ? s.models_available
+            : (models ? models.length : 0);
+        const inventoryError = s.inventory_ok === false;
+        const stats2 = [
+            {
+                label: 'Models Available',
+                value: inventoryError ? '!' : modelsAvailable,
+                icon: '📦',
+                hint: inventoryError
+                    ? `Inventory error: ${s.inventory_error || 'provider unreachable'}`
+                    : `${s.models_embedding_only || 0} embedding-only excluded`,
+                warn: inventoryError,
+            },
+            {
+                label: 'Optimized',
+                value: s.optimized_models ?? 0,
+                icon: '⚡',
+                hint: 'Distinct models with a validated best configuration',
+            },
+            {
+                label: 'Runs Today',
+                value: s.runs_today ?? 0,
+                icon: '📊',
+                hint: `${s.total_runs ?? 0} runs total (local day boundary)`,
+            },
         ];
 
-        return stats.map(s => `
-            <div class="card p-6 text-center">
+        return stats2.map(s => `
+            <div class="card p-6 text-center" title="${s.hint}">
                 <div class="text-4xl mb-2">${s.icon}</div>
-                <div class="text-3xl font-bold text-gray-900">${s.value}</div>
+                <div class="text-3xl font-bold ${s.warn ? 'text-red-600' : 'text-gray-900'}">${s.value}</div>
                 <div class="text-sm text-gray-500">${s.label}</div>
+                <div class="text-xs text-gray-400 mt-1">${s.hint}</div>
             </div>
         `).join('');
     },
@@ -499,6 +548,7 @@ export const UI = {
             'success': 'badge-success',
             'passed': 'badge-success',
             'partial_success': 'badge-warning',
+            'completed_no_validated_winner': 'badge-warning',
             'running': 'badge-warning',
             'resumed': 'badge-warning',
             'paused': 'badge-info',

@@ -60,7 +60,15 @@ class OptimizationPhase(str, Enum):
 class RunStatus(str, Enum):
     """Optimization run status.
 
-    SUCCESS/PARTIAL_SUCCESS/FAILED are terminal success-class states.
+    SUCCESS: a validated winning configuration was found; individual other
+    candidate failures never downgrade the run.
+    COMPLETED_NO_WINNER: the campaign completed and the model generated usable
+    output, but no configuration passed the configured quality threshold. It is
+    an honest terminal state (not a failure, not a validated winner).
+    PARTIAL_SUCCESS: legacy/transitional — an incomplete campaign that kept
+    useful validated results. New completed runs no longer use it for mere
+    candidate failures (that is SUCCESS).
+    FAILED: genuine run-level failure (model never loaded, no usable output).
     CANCELLED/INTERRUPTED are terminal interruption states.
     RESUMED marks a run that was restored from a checkpoint and is running.
     COMPLETED is kept as a legacy alias of SUCCESS.
@@ -72,6 +80,7 @@ class RunStatus(str, Enum):
     COMPLETED = "completed"
     SUCCESS = "success"
     PARTIAL_SUCCESS = "partial_success"
+    COMPLETED_NO_WINNER = "completed_no_validated_winner"
     FAILED = "failed"
     CANCELLED = "cancelled"
     INTERRUPTED = "interrupted"
@@ -80,7 +89,25 @@ class RunStatus(str, Enum):
 
 # Terminal success-class states (winner may exist).
 SUCCESS_STATES: frozenset = frozenset(
-    {RunStatus.COMPLETED, RunStatus.SUCCESS, RunStatus.PARTIAL_SUCCESS}
+    {
+        RunStatus.COMPLETED,
+        RunStatus.SUCCESS,
+        RunStatus.PARTIAL_SUCCESS,
+        RunStatus.COMPLETED_NO_WINNER,
+    }
+)
+
+# Terminal states that mark a finished campaign (nothing left to run).
+TERMINAL_STATES: frozenset = frozenset(
+    {
+        RunStatus.COMPLETED,
+        RunStatus.SUCCESS,
+        RunStatus.PARTIAL_SUCCESS,
+        RunStatus.COMPLETED_NO_WINNER,
+        RunStatus.FAILED,
+        RunStatus.CANCELLED,
+        RunStatus.INTERRUPTED,
+    }
 )
 
 
@@ -167,6 +194,15 @@ class ModelIdentity:
     is_moe: bool = False
     num_experts: int | None = None
     size_bytes: int | None = None
+    # Provider-declared model type ("llm", "embedding", "reranker", ...).
+    # None when the backend does not report it; eligibility then falls back to
+    # architecture/name signals and stays conservative.
+    model_type: str | None = None
+    # LM Studio key (publisher/model) - distinct from id when variants exist.
+    # e.g. id="swift-qwen3.8-27b@q3_k_m", key="swift-qwen3.8-27b"
+    key: str | None = None
+    # Selected variant from LM Studio (e.g. "swift-qwen3.8-27b@q3_k_m")
+    selected_variant: str | None = None
 
     def __hash__(self):
         return hash(self.id)
@@ -265,6 +301,16 @@ class LMStudioCapabilities:
     supports_context_checkpoints: bool = True
     supports_num_experts: bool = False
     supports_rope_scaling: bool = False
+    # Speculative decoding / MTP (probed 2026-10-21: all five keys are
+    # recognized by the live REST v1 API).
+    supports_speculative_draft: bool = False
+    supports_speculative_mtp: bool = False
+    # Runtime-only facts on this build: KV cache quantization, CPU threads,
+    # mmap and keep-in-memory are NOT settable through REST (400
+    # unrecognized_keys in every spelling tried). They are observed, never
+    # searched - see lm_optimizer/services/lm_studio_capabilities.py.
+    supports_cpu_threads: bool = False
+    supports_mmap: bool = False
     load_parameters: list[str] = field(default_factory=list)
 
     def get_supported_load_params(self) -> list[str]:
@@ -292,7 +338,18 @@ class LMStudioCapabilities:
             params.append("num_experts")
         if self.supports_rope_scaling:
             params.extend(["rope_freq_base", "rope_freq_scale"])
-        for extra in ("reasoning_budget_message", "speculative_draft_max_tokens"):
+        if self.supports_speculative_draft:
+            params.extend(
+                [
+                    "speculative_draft_max_tokens",
+                    "speculative_draft_min_tokens",
+                    "speculative_draft_min_continue_probability",
+                ]
+            )
+        if self.supports_speculative_mtp:
+            params.append("speculative_draft_mtp")
+        for extra in ("reasoning_budget_message", "speculative_draft_simple",
+                      "speculative_draft_model"):
             if extra in (self.load_parameters or []) and extra not in params:
                 params.append(extra)
         return params
@@ -326,6 +383,24 @@ class BenchmarkMetrics:
     thinking_text: str = ""
     # The exact prompt sent (for per-test Prompt/Thinking/Output display).
     prompt: str = ""
+
+    # MTP / Speculative Decoding metrics (P0)
+    # Only populated when speculative decoding / MTP is active and server
+    # exposes the statistics. Remain None/0 when not applicable.
+    draft_tokens_proposed: int = 0
+    draft_tokens_accepted: int = 0
+    acceptance_rate: float = 0.0
+    speedup_ratio: float = 1.0
+    draft_vram_delta_mb: float = 0.0
+    draft_ram_delta_mb: float = 0.0
+    draft_ttft_delta_ms: float = 0.0
+
+    # Thermal / power (spec §11.4, §17.2). None means unavailable.
+    gpu_temp_c: float | None = None
+    gpu_util_pct: float | None = None
+    gpu_power_w: float | None = None
+    on_ac: bool | None = None
+    thermal_flag: str = ""
 
     @property
     def ttft_ms(self) -> float:
@@ -465,7 +540,7 @@ class OptimizationRun:
     completed_at: datetime | None = None
     duration_seconds: float = 0.0
     error: str | None = None
-    optimizer_version: str = "1.5.0b1"
+    optimizer_version: str = "1.8.0"
     benchmark_repetitions: int = 3
     validation_repetitions: int = 5
     # Phase A/B strategy fields (all defaulted; legacy runs ignore them).
@@ -475,6 +550,41 @@ class OptimizationRun:
     raw_fastest_config_id: UUID | None = None
     phase_b_enabled: bool = False
     phase_b_result: dict | None = None
+    advanced_settings: dict = field(default_factory=dict)
+
+    # --- Speed floor (spec §3) ---
+    min_generation_tok_s: float = 2.0
+    enforce_min_generation_speed: bool = True
+
+    # --- Preset and stage selection (spec §2, §7) ---
+    run_preset: str = "standard"  # quick, standard, thorough, custom
+    selected_stages: list[str] = field(default_factory=list)
+    max_speed_probes: int | None = None
+    max_finalists: int | None = None
+    benchmark_repetitions_override: int | None = None
+    validation_repetitions_min: int = 2
+    validation_repetitions_max: int = 5
+    recovery_budget: int = 3
+
+    # --- Context strategies (spec §5) ---
+    context_strategy_modes: list[str] = field(default_factory=list)
+
+    # --- Final sandbox (spec §6) ---
+    final_sandbox_mode: str = "off"  # off, one, all, custom
+    final_sandbox_preset_ids: list[str] = field(default_factory=list)
+    final_sandbox_custom_prompts: list[dict] = field(default_factory=list)
+    sandbox_compare_baseline: bool = False
+
+    # --- Scheduled artifact test (fourth option, runs last on the winner) ---
+    artifact_test_id: str | None = None  # builtin task id or "custom:<path>"
+
+    # --- Resolved preset budgets (frozen at run start, for reporting) ---
+    resolved_preset: dict | None = None
+
+    # Explicit reason when a terminal run produced no eligible winner
+    # (e.g. NO_CONFIG_MEETS_SPEED_FLOOR). None means "a winner exists or
+    # the run failed for another reason recorded in `error`".
+    no_winner_reason: str | None = None
 
     def get_best_config(self) -> ConfigurationResult | None:
         if self.best_config_id:

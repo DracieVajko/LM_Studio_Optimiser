@@ -62,6 +62,7 @@ class OllamaMetrics:
     prompt_eval_count: int = 0
     total_duration_ns: int = 0
     done_reason: str | None = None
+    thinking: str = ""
     raw: dict = field(default_factory=dict)
 
     @property
@@ -107,6 +108,7 @@ class OllamaClient:
         self._capabilities: OllamaCapabilities | None = None
         self._connected = False
         self._models_cache: list[ModelIdentity] = []
+        self._running_models: set[str] = set()
 
     async def __aenter__(self) -> "OllamaClient":
         await self.connect()
@@ -143,8 +145,12 @@ class OllamaClient:
             raise RuntimeError("Capabilities not detected. Call connect() first.")
         return self._capabilities
 
-    async def connect(self) -> None:
-        """Establish connection and detect capabilities (idempotent)."""
+    async def connect(self, echo_probe: bool = True) -> None:
+        """Establish connection and detect capabilities (idempotent).
+
+        `echo_probe` is accepted for BackendClient signature parity
+        (LM Studio probes with a real load); Ollama needs no echo load.
+        """
         if self._connected and self._client is not None:
             return
         self._ensure_client()
@@ -230,7 +236,30 @@ class OllamaClient:
             )
 
         self._models_cache = models
+        try:
+            await self.refresh_running_models()
+        except Exception:
+            logger.debug("Ollama /api/ps refresh failed; Loaded column may be stale")
         return models
+
+    async def refresh_running_models(self) -> set[str]:
+        """Refresh the in-memory set of currently loaded models via /api/ps."""
+        try:
+            ps = await self._request_with_retry("GET", "/api/ps")
+            payload = ps.json()
+            items = payload.get("models", []) if isinstance(payload, dict) else []
+            self._running_models = {
+                str(m.get("name") or m.get("model", ""))
+                for m in items
+                if isinstance(m, dict)
+            }
+        except Exception:
+            self._running_models = set()
+        return self._running_models
+
+    def get_loaded_model(self, model_id: str) -> str | None:
+        """Loaded-model lookup for CLI parity (reads the /api/ps snapshot)."""
+        return model_id if model_id in self._running_models else None
 
     async def get_model(self, model_id: str) -> ModelIdentity | None:
         """Get specific model information."""
@@ -264,13 +293,25 @@ class OllamaClient:
         return {"success": True, "model": model_id}
 
     async def generate(
-        self, model_id: str, prompt: str, options: dict | None = None
+        self, model_id: str, prompt: str, options: dict | None = None,
+        think: bool = False,
     ) -> OllamaMetrics:
-        """Generate via ``POST /api/generate`` (stream=false), metrics normalized."""
+        """Generate via ``POST /api/generate`` (stream=false), metrics normalized.
+
+        Thinking is OFF by default (benchmark parity with the LM Studio
+        reasoning-off path): reasoning models otherwise spend the whole
+        token budget in ``thinking`` and return an empty ``response``.
+
+        Exception: gpt-oss models REQUIRE reasoning (their output flows
+        through the reasoning channel, so ``think=False`` yields empty
+        text). Pass ``think=True`` (or ``"low"``/``"medium"``/``"high"``)
+        explicitly for that family. Verified live 2026-10-09.
+        """
         body: dict = {
             "model": model_id,
             "prompt": prompt,
             "stream": False,
+            "think": think,
             "options": dict(options or {}),
         }
         response = await self._request_with_retry(
@@ -292,6 +333,7 @@ class OllamaClient:
             prompt_eval_count=prompt_count,
             total_duration_ns=int(data.get("total_duration") or 0),
             done_reason=data.get("done_reason"),
+            thinking=str(data.get("thinking") or ""),
             raw=data,
         )
 
@@ -368,3 +410,60 @@ class OllamaClient:
             return True
         except Exception:
             return False
+
+    # --- Benchmark/optimizer parity (thin adapters, no logic change) ---
+
+    async def ensure_unloaded(self, model_id: str) -> bool:
+        """Unload a model and verify it is really gone (delegates to unload)."""
+        return await self.unload(model_id)
+
+    async def chat_completion(
+        self,
+        model: str,
+        input_text: str,
+        temperature: float = 0.7,
+        max_output_tokens: int = 512,
+        top_p: float | None = None,
+        top_k: int | None = None,
+        min_p: float | None = None,
+        presence_penalty: float | None = None,
+        reasoning: str | None = None,
+    ) -> dict:
+        """OpenAI-shaped completion over ``POST /api/generate``.
+
+        Parameter mapping: ``max_output_tokens`` → ``num_predict``;
+        sampling keys pass through as options; ``presence_penalty`` maps
+        to the closest analog ``repeat_penalty`` (documented approximation:
+        Ollama has no presence penalty); ``reasoning="off"``/None disables
+        thinking, any other value enables it (gpt-oss REQUIRES reasoning —
+        its output flows through the thinking channel).
+
+        Returns ``{"usage", "choices": [{"message": {"content"}}],
+        "_stats", "thinking_text"}`` matching what
+        ``BenchmarkService._extract_response`` consumes.
+        """
+        options: dict = {"num_predict": max_output_tokens, "temperature": temperature}
+        for key, value in (
+            ("top_p", top_p),
+            ("top_k", top_k),
+            ("min_p", min_p),
+            ("repeat_penalty", presence_penalty),
+        ):
+            if value is not None:
+                options[key] = value
+        think = reasoning is not None and str(reasoning).lower() != "off"
+        metrics = await self.generate(model, input_text, options=options, think=think)
+        return {
+            "usage": {
+                "prompt_tokens": metrics.prompt_eval_count,
+                "completion_tokens": metrics.eval_count,
+            },
+            "choices": [{"message": {"content": metrics.text}}],
+            "_stats": {
+                "gen_tok_s": metrics.gen_tok_s,
+                "prompt_tok_s": metrics.prompt_tok_s,
+                "load_ms": metrics.load_ms,
+                "done_reason": metrics.done_reason,
+            },
+            "thinking_text": metrics.thinking,
+        }

@@ -77,6 +77,16 @@ export const API = {
         return this.request('/models');
     },
 
+    // Dashboard quick-stats (documented meanings, server-computed).
+    async getStats() {
+        return this.request('/stats');
+    },
+
+    // Preview/apply stale-running reconciliation.
+    async reconcileRuns(apply = false) {
+        return this.request(`/runs/reconcile${apply ? '?apply=true' : ''}`, { method: 'POST' });
+    },
+
     async getModel(modelId) {
         return this.request(`/models/${modelId}`);
     },
@@ -95,6 +105,15 @@ export const API = {
 
     async resumeOptimization(runId) {
         return this.request(`/optimize/${runId}/resume`, { method: 'POST' });
+    },
+
+    // New pause/resume for any run (not just current optimizer)
+    async pauseRun(runId) {
+        return this.request(`/runs/${runId}/pause`, { method: 'POST' });
+    },
+
+    async resumeRunFromCheckpoint(runId) {
+        return this.request(`/runs/${runId}/resume`, { method: 'POST' });
     },
 
     async cancelOptimization(runId) {
@@ -155,6 +174,26 @@ export const API = {
         } finally {
             clearTimeout(timer);
         }
+    },
+
+    async judge(request) {
+        return this.request('/judge', {
+            method: 'POST',
+            body: JSON.stringify(request),
+        });
+    },
+
+    async exportLmStudioConfig(runId) {
+        return this.request(`/runs/${runId}/export-config`);
+    },
+
+    async getDefaultDiff(runId) {
+        return this.request(`/runs/${runId}/default-diff`);
+    },
+
+    async saveLmStudioDefault(runId, dryRun = false) {
+        const query = dryRun ? '?dry_run=true' : '';
+        return this.request(`/runs/${runId}/save-default${query}`, { method: 'POST' });
     },
 
     // Apply Configuration

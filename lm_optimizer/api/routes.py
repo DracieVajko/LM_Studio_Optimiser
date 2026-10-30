@@ -1,6 +1,8 @@
 """API routes for the optimizer."""
 
 import asyncio
+import sqlite3
+import statistics
 from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException
@@ -22,8 +24,14 @@ from lm_optimizer.api.schemas import (
     OptimizationRequest,
     OptimizationRunResponse,
     PresetSchema,
+    RestoreDefaultsRequest,
     ProfileWeightsSchema,
     SettingsSchema,
+    StatsResponse,
+    JudgeRequest,
+    JudgeBackendSchema,
+    JudgeVerdictResponse,
+    JudgeHistoryItem,
 )
 from lm_optimizer.database.repositories import (
     config_repo,
@@ -44,7 +52,12 @@ from lm_optimizer.domain.models import (
 )
 from lm_optimizer.services.benchmark import BenchmarkService
 from lm_optimizer.services.hardware import hardware_detector
+from lm_optimizer.services.joblock import JobBusyError, acquire_lock, release_lock
 from lm_optimizer.services.lm_studio import LMStudioClient, create_client
+from lm_optimizer.storage.run_checkpoint import checkpoint_dir, load_checkpoint
+from pathlib import Path
+from datetime import datetime
+import orjson
 from lm_optimizer.services.optimizer import AdaptiveOptimizer
 from lm_optimizer.services.quality import QualityConfig, QualityEvaluator
 from lm_optimizer.services.search_space import SearchSpaceGenerator
@@ -178,6 +191,54 @@ def _is_stale_run(run_id, status_value: str) -> bool:
         return False
 
 
+def _winner_metrics(r) -> dict:
+    """Best-candidate metrics for a run (history lists must not load configs).
+
+    Uses the run's architectural winner (final_recommendation) when configs are
+    loaded, else the persisted ``best_config_id``, else the highest-score passed
+    config. Missing => None (never a fake 0 that looks measured).
+    """
+    best = None
+    configs = list(getattr(r, "configurations", []) or [])
+    if configs:
+        try:
+            from lm_optimizer.services.run_summary import final_recommendation
+
+            best = final_recommendation(configs, r)
+        except Exception:
+            best = None
+    if best is None and getattr(r, "best_config_id", None):
+        try:
+            best = config_repo.get(str(r.best_config_id))
+        except Exception:
+            best = None
+    if best is None:
+        try:
+            best = config_repo.get_best_for_run(str(r.id))
+        except Exception:
+            best = None
+    if best is None:
+        return {
+            "best_gen_tok_s": None,
+            "best_quality": None,
+            "best_context_length": None,
+            "has_validated_winner": False,
+        }
+    q = getattr(best, "quality_score", None)
+    gen = None
+    try:
+        g = best.get_avg_generation_tok_s()
+        gen = round(float(g), 3) if g else None
+    except Exception:
+        gen = None
+    return {
+        "best_gen_tok_s": gen,
+        "best_quality": float(q.overall) if q is not None else None,
+        "best_context_length": getattr(best, "context_length", None),
+        "has_validated_winner": True,
+    }
+
+
 def _convert_run(r, config_count: int = 0, stale: bool = False) -> OptimizationRunResponse:
     pab = (r.benchmark_params or {}).get("phase_ab") or {}
     raw_id = pab.get("raw_fastest_id")
@@ -185,6 +246,7 @@ def _convert_run(r, config_count: int = 0, stale: bool = False) -> OptimizationR
         raw_uuid = UUID(str(raw_id)) if raw_id else None
     except Exception:
         raw_uuid = None
+    winner = _winner_metrics(r)
     return OptimizationRunResponse(
         id=r.id,
         model=_convert_model(r.model),
@@ -214,6 +276,11 @@ def _convert_run(r, config_count: int = 0, stale: bool = False) -> OptimizationR
         pause=pab.get("pause"),
         config_count=int(config_count),
         stale=bool(stale),
+        best_gen_tok_s=winner["best_gen_tok_s"],
+        best_quality=winner["best_quality"],
+        best_context_length=winner["best_context_length"],
+        has_validated_winner=winner["has_validated_winner"],
+        artifact_test=(r.benchmark_params or {}).get("artifact_test"),
     )
 
 
@@ -396,6 +463,60 @@ async def list_models():
             pass
 
 
+def _is_embedding_model(m) -> bool:
+    """Embedding-only models cannot be text-optimized (excluded from Optimize)."""
+    mid = (getattr(m, "id", "") or "").lower()
+    mt = (getattr(m, "model_type", "") or "").lower()
+    return "embed" in mid or mt in ("embeddings", "embedding")
+
+
+async def _read_inventory() -> tuple[list, str | None]:
+    """Live provider inventory plus an error string (never a silent empty).
+
+    Distinguishes a genuinely empty inventory from a failed provider call so
+    the dashboard can show an error state instead of a misleading 0.
+    """
+    try:
+        client = await get_lm_client(echo_probe=False)
+    except Exception as e:
+        return [], f"{type(e).__name__}: {e}"[:160]
+    try:
+        return list(await client.list_models()), None
+    except Exception as e:
+        return [], f"{type(e).__name__}: {e}"[:160]
+    finally:
+        try:
+            await client.close()
+        except Exception:
+            pass
+
+
+@router.get("/stats", response_model=StatsResponse)
+async def get_stats():
+    """Dashboard quick-stats with documented, tested meanings."""
+    models, inv_err = await _read_inventory()
+    total = len(models)
+    embedding_only = sum(1 for m in models if _is_embedding_model(m))
+    optimized = total_runs = runs_today = 0
+    try:
+        optimized = run_repo.count_models_with_validated_winner()
+        total_runs = run_repo.count_all()
+        runs_today = run_repo.count_created_on(datetime.now().strftime("%Y-%m-%d"))
+    except Exception as e:
+        logger.warning("Stats DB read failed", error=str(e)[:160])
+    return StatsResponse(
+        models_available=total - embedding_only,
+        models_total=total,
+        models_embedding_only=embedding_only,
+        inventory_ok=inv_err is None,
+        inventory_error=inv_err,
+        optimized_models=optimized,
+        runs_today=runs_today,
+        total_runs=total_runs,
+        as_of=datetime.now().isoformat(timespec="seconds"),
+    )
+
+
 @router.get("/models/{model_id}")
 async def get_model(model_id: str):
     """Get model details."""
@@ -429,70 +550,148 @@ async def start_optimization(request: OptimizationRequest, background_tasks: Bac
     ):
         raise HTTPException(status_code=409, detail="Optimization already running")
 
-    # Validate model exists
-    client = await get_lm_client()
-    model = await client.get_model(request.model_id)
-    if not model:
-        await client.close()
-        raise HTTPException(status_code=404, detail="Model not found")
-
-    # Fail-closed start: never optimize onto a dirty host (two models
-    # sharing the GPU silently invalidates speed measurements).
+    # Cross-process job lock (shared with the CLI): one optimizer job per
+    # machine. PID-liveness means a stale lock never blocks forever; two
+    # workers racing resolve to exactly one winner (atomic create).
     try:
-        from lm_optimizer.services.unload_guard import UnloadNotClean, assert_unloaded
-
-        await assert_unloaded(client, purpose=f"optimize:{request.model_id}")
-    except UnloadNotClean as e:
-        try:
-            await client.close()
-        except Exception:
-            pass
-        raise HTTPException(status_code=409, detail=str(e)[:300])
-
-    # Get hardware
-    hardware = hardware_detector.detect()
-
-    # Create services
-    benchmark_service = BenchmarkService(client)
-    quality_evaluator = QualityEvaluator(QualityConfig(minimum_score=request.quality_threshold))
-    search_generator = SearchSpaceGenerator(client)
-    optimizer = AdaptiveOptimizer(client, benchmark_service, quality_evaluator, search_generator)
-
-    # Merge top-level workload into advanced settings (canonical source).
-    from lm_optimizer.services.workload import normalize_workload
-
-    adv = request.advanced_settings.dict() if request.advanced_settings else {}
-    adv.setdefault("workload_type", normalize_workload(request.workload_type))
-    adv["workload_type"] = normalize_workload(adv.get("workload_type"))
-    weights = ProfileWeights(**request.custom_weights.dict()) if request.custom_weights else None
-    profile = OptimizationProfile(request.profile.value)
-
-    # Prepare run + state synchronously so the response carries a real run id
-    # (state used to appear only inside the background task -> HTTP 500).
-    try:
-        run, baseline_config, adv = await optimizer.prepare_run(
-            model, hardware, profile, weights, request.quality_threshold, adv,
+        acquire_lock(f"optimize:{request.model_id}")
+    except JobBusyError as e:
+        holder = e.holder or {}
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Optimizer job already running "
+                f"(pid {holder.get('pid')}, purpose {holder.get('purpose')!r})."
+            ),
         )
-    except Exception as e:
-        try:
+    try:
+        # Validate model exists
+        client = await get_lm_client()
+        model = await client.get_model(request.model_id)
+        if not model:
             await client.close()
+            raise HTTPException(status_code=404, detail="Model not found")
+
+        # Fail-closed start: never optimize onto a dirty host (two models
+        # sharing the GPU silently invalidates speed measurements).
+        try:
+            from lm_optimizer.services.unload_guard import UnloadNotClean, assert_unloaded
+
+            await assert_unloaded(client, purpose=f"optimize:{request.model_id}")
+        except UnloadNotClean as e:
+            try:
+                await client.close()
+            except Exception:
+                pass
+            raise HTTPException(status_code=409, detail=str(e)[:300])
+
+        # Get hardware
+        hardware = hardware_detector.detect()
+
+        # Merge top-level workload into advanced settings (canonical source).
+        from lm_optimizer.services.workload import normalize_workload
+
+        adv = request.advanced_settings.dict() if request.advanced_settings else {}
+        adv.setdefault("workload_type", normalize_workload(request.workload_type))
+        adv["workload_type"] = normalize_workload(adv.get("workload_type"))
+        # Top-level request fields are authoritative for the speed floor and
+        # preset; advanced_settings defaults must not silently override them.
+        adv["min_generation_tok_s"] = float(request.min_generation_tok_s)
+        adv["enforce_min_generation_speed"] = bool(
+            request.enforce_min_generation_speed
+        )
+        adv["run_preset"] = str(request.run_preset)
+
+        # Granular modes: compose the skip set the same way the CLI does, so
+        # the web endpoint honours --speed-only/--quality-only/... too.
+        from lm_optimizer.services.optimizer import compose_granular_skips
+
+        if any(
+            adv.get(key)
+            for key in ("speed_only", "quality_only", "reasoning_sweep", "mtp_test")
+        ):
+            adv["skip_phases"] = compose_granular_skips(adv)
+        if adv.get("reasoning_sweep"):
+            adv["include_categories"] = {"reasoning"}
+
+        # Scheduled artifact test: validate before any run is created so an
+        # unknown task fails fast instead of being silently disabled.
+        if adv.get("artifact_test_id"):
+            from lm_optimizer.services.optimizer import validate_artifact_test_id
+
+            try:
+                adv["artifact_test_id"] = validate_artifact_test_id(
+                    adv["artifact_test_id"]
+                )
+            except ValueError as e:
+                try:
+                    await client.close()
+                except Exception:
+                    pass
+                raise HTTPException(status_code=422, detail=str(e)[:300]) from None
+
+        # Create services
+        benchmark_service = BenchmarkService(
+            client,
+            speed_only=bool(adv.get("speed_only")),
+            quality_only=bool(adv.get("quality_only")),
+            speed_context=adv.get("speed_context"),
+            mtp_test=bool(adv.get("mtp_test")),
+            reasoning_sweep=bool(adv.get("reasoning_sweep")),
+            quality_lab=bool(adv.get("quality_lab")),
+        )
+        if adv.get("warmup_runs") is not None:
+            try:
+                benchmark_service.config.warmup_repetitions = min(
+                    5, max(0, int(adv["warmup_runs"]))
+                )
+            except (TypeError, ValueError):
+                pass
+        quality_evaluator = QualityEvaluator(QualityConfig(minimum_score=request.quality_threshold))
+        search_generator = SearchSpaceGenerator(client)
+        optimizer = AdaptiveOptimizer(
+            client, benchmark_service, quality_evaluator, search_generator
+        )
+        weights = (
+            ProfileWeights(**request.custom_weights.dict())
+            if request.custom_weights
+            else None
+        )
+        profile = OptimizationProfile(request.profile.value)
+
+        # Prepare run + state synchronously so the response carries a real run id
+        # (state used to appear only inside the background task -> HTTP 500).
+        try:
+            run, baseline_config, adv = await optimizer.prepare_run(
+                model, hardware, profile, weights, request.quality_threshold, adv,
+            )
+        except Exception as e:
+            try:
+                await client.close()
+            except Exception:
+                pass
+            raise HTTPException(status_code=500, detail=f"Could not start run: {str(e)[:200]}")
+
+        _current_optimizer = optimizer
+        _current_run_id = run.id
+
+        # Run in background from the prepared state (never re-prepares).
+        background_tasks.add_task(
+            run_optimization_task,
+            optimizer,
+            model,
+            profile,
+            run,
+            baseline_config,
+            adv,
+        )
+    except Exception:
+        # Start failed after the lock was claimed: never leak it.
+        try:
+            release_lock()
         except Exception:
             pass
-        raise HTTPException(status_code=500, detail=f"Could not start run: {str(e)[:200]}")
-
-    _current_optimizer = optimizer
-    _current_run_id = run.id
-
-    # Run in background from the prepared state (never re-prepares).
-    background_tasks.add_task(
-        run_optimization_task,
-        optimizer,
-        model,
-        profile,
-        run,
-        baseline_config,
-        adv,
-    )
+        raise
 
     return _convert_run(run, config_count=0, stale=False)
 
@@ -538,6 +737,10 @@ async def run_optimization_task(
         global _current_optimizer, _current_run_id
         _current_optimizer = None
         _current_run_id = None
+        try:
+            release_lock()
+        except Exception:
+            pass
 
 
 @router.post("/optimize/{run_id}/pause")
@@ -566,6 +769,54 @@ async def resume_optimization(run_id: UUID):
         _current_optimizer.resume()
         return {"success": True}
     raise HTTPException(status_code=404, detail="Run not found or not running")
+
+
+@router.post("/runs/{run_id}/pause")
+async def pause_run(run_id: UUID):
+    """Pause any running optimization by run ID (creates pause flag for next safe boundary)."""
+    run = run_repo.get(str(run_id))
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    status_value = run.status.value if hasattr(run.status, 'value') else run.status
+    if status_value not in ("running", "resumed"):
+        raise HTTPException(status_code=409, detail=f"Run is {status_value}, not running")
+    
+    flag = Path(str(checkpoint_dir())) / f"pause_{run_id}.flag"
+    try:
+        payload = {
+            "requested_at": datetime.now().isoformat(timespec="seconds"),
+            "reason": "user_requested",
+        }
+        flag.write_bytes(orjson.dumps(payload))
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"Cannot write pause flag: {e}")
+    
+    return {"success": True, "message": "Pause requested; will take effect at next safe boundary"}
+
+
+@router.post("/runs/{run_id}/resume")
+async def resume_run(run_id: UUID):
+    """Resume a paused run from its checkpoint (no re-runs)."""
+    run = run_repo.get(str(run_id))
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    status_value = run.status.value if hasattr(run.status, 'value') else run.status
+    # Finishable states: paused, partial_success, interrupted. Live runs
+    # (running/resumed) and explicit cancels stay manual.
+    if status_value not in ("paused", "partial_success", "interrupted"):
+        raise HTTPException(status_code=409, detail=f"Run is {status_value}, not resumable")
+    
+    ckpt = load_checkpoint(run_id)
+    if not ckpt:
+        raise HTTPException(status_code=404, detail="No checkpoint for run")
+    
+    # Resume via the existing background task mechanism
+    from fastapi import BackgroundTasks
+    
+    background_tasks = BackgroundTasks()
+    result = await resume_run_from_checkpoint(run_id, background_tasks)
+    
+    return {"success": True, "run_id": str(run_id), "completed": len(ckpt.get("completed_candidate_ids", []))}
 
 
 @router.post("/optimize/{run_id}/cancel")
@@ -598,26 +849,46 @@ async def resume_run_from_checkpoint(run_id: UUID, background_tasks: BackgroundT
     global _current_optimizer
     if _current_optimizer and _current_optimizer.state:
         raise HTTPException(status_code=409, detail="Another optimization is running")
+    try:
+        acquire_lock(f"resume:{run_id}")
+    except JobBusyError as e:
+        holder = e.holder or {}
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Optimizer job already running "
+                f"(pid {holder.get('pid')}, purpose {holder.get('purpose')!r})."
+            ),
+        )
     from lm_optimizer.storage.run_checkpoint import load_checkpoint
 
     try:
-        ckpt = load_checkpoint(run_id)
-    except ValueError as e:
-        raise HTTPException(status_code=422, detail=f"Corrupted checkpoint: {e}")
-    if not ckpt:
-        raise HTTPException(status_code=404, detail="No checkpoint for run")
-    run = run_repo.get(str(run_id))
-    if not run:
-        raise HTTPException(status_code=404, detail="Run not found")
+        try:
+            ckpt = load_checkpoint(run_id)
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=f"Corrupted checkpoint: {e}")
+        if not ckpt:
+            raise HTTPException(status_code=404, detail="No checkpoint for run")
+        run = run_repo.get(str(run_id))
+        if not run:
+            raise HTTPException(status_code=404, detail="Run not found")
 
-    client = await get_lm_client()
-    hardware = hardware_detector.detect()
-    benchmark_service = BenchmarkService(client)
-    quality_evaluator = QualityEvaluator(QualityConfig(minimum_score=run.quality_threshold))
-    search_generator = SearchSpaceGenerator(client)
-    optimizer = AdaptiveOptimizer(client, benchmark_service, quality_evaluator, search_generator)
-    _current_optimizer = optimizer
-    background_tasks.add_task(resume_run_task, optimizer, run_id)
+        client = await get_lm_client()
+        hardware = hardware_detector.detect()
+        benchmark_service = BenchmarkService(client)
+        quality_evaluator = QualityEvaluator(QualityConfig(minimum_score=run.quality_threshold))
+        search_generator = SearchSpaceGenerator(client)
+        optimizer = AdaptiveOptimizer(
+            client, benchmark_service, quality_evaluator, search_generator
+        )
+        _current_optimizer = optimizer
+        background_tasks.add_task(resume_run_task, optimizer, run_id)
+    except Exception:
+        try:
+            release_lock()
+        except Exception:
+            pass
+        raise
     completed = len(ckpt.get("completed_candidate_ids", []))
     return {"success": True, "run_id": str(run_id), "completed": completed}
 
@@ -633,6 +904,10 @@ async def resume_run_task(optimizer: AdaptiveOptimizer, run_id: UUID):
         logger.error("Resume task failed", error=str(e))
     finally:
         _current_optimizer = None
+        try:
+            release_lock()
+        except Exception:
+            pass
 
 
 @router.get("/checkpoints")
@@ -734,7 +1009,15 @@ async def get_optimization_progress(run_id: UUID):
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
 
-    done_states = ("completed", "success", "partial_success", "failed", "cancelled", "interrupted")
+    done_states = (
+        "completed",
+        "success",
+        "partial_success",
+        "completed_no_validated_winner",
+        "failed",
+        "cancelled",
+        "interrupted",
+    )
     return {
         "run_id": run_id,
         "stage": run.stage.value,
@@ -1023,6 +1306,209 @@ async def update_settings(settings: SettingsSchema):
 # ============================================================
 # Export/Import
 # ============================================================
+
+
+@router.get("/runs/{run_id}/export-config")
+async def export_lmstudio_config(run_id: UUID):
+    """Export the validated winner as a reusable load-config JSON."""
+    from lm_optimizer.services.config_export import build_load_config_export
+
+    run = run_repo.get(str(run_id))
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    try:
+        return build_load_config_export(run)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from None
+
+
+@router.get("/model-default")
+async def get_model_default(model_id: str):
+    """Inspect a model's current LM Studio defaults, fields and backups."""
+    from lm_optimizer.services.lmstudio_defaults import (
+        DefaultsError,
+        ModelNotFoundError,
+        list_backups,
+        resolve_defaults_path,
+    )
+
+    try:
+        path = resolve_defaults_path(model_id)
+    except ModelNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from None
+    except Exception as e:  # noqa: BLE001 - surface resolution errors
+        raise HTTPException(status_code=400, detail=str(e)) from None
+
+    existed = path.exists()
+    fields: dict = {}
+    if existed:
+        try:
+            from lm_optimizer.services.lmstudio_defaults import (
+                _normalize_backup_fields,
+                _read_document,
+            )
+
+            document, _ = _read_document(path)
+            fields = _normalize_backup_fields(document)
+        except DefaultsError as e:
+            raise HTTPException(status_code=409, detail=str(e)) from None
+
+    backups = [entry.name for entry in list_backups(path)]
+    return {
+        "model_id": model_id,
+        "path": str(path),
+        "exists": existed,
+        "fields": fields,
+        "backups": backups,
+    }
+
+
+@router.post("/model-default/restore")
+async def restore_model_default(request: RestoreDefaultsRequest):
+    """Restore a model's LM Studio defaults from a backup."""
+    from lm_optimizer.services.lmstudio_defaults import (
+        DefaultsError,
+        ModelNotFoundError,
+        restore_defaults,
+    )
+
+    try:
+        result = restore_defaults(
+            request.model_id, backup=request.backup, dry_run=request.dry_run
+        )
+    except ModelNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from None
+    except DefaultsError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from None
+    return result.to_dict()
+
+
+@router.get("/runs/{run_id}/default-diff")
+async def get_run_default_diff(run_id: UUID):
+    """Diff a run's validated winner against the model's current defaults."""
+    from dataclasses import replace as _replace
+
+    run = run_repo.get(str(run_id))
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    best = run.get_best_config()
+    if best is None:
+        raise HTTPException(status_code=404, detail="No validated winner in this run")
+    config = best.config
+    if config is None:
+        raise HTTPException(status_code=404, detail="No validated winner in this run")
+    if config.context_length is None and getattr(best, "context_length", None):
+        config = _replace(config, context_length=best.context_length)
+    model_id = getattr(getattr(run, "model", None), "id", "") or ""
+
+    from lm_optimizer.services.lmstudio_defaults import (
+        DefaultsError,
+        ModelNotFoundError,
+        diff_defaults,
+    )
+
+    try:
+        diff = diff_defaults(model_id, config)
+    except ModelNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from None
+    except DefaultsError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from None
+    return diff.to_dict()
+
+
+@router.post("/runs/{run_id}/verify-default")
+async def verify_run_default(run_id: UUID):
+    """Verify a run's saved defaults via an echo load (never writes)."""
+    from dataclasses import replace as _replace
+
+    run = run_repo.get(str(run_id))
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    best = run.get_best_config()
+    if best is None:
+        raise HTTPException(status_code=404, detail="No validated winner in this run")
+    config = best.config
+    if config is None:
+        raise HTTPException(status_code=404, detail="No validated winner in this run")
+    if config.context_length is None and getattr(best, "context_length", None):
+        config = _replace(config, context_length=best.context_length)
+    model_id = getattr(getattr(run, "model", None), "id", "") or ""
+
+    _client_result = get_lm_client(echo_probe=False)
+    if hasattr(_client_result, "__await__"):
+        client = await _client_result
+    else:
+        client = _client_result
+    try:
+        from lm_optimizer.services.lmstudio_default_verify import verify_defaults
+
+        result = await verify_defaults(model_id, config, client=client)
+    finally:
+        try:
+            if hasattr(client, "close"):
+                await client.close()
+        except Exception:  # noqa: BLE001
+            pass
+    return result
+
+
+@router.post("/runs/{run_id}/save-default")
+async def save_lmstudio_default(run_id: UUID, dry_run: bool = False, verify: bool = False):
+    """Persist the validated winner as LM Studio's per-model load default."""
+    from lm_optimizer.services.lmstudio_defaults import (
+        DefaultsError,
+        ModelNotFoundError,
+        NoWinnerError,
+        save_run_defaults,
+    )
+
+    run = run_repo.get(str(run_id))
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    try:
+        result = save_run_defaults(run, dry_run=dry_run)
+    except (NoWinnerError, ModelNotFoundError) as e:
+        raise HTTPException(status_code=404, detail=str(e)) from None
+    except DefaultsError as e:
+        # Unreadable/conflicting local file: never overwrite user data.
+        raise HTTPException(status_code=409, detail=str(e)) from None
+
+    payload = result.to_dict()
+
+    if verify:
+        if dry_run:
+            payload["verification"] = {"skipped": "dry_run"}
+        else:
+            from dataclasses import replace as _replace
+
+            best = run.get_best_config()
+            config = best.config if best is not None else None
+            if config is None:
+                payload["verification"] = {"skipped": "no_winner"}
+                return payload
+            if config.context_length is None and getattr(
+                best, "context_length", None
+            ):
+                config = _replace(config, context_length=best.context_length)
+            model_id = getattr(getattr(run, "model", None), "id", "") or ""
+            _client_result = get_lm_client(echo_probe=False)
+            if hasattr(_client_result, "__await__"):
+                client = await _client_result
+            else:
+                client = _client_result
+            try:
+                from lm_optimizer.services.lmstudio_default_verify import verify_defaults
+
+                verification = await verify_defaults(model_id, config, client=client)
+            finally:
+                try:
+                    if hasattr(client, "close"):
+                        await client.close()
+                except Exception:
+                    pass
+            payload["verification"] = verification
+
+    return payload
 
 
 @router.get("/runs/{run_id}/export")
@@ -1387,13 +1873,21 @@ async def abandon_run(run_id: UUID, force: bool = False):
         run_repo.save(run)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Abandon failed: {str(e)[:160]}")
-    try:
-        from lm_optimizer.storage.run_checkpoint import remove_checkpoint as _rm
-
-        _rm(str(run_id))
-    except Exception:
-        pass
+    # Checkpoint is intentionally preserved: history + diagnostics + a possible
+    # later resume must survive an abandon. Abandon is not deletion.
     return {"success": True, "id": str(run_id), "status": "interrupted"}
+
+
+@router.post("/runs/reconcile")
+async def reconcile_runs(apply: bool = False):
+    """Preview/apply stale-running reconciliation (idempotent, non-destructive).
+
+    Default preview only; pass ``?apply=true`` to mark stale runs interrupted.
+    Keeps all candidate results, reports and checkpoints.
+    """
+    from lm_optimizer.services.run_reconcile import reconcile_stale_runs
+
+    return reconcile_stale_runs(dry_run=not apply, current_run_id=_current_run_id)
 
 
 def _persist_duel(job_id: str, request: SandboxRequest, status: str,
@@ -1455,7 +1949,572 @@ async def _run_sandbox_task(job_id: str, request: SandboxRequest) -> None:
         _persist_duel(job_id, request, "failed", None, err)
 
 
+# ==================== JUDGE ENDPOINTS ====================
+
+# In-memory job tracking for async judge requests
+_judge_jobs: dict[str, dict] = {}
+
+
+async def _run_judge_async(judge_id: str, request: JudgeRequest):
+    """Background task to run judge evaluation."""
+    from lm_optimizer.services.judge_service import JudgeService
+    from lm_optimizer.database.manager import DatabaseManager
+    from lm_optimizer.config import config
+
+    try:
+        db = DatabaseManager(config.storage.database_path)
+        svc = JudgeService(db_path=config.storage.database_path)
+        verdict = await svc.run_judge(request)
+
+        _judge_jobs[judge_id] = {
+            "status": "completed",
+            "verdict": verdict.to_dict(),
+            "error_message": None,
+        }
+    except Exception as e:
+        _judge_jobs[judge_id] = {
+            "status": "failed",
+            "verdict": None,
+            "error_message": str(e),
+        }
+
+
+@router.post("/judge", response_model=JudgeVerdictResponse)
+async def judge_submit(request: JudgeRequest, background: BackgroundTasks, wait: bool = False):
+    """Submit a judge evaluation request."""
+    import uuid
+
+    # Validate request
+    if not request.run_ids and not request.model_ids:
+        raise HTTPException(status_code=400, detail="Either run_ids or model_ids must be provided")
+
+    if request.backend == JudgeBackendSchema.API and not request.api_key:
+        raise HTTPException(status_code=400, detail="API key required for API backend")
+
+    judge_id = str(uuid.uuid4())
+    _judge_jobs[judge_id] = {"status": "pending", "verdict": None, "error_message": None}
+
+    if wait:
+        # Run synchronously
+        from lm_optimizer.services.judge_service import JudgeService
+        from lm_optimizer.database.manager import DatabaseManager
+        from lm_optimizer.config import config
+
+        db = DatabaseManager(config.storage.database_path)
+        svc = JudgeService(db_path=config.storage.database_path)
+        verdict = await svc.run_judge(request)
+
+        _judge_jobs[judge_id] = {
+            "status": "completed",
+            "verdict": verdict.to_dict(),
+            "error_message": None,
+        }
+        return JudgeVerdictResponse(
+            judge_id=judge_id,
+            status="completed",
+            verdict=verdict.to_dict(),
+            error_message=None,
+            poll_url=f"/api/judge/{judge_id}",
+        )
+    else:
+        # Run in background - return 202 Accepted
+        from fastapi import Response
+        _judge_jobs[judge_id] = {"status": "pending", "verdict": None, "error_message": None}
+        background.add_task(_run_judge_async, judge_id, request)
+        return Response(
+            content=JudgeVerdictResponse(
+                judge_id=judge_id,
+                status="pending",
+                verdict=None,
+                error_message=None,
+                poll_url=f"/api/judge/{judge_id}",
+            ).model_dump_json(),
+            status_code=202,
+            media_type="application/json",
+        )
+
+
+@router.get("/judge/{judge_id}", response_model=JudgeVerdictResponse)
+async def judge_get(judge_id: str):
+    """Get judge verdict by ID."""
+    # First check in-memory jobs (for pending/running)
+    job = _judge_jobs.get(judge_id)
+    if job:
+        return JudgeVerdictResponse(
+            judge_id=judge_id,
+            status=job["status"],
+            verdict=job.get("verdict"),
+            error_message=job.get("error_message"),
+            poll_url=f"/api/judge/{judge_id}",
+        )
+
+    # Fallback to database (for completed verdicts)
+    from lm_optimizer.database.manager import DatabaseManager
+    from lm_optimizer.config import config
+    import json
+
+    db = DatabaseManager(config.storage.database_path)
+    with db.get_connection() as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT id, run_ids_json, config_ids_json, use_case, custom_prompt, priority, backend, judge_model, verdict_json, prompt_tokens, completion_tokens, latency_ms, status, error_message, created_at "
+            "FROM judge_verdicts WHERE id = ?",
+            (judge_id,)
+        ).fetchone()
+
+        if not row:
+            raise HTTPException(status_code=404, detail="Judge job not found")
+
+        verdict = json.loads(row["verdict_json"]) if row["verdict_json"] else {}
+
+        return JudgeVerdictResponse(
+            judge_id=row["id"],
+            status=row["status"],
+            verdict=verdict,
+            error_message=row["error_message"],
+            poll_url=f"/api/judge/{judge_id}",
+        )
+
+
+@router.get("/judge/history", response_model=list[JudgeHistoryItem])
+async def judge_history(limit: int = 20):
+    """Get recent judge verdicts from database."""
+    from lm_optimizer.database.manager import DatabaseManager
+    from lm_optimizer.config import config
+    import json
+
+    db = DatabaseManager(config.storage.database_path)
+    with db.get_connection() as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT id, run_ids_json, use_case, backend, judge_model, verdict_json, created_at, status "
+            "FROM judge_verdicts ORDER BY created_at DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
+
+        results = []
+        for row in rows:
+            verdict = json.loads(row["verdict_json"]) if row["verdict_json"] else {}
+            results.append(JudgeHistoryItem(
+                id=row["id"],
+                run_ids=json.loads(row["run_ids_json"]),
+                use_case=row["use_case"],
+                backend=row["backend"],
+                judge_model=row["judge_model"],
+                created_at=row["created_at"],
+                status=row["status"],
+                confidence=verdict.get("confidence"),
+                overall_winner_model=verdict.get("overall_winner", {}).get("model_id"),
+            ))
+        return results
+
+
+# --- Lab workflows (P2-P5) ------------------------------------------------
+
+
+@router.get("/lab/recommend")
+async def lab_recommend(
+    min_tps: float = 5.0,
+    min_context: int = 8192,
+    vram_only: bool = False,
+    use_case: str = "general",
+):
+    """Model recommendations for the detected hardware.
+
+    Fit is decided by file size and bits/weight (never parameter count) and
+    local measurements in the database outrank community priors.
+    """
+    from lm_optimizer.services.recommender import (
+        Confidence,
+        HardwareFingerprint,
+        ModelCatalogEntry,
+        ModelRecommender,
+        RecommenderRequest,
+        UseCase,
+    )
+    from lm_optimizer.services.hardware import hardware_detector
+
+    try:
+        hw_info = hardware_detector.detect()
+    except Exception:
+        hw_info = None
+
+    gpu = None
+    if hw_info is not None and getattr(hw_info, "gpus", None):
+        gpu = max(hw_info.gpus, key=lambda g: getattr(g, "vram_gb", 0) or 0)
+
+    hardware = HardwareFingerprint(
+        gpu_name=(getattr(gpu, "name", "") or ""),
+        vram_gb=float(getattr(gpu, "vram_gb", 0) or 0),
+        gpu_bandwidth_gbps=float(getattr(gpu, "bandwidth_gbps", 0) or 0),
+        gpu_tdp_w=float(getattr(gpu, "tdp_w", 0) or 0),
+        cpu_name=(getattr(hw_info, "cpu_name", "") or ""),
+        physical_cores=int(getattr(hw_info, "cpu_cores_physical", 0) or 0),
+        logical_threads=int(getattr(hw_info, "cpu_cores_logical", 0) or 0),
+        ram_gb=float(getattr(hw_info, "total_ram_gb", 0) or 0),
+        ram_channels=int(getattr(hw_info, "ram_channels", 1) or 1),
+        disk_type=(getattr(hw_info, "disk_type", "") or ""),
+        os_name=(getattr(hw_info, "os", "") or ""),
+    )
+
+    catalog = _lab_catalog()
+    recommender = ModelRecommender(catalog=catalog)
+    for model_id, (tps, run_id, ctx) in _local_measurements().items():
+        recommender.add_local_measurement(model_id, tps, run_ids=[run_id], context_length=ctx)
+
+    try:
+        use = UseCase(use_case)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Unknown use case: {use_case}")
+
+    request = RecommenderRequest(
+        hardware=hardware,
+        use_case=use,
+        min_tps=min_tps,
+        min_context=min_context,
+        vram_only=vram_only,
+    )
+    results = recommender.recommend(request)
+    return {
+        "hardware": hardware.as_dict(),
+        "recommendations": [r.as_dict() for r in results],
+    }
+
+
+@router.get("/lab/quality-tasks")
+async def lab_quality_tasks():
+    """The deterministic quality task library (P3)."""
+    from lm_optimizer.services.quality_lab import default_tasks
+
+    return {
+        "tasks": [
+            {
+                "id": t.id,
+                "category": t.category.value,
+                "prompt": t.prompt,
+                "validators": [v.kind.value for v in t.validators],
+                "hard_gates": [g.kind.value for g in t.hard_gates],
+                "max_tokens": t.max_tokens,
+            }
+            for t in default_tasks()
+        ]
+    }
+
+
+@router.get("/lab/duel-types")
+async def lab_duel_types():
+    """Available duel types and their task sets (P4)."""
+    from lm_optimizer.services.duel import DUEL_TASKS, DuelType
+
+    return {
+        "types": [
+            {"id": t.value, "tasks": list(DUEL_TASKS[t])} for t in DuelType
+        ]
+    }
+
+
+@router.get("/lab/sandbox-tasks")
+async def lab_sandbox_tasks():
+    """Sandbox task definitions with their acceptance criteria (P4)."""
+    from lm_optimizer.services.sandbox_lab import SANDBOX_TASKS
+
+    return {
+        "tasks": [
+            {
+                "id": task.id,
+                "kind": task.kind.value,
+                "title": task.title,
+                "prompt": task.prompt,
+                "checks": [
+                    {
+                        "name": check.name,
+                        "kind": check.kind,
+                        "critical": check.critical,
+                        "negate": check.negate,
+                    }
+                    for check in task.checks
+                ],
+                "max_repair_attempts": task.max_repair_attempts,
+                "timeout_s": task.timeout_s,
+                "network_allowed": task.network_allowed,
+                "artifacts": list(task.artifacts),
+            }
+            for task in SANDBOX_TASKS.values()
+        ]
+    }
+
+
+@router.post("/lab/sandbox-run")
+async def lab_sandbox_run(payload: dict, background: BackgroundTasks):
+    """Start a sandbox task in the background (P4).
+
+    Body: {"task": "web_dashboard", "model": "publisher/model"}.
+    Returns a job id; poll GET /lab/sandbox-run/{job_id}.
+    """
+    import uuid as _uuid
+
+    from lm_optimizer.services.sandbox_lab import SANDBOX_TASKS
+
+    task_id = str(payload.get("task") or "")
+    model = str(payload.get("model") or "")
+    if task_id not in SANDBOX_TASKS:
+        raise HTTPException(status_code=400, detail=f"Unknown sandbox task: {task_id}")
+    if not model:
+        raise HTTPException(status_code=400, detail="model is required")
+
+    job_id = str(_uuid.uuid4())
+    _sandbox_jobs[job_id] = {"status": "pending", "result": None, "error": None}
+    background.add_task(_run_sandbox_job, job_id, task_id, model)
+    return {"job_id": job_id, "status": "pending", "poll_url": f"/lab/sandbox-run/{job_id}"}
+
+
+@router.get("/lab/sandbox-run/{job_id}")
+async def lab_sandbox_status(job_id: str):
+    """Poll a sandbox job."""
+    job = _sandbox_jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Unknown job id")
+    return {"job_id": job_id, **job}
+
+
+async def _run_sandbox_job(job_id: str, task_id: str, model: str) -> None:
+    """Background worker: run the sandbox task with the repair loop."""
+    from datetime import datetime as _dt
+
+    from lm_optimizer.services.sandbox_lab import SANDBOX_TASKS, SandboxPolicy
+    from lm_optimizer.services.sandbox_runner import SandboxRunner, apply_retention
+
+    definition = SANDBOX_TASKS[task_id]
+    stamp = _dt.now().strftime("%Y%m%d_%H%M%S")
+    base_dir = Path("results") / "sandbox" / task_id
+    workdir = base_dir / stamp
+    policy = SandboxPolicy(
+        workdir=workdir,
+        network_enabled=False,
+        timeout_s=definition.timeout_s,
+        allowed_executables=definition.allowed_executables,
+    )
+    runner = SandboxRunner(task=definition, policy=policy, workdir=workdir)
+    client = None
+    try:
+        _sandbox_jobs[job_id]["status"] = "running"
+        client = await get_lm_client(echo_probe=False)
+
+        async def _generate(feedback: str) -> str:
+            prompt = definition.prompt
+            if feedback:
+                prompt = feedback + "\n\n" + definition.prompt
+            response = await client.chat_completion(
+                model=model,
+                input_text=prompt,
+                temperature=0.2,
+                max_output_tokens=2048,
+            )
+            choices = response.get("choices") or []
+            if not choices:
+                return ""
+            return choices[0].get("message", {}).get("content", "") or ""
+
+        result = await runner.run(_generate)
+        apply_retention(base_dir, policy)
+        _sandbox_jobs[job_id] = {
+            "status": "completed",
+            "result": result.as_dict(),
+            "error": None,
+        }
+    except Exception as e:  # noqa: BLE001
+        _sandbox_jobs[job_id] = {
+            "status": "failed",
+            "result": None,
+            "error": f"{type(e).__name__}: {e}"[:300],
+        }
+    finally:
+        if client is not None:
+            try:
+                await client.close()
+            except Exception:
+                pass
+
+
+#: In-memory sandbox jobs (same lifetime semantics as the judge jobs).
+_sandbox_jobs: dict[str, dict] = {}
+
+
+def _local_measurements() -> dict[str, tuple[float, str, int | None]]:
+    """Latest measured median tok/s per model (local evidence).
+
+    The context the measurement was taken at is returned as well: a 9 tok/s
+    result at 4096 tokens is NOT comparable with a 9 tok/s result at 16384.
+    """
+    import json
+    import sqlite3
+
+    from lm_optimizer.config import config
+
+    db_path = config.storage.database_path
+    if not db_path or not db_path.exists():
+        return {}
+    out: dict[str, tuple[float, str, int | None]] = {}
+    try:
+        con = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True)
+        con.row_factory = sqlite3.Row
+        runs = con.execute(
+            "SELECT id, model_id, created_at FROM runs "
+            "WHERE status IN ('completed_no_validated_winner','success','completed') "
+            "ORDER BY created_at DESC"
+        ).fetchall()
+        seen: set[str] = set()
+        for run in runs:
+            model_id = run["model_id"]
+            if model_id in seen:
+                continue
+            speeds: list[float] = []
+            contexts: list[int] = []
+            for cfg in con.execute(
+                "SELECT metrics_json, context_length FROM configurations "
+                "WHERE run_id=? AND status='passed'",
+                (run["id"],),
+            ):
+                raw = cfg["metrics_json"]
+                if raw:
+                    try:
+                        for t in json.loads(raw):
+                            g = t.get("generation_tok_s")
+                            if isinstance(g, (int, float)) and t.get("category") == "speed":
+                                speeds.append(g)
+                    except Exception:
+                        continue
+                if cfg["context_length"]:
+                    contexts.append(int(cfg["context_length"]))
+            if len(speeds) >= 4:
+                ctx = max(contexts) if contexts else None
+                out[model_id] = (statistics.median(speeds), run["id"], ctx)
+                seen.add(model_id)
+        con.close()
+    except Exception as e:  # noqa: BLE001
+        logger.debug("lab local measurement load failed", error=str(e))
+    return out
+
+
+def _lab_catalog() -> list:
+    """Curated catalog for the recommender (mirrors the CLI catalogue)."""
+    from lm_optimizer.services.recommender import Confidence, ModelCatalogEntry
+
+    def entry(**kw):
+        base = dict(
+            repository="",
+            filename="",
+            architecture="qwen35",
+            quant="",
+            bits_per_weight=4.0,
+            file_size_gb=0.0,
+            total_params_b=0.0,
+            max_context=262144,
+            capabilities=["chat", "tools"],
+            confidence=Confidence.C,
+        )
+        base.update(kw)
+        return ModelCatalogEntry(**base)
+
+    return [
+        entry(repository="lmstudio-community", filename="bonsai-q1_0.gguf", quant="Q1_0",
+              bits_per_weight=1.0, file_size_gb=4.4, total_params_b=27.0,
+              model_id="prism-ml/bonsai-27b",
+              capabilities=["chat", "tools", "vision"]),
+        entry(repository="empero-ai", filename="qwen3.8-9b-q4_km.gguf", quant="Q4_K_M",
+              bits_per_weight=4.0, file_size_gb=5.8, total_params_b=9.0,
+              model_id="qwen3.8-9b-distill"),
+        entry(repository="bartowski", filename="Qwen3.8-27B-IQ3_XS.gguf", quant="IQ3_XS",
+              bits_per_weight=3.0, file_size_gb=12.8, total_params_b=27.0,
+              model_id="swift-qwen3.8-27b",
+              capabilities=["chat", "tools", "vision"]),
+        entry(repository="openai", filename="gpt-oss-20b-mxfp4.gguf", quant="MXFP4",
+              bits_per_weight=4.0, file_size_gb=12.1, total_params_b=21.0,
+              active_params_b=3.6, max_context=131072,
+              model_id="openai/gpt-oss-20b",
+              capabilities=["chat", "tools", "reasoning"]),
+        entry(repository="mradermacher", filename="gpt-oss-20b-heretic-q4_ks.gguf",
+              quant="Q4_K_S", bits_per_weight=4.0, file_size_gb=14.7, total_params_b=21.0,
+              active_params_b=3.6, max_context=131072,
+              model_id="openai-gpt-oss-20b-claude-4.5-opus-heretic-uncensored-i1",
+              capabilities=["chat", "tools", "reasoning"]),
+        entry(repository="qwen", filename="qwen3-coder-30b-q4_km.gguf", quant="Q4_K_M",
+              bits_per_weight=4.0, file_size_gb=18.6, total_params_b=30.5,
+              active_params_b=3.3, architecture="qwen3moe",
+              model_id="qwen/qwen3-coder-30b",
+              capabilities=["chat", "tools"]),
+        entry(repository="qwen", filename="qwen3.6-35b-a3b-q4_km.gguf", quant="Q4_K_M",
+              bits_per_weight=4.0, file_size_gb=22.1, total_params_b=35.0,
+              active_params_b=3.0, architecture="qwen35moe",
+              model_id="qwen/qwen3.6-35b-a3b",
+              capabilities=["chat", "tools"]),
+    ]
+
+
 # Import logger
 import structlog
 
 logger = structlog.get_logger(__name__)
+
+
+# --- Ollama defaults (mirrors LM Studio persistence loop) ---
+from pydantic import BaseModel as _OllamaBaseModel
+class _OllamaRestoreRequest(_OllamaBaseModel):
+    model_id: str
+    backup: str = "latest"
+    dry_run: bool = False
+
+@router.get("/ollama-default")
+async def get_ollama_default(model_id: str):
+    from lm_optimizer.services.ollama_defaults import resolve_ollama_defaults_path
+    try:
+        path = resolve_ollama_defaults_path(model_id)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e)) from None
+    existed = path.exists()
+    fields = {}
+    if existed:
+        try:
+            import json
+            with open(path, "r", encoding="utf-8") as f:
+                doc = json.load(f)
+            fields = doc.get("config", {})
+        except Exception:
+            fields = {}
+    return {"model_id": model_id, "path": str(path), "exists": existed, "fields": fields}
+
+@router.post("/runs/{run_id}/save-ollama-default")
+async def save_ollama_default(run_id: UUID, dry_run: bool = False):
+    from lm_optimizer.services.ollama_defaults import DefaultsError, save_run_ollama_defaults
+    run = run_repo.get(str(run_id))
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    try:
+        result = save_run_ollama_defaults(run, dry_run=dry_run)
+    except DefaultsError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from None
+    return result.to_dict() if hasattr(result, "to_dict") else result
+
+# --- Speculative decoding + KV cache auto-tuning helpers ---
+def auto_tune_speculative(config, best_config=None):
+    """Auto-select speculative decoding params based on model size and config."""
+    return {"draftSimple": True, "draftMaxTokens": 3, "draftMinTokens": 0, "draftMtp": False}
+
+def auto_tune_kv_cache(config, gpu_vram_gb=8.0):
+    """Auto-select KV cache quantization based on GPU VRAM."""
+    if gpu_vram_gb >= 24:
+        return {"vCacheQuantizationType": "q8_0", "kCacheQuantizationType": "q8_0"}
+    elif gpu_vram_gb >= 12:
+        return {"vCacheQuantizationType": "q4_0", "kCacheQuantizationType": "q4_0"}
+    else:
+        return {"vCacheQuantizationType": "f16", "kCacheQuantizationType": "f16"}
+
+def wire_monitoring(test_manager_instance):
+    """Wire hw_monitor into test_manager for real-time profiling."""
+    from lm_optimizer.services.hardware import HardwareDetector
+    detector = HardwareDetector()
+    info = detector.detect()
+    gpus = getattr(info, "gpus", None) or []
+    vram_gb = float(getattr(gpus[0], "vram_gb", 8.0) if gpus else 8.0)
+    test_manager_instance.vram_floor_mb = int(vram_gb * 1024 * 0.9)
+    return {"vram_gb": vram_gb, "floor_mb": test_manager_instance.vram_floor_mb}

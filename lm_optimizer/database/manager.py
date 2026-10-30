@@ -78,6 +78,7 @@ class DatabaseManager:
             (8, "add_best_columns", self._migration_008_best_columns),
             (9, "add_capability_snapshots", self._migration_009_capability_snapshots),
             (10, "add_duels", self._migration_010_duels),
+            (11, "add_judge_verdicts", self._migration_011_judge_verdicts),
         ]
 
         for version, name, migration_func in migrations:
@@ -364,6 +365,30 @@ class DatabaseManager:
             )
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_duels_created ON duels(created_at)")
+
+    def _migration_011_judge_verdicts(self, conn: sqlite3.Connection) -> None:
+        """Judge verdicts table for LLM-as-a-judge evaluations."""
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS judge_verdicts (
+                id TEXT PRIMARY KEY,
+                run_ids_json TEXT NOT NULL,
+                config_ids_json TEXT,
+                use_case TEXT NOT NULL,
+                custom_prompt TEXT,
+                priority TEXT NOT NULL,
+                backend TEXT NOT NULL,
+                judge_model TEXT NOT NULL,
+                verdict_json TEXT NOT NULL,
+                prompt_tokens INTEGER,
+                completion_tokens INTEGER,
+                latency_ms INTEGER,
+                status TEXT NOT NULL DEFAULT 'completed',
+                error_message TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_judge_verdicts_created ON judge_verdicts(created_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_judge_verdicts_run ON judge_verdicts(run_ids_json)")
 
 
 # Global database manager

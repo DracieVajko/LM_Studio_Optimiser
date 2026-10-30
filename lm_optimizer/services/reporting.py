@@ -3,8 +3,9 @@
 import re
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
-from lm_optimizer.domain.models import OptimizationRun
+from lm_optimizer.domain.models import OptimizationRun, RunStatus
 from lm_optimizer.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -14,6 +15,25 @@ def sanitize_model_filename(model_id: str) -> str:
     """Make a filesystem-safe stem from a model id."""
     stem = re.sub(r"[^A-Za-z0-9_.-]+", "-", model_id).strip("-")
     return stem or "model"
+
+
+def _skip_tokens(run) -> set[str]:
+    """Lowercased skip-phase tokens from advanced_settings + benchmark_params."""
+    toks: set[str] = set()
+    for src in (getattr(run, "advanced_settings", None), getattr(run, "benchmark_params", None)):
+        if not isinstance(src, dict):
+            continue
+        val = src.get("skip_phases")
+        if isinstance(val, str):
+            toks.update(p.strip().lower() for p in val.split(",") if p.strip())
+        elif isinstance(val, (list, tuple, set)):
+            toks.update(str(p).strip().lower() for p in val if str(p).strip())
+    return toks
+
+
+def is_exploratory_run(run) -> bool:
+    """True when the quality phase was skipped: speed-only exploration."""
+    return "quality" in _skip_tokens(run)
 
 
 def _fmt(value: object, na: str = "N/A") -> str:
@@ -176,6 +196,52 @@ def _failed_guidance(configs: list) -> list[str]:
     return hints
 
 
+def no_winner_title(status: Any) -> str:
+    """Title wording for a run with no validated winner.
+
+    Derived from the canonical run-level status, never from the presence of
+    failed candidates. A campaign that completed and produced usable output
+    but never passed the quality gate is NOT a run-level failure, and saying
+    "FAILED" would misreport it.
+    """
+    value = getattr(getattr(status, "value", status), "__str__", lambda: str(status))()
+    if value == RunStatus.FAILED.value:
+        return "FAILED run"
+    if value == RunStatus.CANCELLED.value:
+        return "CANCELLED run"
+    if value == RunStatus.INTERRUPTED.value:
+        return "INTERRUPTED run"
+    if value == RunStatus.PARTIAL_SUCCESS.value:
+        return "PARTIAL run"
+    return "NO WINNER"
+
+
+def no_winner_summary(status: Any) -> str:
+    """One-line explanation matching the title wording above."""
+    value = getattr(getattr(status, "value", status), "__str__", lambda: str(status))()
+    if value == RunStatus.FAILED.value:
+        return (
+            "Run-level failure: the model produced no usable output. "
+            "The table below shows why each candidate was rejected."
+        )
+    if value == RunStatus.CANCELLED.value:
+        return "Run was cancelled before a configuration passed validation."
+    if value == RunStatus.INTERRUPTED.value:
+        return "Run was interrupted before a configuration passed validation."
+    if value == RunStatus.PARTIAL_SUCCESS.value:
+        return (
+            "Campaign ended before finishing; no candidate passed validation. "
+            "Some candidates failed individually, which does not by itself "
+            "make the run failed."
+        )
+    return (
+        "Campaign completed and the model generated usable output, but no "
+        "configuration passed the configured quality threshold. This is an "
+        "honest terminal state, not an operational failure. Individual "
+        "candidate failures are listed per-config below."
+    )
+
+
 def save_failed_report(
     run: OptimizationRun,
     out_dir: str | Path = "results",
@@ -211,7 +277,7 @@ def save_failed_report(
         return "—"
 
     lines = [
-        f"# FAILED run: {run.model.id} (no validated winner)",
+        f"# {no_winner_title(run.status)}: {run.model.id} (no validated winner)",
         "",
         f"- Date: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
         f"- Profile: {run.profile.value}",
@@ -220,6 +286,8 @@ def save_failed_report(
         f"- Elapsed: {run.duration_seconds:.1f}s" if run.duration_seconds else "- Elapsed: N/A",
         f"- Configs tested: {len(configs)}",
         f"- Failure classes: {classes}",
+        "",
+        no_winner_summary(run.status),
         "",
         "## Per-config results",
         "",
@@ -280,6 +348,24 @@ def save_failed_report(
     lines += ["## Guidance", ""]
     for hint in _failed_guidance(configs):
         lines.append(f"- {hint}")
+    lines += ["", "## Failure signatures (grouped, with durations)", ""]
+    try:
+        from lm_optimizer.services.failure_states import (
+            failure_signature_rows,
+            should_stop_repeating,
+        )
+
+        lines += failure_signature_rows(configs)
+        verdict = should_stop_repeating(configs)
+        if verdict.get("trip"):
+            lines.append(
+                f"- Circuit-breaker TRIPPED: {verdict.get('count')}x "
+                f"'{verdict.get('signature')}' — {verdict.get('reason')}"
+            )
+        else:
+            lines.append(f"- Circuit-breaker: no trip ({verdict.get('reason')})")
+    except Exception:
+        lines.append("- Signature diagnostics unavailable.")
     lines += [""]
     path.write_text("\n".join(lines), encoding="utf-8")
     logger.info("Failed report saved", path=str(path))
@@ -502,6 +588,23 @@ def _per_test_rows(best) -> list[str]:
     return lines
 
 
+def _experimental_detail_rows(run) -> list[str]:
+    """Requested vs resolved vs applied experimental rows (legacy-safe)."""
+    detail = (getattr(run, "benchmark_params", None) or {}).get("experimental_detail")
+    if not detail:
+        return ["- No experimental detail recorded (legacy run)."]
+    rows = []
+    for key in ("enable_rope", "enable_cpu_moe", "enable_speculative"):
+        req = (detail.get("requested") or {}).get(key)
+        res = (detail.get("resolved") or {}).get(key)
+        app = (detail.get("applied") or {}).get(key)
+        exe = (detail.get("exercised") or {}).get(key)
+        rows.append(f"- {key}: requested={req} resolved={res} applied={app} exercised={exe}")
+    for key, reason in (detail.get("skipped") or {}).items():
+        rows.append(f"- {key} skipped: {reason}")
+    return rows
+
+
 def _verification_rows(best) -> list[str]:
     """Requested vs applied rows from the recorded load verification (§13)."""
     recorded = (best.generation or {}).get("load_verification") or {}
@@ -550,13 +653,16 @@ def save_best_report(
     host: dict | None = None,
     extra: dict | None = None,
     generation: dict | None = None,
+    sort: str = "run",
 ) -> Path | None:
     """Save a per-model .md file with the best settings. Returns path or None.
 
     Filename and every identity claim derive from the run's own stored
     model_id (never execution order or selection state). `generation`:
     recommended sampling settings {temperature, top_p, top_k, min_p,
-    presence_penalty, reasoning, source}.
+    presence_penalty, reasoning, source}. `sort`: tested-configs table
+    order — "run" (execution order), "speed" (gen tok/s desc) or
+    "quality" (overall desc); unknown falls back to "run".
     """
     best = run.get_best_config()
     if best is None:
@@ -566,7 +672,9 @@ def save_best_report(
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     # Canonical model identity from the actual run (§6/§33).
-    path = out / f"{sanitize_model_filename(run.model.id)}-best.md"
+    exploratory = is_exploratory_run(run)
+    suffix = "-explore.md" if exploratory else "-best.md"
+    path = out / f"{sanitize_model_filename(run.model.id)}{suffix}"
 
     bc = best.config
     qs = best.quality_score
@@ -580,19 +688,61 @@ def save_best_report(
     storage = host.get("storage") or {}
     drives = storage.get("drives") or []
     trio = _context_trio([c for c in configs if c.status.value == "passed"])
+    tested = [c for c in configs if c.status.value == "passed"]
+    failed = [c for c in configs if c.status.value != "passed"]
+    pareto = run.get_pareto_configs()
+
+    order = (sort or "run").lower()
+    if order == "speed":
+        ordered = sorted(tested, key=lambda c: c.get_avg_generation_tok_s(), reverse=True)
+    elif order == "quality":
+        ordered = sorted(
+            tested,
+            key=lambda c: (c.quality_score.overall if c.quality_score else -1.0),
+            reverse=True,
+        )
+    else:
+        order = "run"
+        ordered = list(tested)
 
     def tried(get):
         return _tried(configs, get)
 
     lines = (
         [
-            f"# Best settings: {run.model.id}",
+            f"# Best settings: {run.model.id}" if not exploratory
+            else f"# Exploratory settings (NOT quality-validated): {run.model.id}",
             "",
             f"- Date: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
             f"- Profile: {run.profile.value} (style: {style})",
             f"- Run: {run.id} (status: {run.status.value})",
             f"- Optimizer: {run.optimizer_version}",
             f"- Elapsed: {run.duration_seconds:.1f}s" if run.duration_seconds else "- Elapsed: N/A",
+        ]
+        + (
+            [
+                "- quality_validated: false (quality phase skipped — speed-only exploration)",
+                "- This file never overwrites the validated -best.md report.",
+                "",
+            ]
+            if exploratory
+            else [""]
+        )
+        + [
+            "## Results",
+            "",
+            f"- Generation: {best.get_avg_generation_tok_s():.1f} tok/s",
+            f"- Prompt: {best.get_avg_prompt_tok_s():.0f} tok/s",
+            f"- Est. TTFT: {best.get_avg_estimated_ttft_ms():.0f} ms",
+            (
+                f"- Quality: {qs_best.overall:.3f} "
+                f"({qs_best.checks_passed}/{qs_best.checks_total} checks)"
+                if (qs_best := best.quality_score) is not None
+                else "- Quality: N/A"
+            ),
+            f"- Context: {best.context_length}",
+            f"- Verdict: winner of {len(tested)} tested (non-inferiority band, "
+            f"profile {run.profile.value})",
             "",
             "## Model identity (from this run, not execution order)",
             "",
@@ -649,18 +799,17 @@ def save_best_report(
             "(gpu_ratio excluded). GUI-only items (KV quant, offload ratio, threads) "
             "must be set on the host.",
             "",
-            "## Control channels (per parameter, registry-driven)",
-            "",
-            "| Parameter | Channel | Programmatic |",
-            "| --- | --- | --- |",
-        ]
-        + _channel_rows(best)
-        + [
             "",
             "## Requested vs applied (winner load verification)",
             "",
         ]
         + _verification_rows(best)
+        + [
+            "",
+            "## Experimental detail (requested vs applied)",
+            "",
+        ]
+        + _experimental_detail_rows(run)
         + [
             "",
             "## Winner typical across identical runs",
@@ -710,8 +859,6 @@ def save_best_report(
             "",
         ]
 
-    pareto = run.get_pareto_configs()
-    tested = [c for c in run.configurations if c.status.value == "passed"]
     max_passing_ctx = max((c.context_length for c in tested), default=None)
     lines += [
         f"Max passing context: {max_passing_ctx} (among {len(tested)} passed configurations)",
@@ -762,21 +909,52 @@ def save_best_report(
             )
         lines += [""]
     lines += ["## Tested configurations (passed)", ""]
-    lines += ["| ctx | flash | KV | batch | gen tok/s | quality | score | status |"]
-    lines += ["| --- | --- | --- | --- | --- | --- | --- | --- |"]
-    for c in tested:
+    lines += [
+        "| # | ctx | flash | KV | batch | phys | par | gen tok/s | prompt tok/s | "
+        "TTFT ms | VRAM GB | quality | score | status |"
+    ]
+    lines += [
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
+    ]
+    for i, c in enumerate(ordered, 1):
         q = f"{c.quality_score.overall:.3f}" if c.quality_score else "N/A"
+        vram = f"{c.peak_vram_gb:.1f}" if c.peak_vram_gb is not None else "—"
         lines.append(
-            f"| {c.context_length} | {_fmt(c.config.flash_attention)} | "
+            f"| {i} | {c.context_length} | {_fmt(c.config.flash_attention)} | "
             f"{'GPU' if c.config.offload_kv_cache_to_gpu else 'CPU'} | "
-            f"{_fmt(c.config.eval_batch_size)} | {c.get_avg_generation_tok_s():.1f} | "
-            f"{q} | {_score_str(c.score)} | PASS |"
+            f"{_fmt(c.config.eval_batch_size)} | {_fmt(c.config.physical_batch_size)} | "
+            f"{_fmt(c.config.parallel)} | {c.get_avg_generation_tok_s():.1f} | "
+            f"{c.get_avg_prompt_tok_s():.0f} | {c.get_avg_estimated_ttft_ms():.0f} | "
+            f"{vram} | {q} | {_score_str(c.score)} | PASS |"
         )
     if len(pareto) != len(tested):
         lines += ["", f"Pareto-optimal: {len(pareto)} of {len(tested)} passed."]
+    else:
+        lines += ["", "Pareto-optimal: all tested configurations are non-dominated."]
+    # Winner transparency (audit): the winner is chosen progressively during
+    # the run under then-current score bounds and is finalized as the median
+    # validated copy of its config. A different eligible config may end the
+    # run with a higher recomputed score; surface that explicitly.
+    better = [
+        c
+        for c in configs
+        if c.id != best.id
+        and c.status.value == "passed"
+        and c.score is not None
+        and best.score is not None
+        and c.score > best.score * 1.05
+    ]
+    if better:
+        top = max(better, key=lambda c: c.score)
+        lines += [
+            "",
+            f"NOTE: config {top.id} closed with a higher recomputed score "
+            f"({top.score:.3f} vs winner {best.score:.3f}); winner was "
+            "selected under running bounds during the search (winner remains "
+            "the median of its final validation).",
+        ]
     lines += [""]
 
-    failed = [c for c in run.configurations if c.status.value != "passed"]
     if failed:
         lines += ["## Failed configurations (with reasons)", ""]
         lines += ["| ctx | flash | KV | batch | status | reason |"]
@@ -823,6 +1001,18 @@ def save_best_report(
         if best_val is None and name in server_defaults:
             best_val = f"server default ({server_defaults[name]})"
         lines.append(f"| {name} | {shown} | {best_val} |")
+    lines += [""]
+
+    lines += [
+        "## Control channels (per parameter, registry-driven)",
+        "",
+        "Which knobs the optimizer can turn itself during a run (and how), "
+        "vs what stays fixed or needs manual/CLI steps.",
+        "",
+        "| Parameter | Channel | Programmatic |",
+        "| --- | --- | --- |",
+    ]
+    lines += _channel_rows(best)
     lines += [""]
 
     notes = _prune_notes(run, configs)
@@ -887,6 +1077,74 @@ def save_best_report(
             if pb.get("spill_note"):
                 lines.append(f"- Note: {pb.get('spill_note')}")
             lines += [""]
+
+    # --- Speed floor outcome (spec §3) ---
+    floor = (run.search_space or {}).get("speed_floor")
+    if isinstance(floor, dict):
+        lines += ["## Speed floor", ""]
+        lines.append(
+            f"- Floor: {floor.get('value', 'N/A')} tok/s "
+            f"({'enforced' if floor.get('enforced') else 'informational'})"
+        )
+        lines.append(f"- Met: {floor.get('met')}")
+        fastest = floor.get("fastest_tok_s")
+        if fastest is not None:
+            lines.append(
+                f"- Fastest candidate: {fastest} tok/s "
+                f"(id {str(floor.get('fastest_candidate_id') or 'N/A')[:8]}) "
+                "- shown even when below the floor"
+            )
+        if floor.get("enforced") and not floor.get("met"):
+            lines.append(
+                "- Outcome: NO CONFIG MEETS SPEED FLOOR; no winner was "
+                "promoted. The fastest candidate is diagnostic only."
+            )
+        lines += [""]
+
+    # --- Context strategies (spec §5) ---
+    strategies = ((pab.get("phase_b_result") or {}).get("context_strategies")) or {}
+    if isinstance(strategies, dict) and strategies:
+        lines += [
+            "## Context strategies",
+            "",
+            "| Strategy | Available | Max stable | Max usable | Note |",
+            "| --- | --- | --- | --- | --- |",
+        ]
+        for name, info in strategies.items():
+            info = info if isinstance(info, dict) else {}
+            note = info.get("reason") or info.get("error") or ""
+            lines.append(
+                f"| {name} | {info.get('available', True)} | "
+                f"{info.get('max_stable_context', 'N/A')} | "
+                f"{info.get('max_usable_context', 'N/A')} | {str(note)[:120]} |"
+            )
+        lines += [""]
+
+    # --- Scheduled artifact test (fourth option) ---
+    artifact = (run.benchmark_params or {}).get("artifact_test")
+    if isinstance(artifact, dict) and artifact:
+        lines += ["## Artifact test (post-run)", ""]
+        lines.append(
+            f"- Task: {artifact.get('task_id', '?')} "
+            f"({artifact.get('task_kind', '?')})"
+        )
+        lines.append(f"- Success: {artifact.get('success')}")
+        if artifact.get("manual_review_only"):
+            lines.append("- Score: n/a (manual review only, no checks)")
+        else:
+            score = artifact.get("score")
+            lines.append(
+                f"- Score: {score if score is not None else 'n/a'}"
+            )
+        if artifact.get("config_id"):
+            lines.append(f"- Config: {str(artifact.get('config_id'))[:8]}")
+        if artifact.get("echo_mismatches"):
+            lines.append(f"- Requested vs applied: {artifact.get('echo_mismatches')}")
+        if artifact.get("unloaded") is not None:
+            lines.append(f"- Unloaded: {artifact.get('unloaded')}")
+        if artifact.get("error"):
+            lines.append(f"- Error: {artifact.get('error')}")
+        lines += [""]
 
     lines += [
         "## How quality and score work",

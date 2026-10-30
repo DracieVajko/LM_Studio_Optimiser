@@ -139,7 +139,7 @@ class TestScorelessRowsPassThrough:
         base = Path(__file__).parent.parent
         unversioned = []
         for f in (base / "ui" / "templates").glob("*.html"):
-            for m in re.finditer(r"""src="(/static/js/[\w-]+\.js)(\?v=\d+)?\"""", f.read_text()):
+            for m in re.finditer(r"""src="(/static/js/[\w-]+\.js)(\?v=\d+)?\"""", f.read_text(encoding="utf-8")):
                 if not m.group(2):
                     unversioned.append(f"{f.name}: {m.group(1)}")
         assert not unversioned, f"unversioned scripts: {unversioned}"
@@ -411,7 +411,7 @@ class TestNavUnified:
         pages = ["dashboard.html", "history.html", "results.html", "settings.html",
                  "sandbox.html", "json.html"]
         for name in pages:
-            text = (base / "ui" / "templates" / name).read_text()
+            text = (base / "ui" / "templates" / name).read_text(encoding="utf-8")
             assert 'viewBox="0 0 24 24"' in text, f"{name} missing logo"
             assert 'id="lm-status"' in text, f"{name} missing status badge"
             assert "theme-toggle" in text, f"{name} missing theme toggle"
@@ -760,14 +760,14 @@ class TestDarkMode:
         from pathlib import Path
 
         base = Path(__file__).parent.parent
-        css = (base / "ui" / "static" / "css" / "app.css").read_text()
+        css = (base / "ui" / "static" / "css" / "app.css").read_text(encoding="utf-8")
         assert ".dark body" in css, "dark surface overrides missing"
         assert ".dark .card" in css, "dark card overrides missing"
         for f in (base / "ui" / "templates").glob("*.html"):
-            text = f.read_text()
+            text = f.read_text(encoding="utf-8")
             assert "theme.js?v=" in text, f"{f.name} missing theme.js"
             assert "theme-toggle" in text, f"{f.name} missing toggle button"
-        theme = (base / "ui" / "static" / "js" / "theme.js").read_text()
+        theme = (base / "ui" / "static" / "js" / "theme.js").read_text(encoding="utf-8")
         assert "prefers-color-scheme" in theme, "must follow OS theme by default"
         assert "localStorage" in theme, "must persist choice"
 
@@ -802,7 +802,7 @@ class TestJsSyntax:
             (base / "ui" / "static" / "js").glob("*.js")
         )
         for f in targets:
-            for m in re.finditer(r"[\"'](?:\./|/static/js/)([\w-]+\.js)\?v=(\d+)", f.read_text()):
+            for m in re.finditer(r"[\"'](?:\./|/static/js/)([\w-]+\.js)\?v=(\d+)", f.read_text(encoding="utf-8")):
                 versions.add(m.group(2))
                 if not (base / "ui" / "static" / "js" / m.group(1)).exists():
                     missing.append(f"{f.name} -> {m.group(1)}")
@@ -817,7 +817,7 @@ class TestJsSyntax:
         js_dir = Path(__file__).parent.parent / "ui" / "static" / "js"
         bad = []
         for f in sorted(js_dir.glob("*.js")):
-            for m in re.finditer(r'class="[^"]*space-y-\d+[^"]*grid[^"]*"', f.read_text()):
+            for m in re.finditer(r'class="[^"]*space-y-\d+[^"]*grid[^"]*"', f.read_text(encoding="utf-8")):
                 bad.append(f"{f.name}: {m.group(0)[:80]}")
         assert not bad, f"grid/space-y collision: {bad}"
 

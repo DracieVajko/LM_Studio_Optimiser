@@ -9,20 +9,28 @@ on:
 jobs:
   pytest:
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
       - name: Install
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
+      - name: Undefined names (annotations evaluated eagerly on 3.12)
+        # Catches NameError-at-import regressions that Python 3.14 defers.
+        run: python -m ruff check lm_optimizer tests --select F821
       - name: Tests
-        run: python -m pytest lm_optimizer/tests -q
+        # Full suite: both test roots (lm_optimizer/tests and tests/).
+        run: python -m pytest -q
       - name: UI syntax check
         run: |
-          for f in lm_optimizer/ui/static/js/*.js; do node --check "$f"; done
+          python -c "import glob, subprocess; [subprocess.check_call(['node', '--check', f]) for f in glob.glob('lm_optimizer/ui/static/js/*.js')]"

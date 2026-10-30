@@ -2,6 +2,75 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- **Test manager + recommender** (integrated in `lab`): `lab test-manager` (intelligent ordering, MoE before dense, VRAM floor 250-500MB, partial results, assistant opt-in via `.env`); `lab recommend`; `lab clean`; `docs/specs/2026-10-28-test-manager-design.md` approved; no web access by default; folder-bound isolation.
+- **Persistence loop**: timestamped backups (`optimizer-backup-<utc>`), keep newest 10, legacy `.optimizer-backup` recognized; `lab diff-default`, `lab restore-default`, `lab verify-default`; `GET /api/model-default`, `GET /api/runs/{run_id}/default-diff`, `POST /api/model-default/restore`, `POST /api/runs/{run_id}/verify-default`, `POST /api/runs/{run_id}/save-default?verify=true`; Results-page diff before save; model-detail "LM Studio default" card.
+- **Persist the winner in LM Studio**: `lm-optimizer lab save-default <run-id>`,
+  `POST /api/runs/{run-id}/save-default` and a Results-page **Save as LM Studio
+  default** button write the validated winner into
+  `~/.lmstudio/.internal/user-concrete-model-default-config/<model>.json`.
+  The merge preserves unknown keys/presets, writes atomically, backs up the
+  previous file, supports `--dry-run`, and never overwrites unreadable files.
+  Verified live: `contextLength`, `llama.flashAttention` and
+  `offloadKVCacheToGpu` are applied on the next load without an LM Studio
+  restart. Config-export instructions updated accordingly.
+
+## [1.8.0] - 2026-10-27
+
+### Added
+- **Presets** (`quick`, `standard`, `thorough`, `custom`) with frozen budgets persisted in `benchmark_params.resolved_settings`; resume restores them verbatim
+- **Speed floor** (`--min-generation-tok-s`, default 2.0; `--no-enforce-min-generation-speed`) with explicit `NO_CONFIG_MEETS_SPEED_FLOOR` and a visible fastest diagnostic candidate
+- **Stage selection** (`--stage`, custom preset) with dependency warnings; `--optimize-context` wins over a preset without the context stage
+- **Context strategies** (`winner`, `gpu_resident`, `model_first_kv_cpu`, `system_spillover`) gated by capability/CLI channel
+- **Scheduled artifact test** (`--artifact-test <builtin|custom:path>`): runs last on the exact winner, records applied config/echo, score only with checks, exposed for history/compare
+- **Config export**: `GET /api/runs/{id}/export-config` and `lab export-config` (REST params, vLLM engine config, llama.cpp instructions)
+- **Web UI**: single Brewery nav (Lab + Experiments), history bulk select/delete/re-run/compare, Ask Judge enabled, Save LM Studio config button, dashboard model dropdown, custom priorities 0.00-1.00 + hard speed target
+
+### Fixed
+- Variant models failed to load with HTTP 404 (`selected_variant` used as the load id instead of the LM Studio key)
+- `max_speed_probes`, `validation_repetitions_min/max` and preset benchmark repetitions were stored but never applied
+- Empty CLI lists (e.g. `--stage` unset) overrode preset stage/strategy defaults
+- `no_winner_reason` was memory-only; now persisted in `benchmark_params`
+- Unload verification cancelled live runs on a stale inventory entry (now 3 attempts with settle delays)
+- `final_recommendation()` could promote a scoreless speed probe
+- Reasoning-sweep levels were unscored (`0/0 checks`); unknown tests no longer score 1.0
+- Sandbox presets aborted the page script (`renderPresets` before `PRESETS`); charts rendered twice; Ask Judge permanently disabled
+- `Path(...).name` failed cross-platform for foreign path styles (CI)
+- Python 3.12 annotation NameErrors missed locally on 3.14
+
+## [1.6.0] - 2026-10-11
+
+### Added
+- **Phase skipping** (`--skip-phases speed,quality,recovery,validation,context`) on `optimize`, `auto`, `resume`, `resume-menu --all` — skips persist in run checkpoints and survive restarts
+- **Quality ladder** (`ctx --quality-rungs N --quality-threshold 0.97`) runs full quality suites on top-N stable ladder rungs (ctx, tok/s, quality, checks, VRAM, TTFT, PASS/FAIL table)
+- **Faster tests**: `--warmup-runs 0-5` (default 1) on `optimize` / `auto` / `ctx` — `0` skips warmup suite pass per config (~15-20% faster, slightly noisier first measurements)
+- **Richer reports**: `--report-sort run|speed|quality` reorders tested-configs table; Results block first, then best config, HW details, test details, tried configs, methodology last
+- **Wider grid**: `--physical-batches 256,512,1024` adds eval batch size as search dimension (`optimize` / `auto`)
+- **GUI Dashboard**: Skip phases checkboxes, Warmup runs input, Report sort selector
+- **GUI History**: "Resume All Pending" finishes `paused`, `partial_success`, `interrupted` runs
+- **Ollama probe matrix** (`ollama-probe`): connect/list/show/generate/think-fallback/ctx-timings/unload-verify
+- **Ollama adapters**: `chat_completion` + `ensure_unloaded` + thinking capture
+- **Ollama Modelfile workflow**: `--from-show` (live defaults) + `--probe-max-ctx` (ladder probe) + apply as `<base>-best`; config dir `ollama-configs/`
+- **Apply-menu picker**: `apply-menu --backend lmstudio|ollama` (presets + modelfiles); `apply` failure hints (no preset / failed load)
+
+### Fixed
+- **Bugfix**: `_benchmark_config_obj` double-construction lost `max_tokens_scale` — now single construction with `warmup_runs`
+- **macOS CI**: `get_cpu_info()` frequency fallback already in place (1.5.1)
+
+## [1.5.1] - 2026-10-07
+
+### Added
+- **Web UI Pause/Resume**: Pause and Resume buttons on Results page for running/paused runs
+- **Resume All Pending**: "Resume All Pending" button on History page to bulk-resume paused runs
+- **API endpoints**: `POST /api/runs/{run_id}/pause` and `POST /api/runs/{run_id}/resume` for any run with checkpoint
+- **Partial Success Resume**: Resume from checkpoint skips already-completed candidates (no re-runs)
+
+### Fixed
+- **DB Cleanup**: Removed 7 model entries not present in LM Studio
+- **API imports**: Moved `checkpoint_dir`, `load_checkpoint`, `orjson`, `Path`, `datetime` to module level for testability
+
 ## [1.5.0b1] - 2026-10-03 - BETA
 
 Ollama backend is beta (implemented, mocked-test evidence only, no live
@@ -278,7 +347,7 @@ Physical end-to-end LM Studio validation is still pending.
 - Recommended card and table reading config from wrong level (always OFF/CPU/Auto); comparison modal X button (module-scope handler).
 - Double-prefix route `/api/api/runs/...`; SPA nav hijack swallowing new pages; asset cache-busting versions.
 
-## [Unreleased]
+## [1.7.0] - 2026-10-27
 
 ### Planned
 - Docker support with GPU access
@@ -289,3 +358,6 @@ Physical end-to-end LM Studio validation is still pending.
 - Comparison view between runs
 - Scheduled optimization runs
 - Model quantization recommendations
+- **Ollama defaults persistence**: lab ollama-save-default, lab ollama-diff-default, lab ollama-restore-default, GET /api/ollama-default, POST /api/runs/{run_id}/save-ollama-default, GET /api/runs/{run_id}/ollama-default-diff — mirrors LM Studio persistence loop for Ollama config.
+- **Speculative decoding + KV cache auto-tuning**: uto_tune_speculative() (draftSimple, max_tokens=3), uto_tune_kv_cache() (VRAM-based q8_0/q4_0/f16 selection).
+- **Monitoring integration**: wire_monitoring() connects HardwareDetector to TestManager for real-time VRAM profiling.

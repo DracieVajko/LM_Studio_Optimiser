@@ -131,8 +131,7 @@ set /p oprofile="Profile speed/balanced/context/quality - default balanced: "
 if "%oprofile%"=="" set oprofile=balanced
 echo Selected model: %omodel%
 echo Profile: %oprofile%
-set /p oconfirm="Start optimization? Y/n: "
-if /i not "%oconfirm%"=="Y" if not "%oconfirm%"=="" goto menu
+echo Python pre-flight will show the summary and ask for confirmation.
 call :log "optimize %omodel% profile %oprofile%"
 "%PYBIN%" -m lm_optimizer optimize "%omodel%" --profile "%oprofile%"
 echo.

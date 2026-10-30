@@ -60,6 +60,92 @@ def _sample_mem() -> dict:
         return {}
 
 
+def _collect_thermal() -> dict:
+    """Thermal/power snapshot after a generation (spec §11.4).
+
+    Missing values stay None (never fabricated). A GPU above 85 C is flagged
+    as thermally contaminated so a winner cannot silently be a throttled
+    measurement.
+    """
+    try:
+        from lm_optimizer.services.metrics_providers import collect_metrics
+
+        metrics = collect_metrics()
+    except Exception:
+        return {}
+    gpu = metrics.gpus[0] if metrics.gpus else None
+    temp = getattr(gpu, "temperature_c", None)
+    flag = "throttled" if isinstance(temp, (int, float)) and temp >= 85.0 else ""
+    return {
+        "gpu_temp_c": temp,
+        "gpu_util_pct": getattr(gpu, "utilization_pct", None),
+        "gpu_power_w": getattr(gpu, "power_w", None),
+        "on_ac": metrics.power.on_ac,
+        "thermal_flag": flag,
+    }
+
+
+def _extract_mtp_metrics(stats: dict | None) -> dict:
+    """MTP / speculative-decoding metrics from the server's chat stats.
+
+    LM Studio's native /api/v1/chat `stats` object may expose draft token
+    counters when speculative decoding or MTP is active. Field spelling
+    differs between runtime versions, so every accepted alias is probed and
+    the FIRST match wins. Missing fields stay at their honest defaults
+    (0 proposed / 0 accepted / 0.0 acceptance) - never fabricated.
+
+    A non-empty result means the server really reported the counters; an
+    empty dict means "not exposed" and the caller keeps the neutral values.
+    """
+    if not isinstance(stats, dict):
+        return {}
+
+    def _int(*keys: str) -> int:
+        for key in keys:
+            value = stats.get(key)
+            if isinstance(value, (int, float)):
+                return int(value)
+        return 0
+
+    def _float(*keys: str) -> float:
+        for key in keys:
+            value = stats.get(key)
+            if isinstance(value, (int, float)):
+                return float(value)
+        return 0.0
+
+    proposed = _int(
+        "draft_tokens_proposed",
+        "draft_tokens",
+        "predicted_draft_tokens",
+        "speculative_draft_tokens",
+        "n_draft",
+    )
+    accepted = _int(
+        "draft_tokens_accepted",
+        "accepted_draft_tokens",
+        "draft_tokens_accepted_count",
+        "n_accepted",
+    )
+    acceptance = _float(
+        "draft_acceptance_rate",
+        "acceptance_rate",
+        "draft_tokens_accepted_ratio",
+    )
+    if acceptance <= 0.0 and proposed > 0 and accepted > 0:
+        acceptance = accepted / proposed
+
+    if proposed <= 0 and accepted <= 0 and acceptance <= 0.0:
+        # Server exposed no draft counters at all: leave the neutral values.
+        return {}
+
+    return {
+        "draft_tokens_proposed": proposed,
+        "draft_tokens_accepted": accepted,
+        "acceptance_rate": round(acceptance, 4),
+    }
+
+
 def _peak_usage(before: dict | None, after: dict | None) -> tuple[float | None, float | None]:
     """Peak GB used = total - min(free) over snapshots; None if unmeasurable."""
     peak_vram = peak_ram = None
@@ -120,6 +206,18 @@ class BenchmarkService:
         style: str = "balanced",
         reasoning: str | None = "off",
         gpu_via_cli: bool = False,
+        include_categories: set[str] | None = None,
+        test_only: bool = False,
+        speed_only: bool = False,
+        quality_only: bool = False,
+        speed_context: int | None = None,
+        mtp_test: bool = False,
+        reasoning_sweep: bool = False,
+        quality_lab: bool = False,
+        test_names: list[str] | None = None,
+        flash_attention: bool = True,
+        offload_kv_cache_to_gpu: bool = True,
+        min_tps: float = 1.0,
     ):
         self.client = client
         self.config = benchmark_config or BenchmarkConfig(
@@ -133,10 +231,31 @@ class BenchmarkService:
         # --gpu` when enabled (and available); otherwise REST with the ratio
         # recorded-but-not-applied (never silently claimed as applied).
         self.gpu_via_cli = gpu_via_cli
+        self.include_categories = include_categories
+        self.test_only = test_only
+        self.speed_only = speed_only
+        self.quality_only = quality_only
+        self.speed_context = speed_context
+        self.mtp_test = mtp_test
+        self.reasoning_sweep = reasoning_sweep
+        self.quality_lab = quality_lab
+        self.flash_attention = flash_attention
+        self.offload_kv_cache_to_gpu = offload_kv_cache_to_gpu
+        self.min_tps = min_tps
+        # --test / --test-only: exact case names to run.
+        self.test_names = [str(n) for n in (test_names or []) if str(n).strip()]
+        # Set (model id) only when the trailing ensure_unloaded of an attempt
+        # could NOT verify the model left the host. The optimizer reads this
+        # between candidates and refuses to load another memory-heavy config.
+        # None means the last attempt verified an empty state.
+        self.last_unverified_unload: str | None = None
         # Benchmarks score the ANSWER, not the thinking trace (R32). The native
         # chat endpoint exposes reasoning off/low/medium/high/on; default off
         # keeps outputs deterministic and scorable.
         self.reasoning = reasoning
+        # MTP / KV cache settings
+        self.flash_attention = flash_attention
+        self.offload_kv_cache_to_gpu = offload_kv_cache_to_gpu
 
     async def _channel_load(
         self, model_id: str, cfg: LoadConfiguration
@@ -146,8 +265,29 @@ class BenchmarkService:
         Returns (ok, identifier_or_error, loaded_config, channel, applied,
         load_error). CLI is used only for gpu_ratio REST cannot express and
         only when enabled + available; CLI failure falls back to REST.
+
+        A pre-load unload guarantees that a slow unload under host load can
+        never leave the previous instance alive and make this load a SECOND
+        instance of the same model (observed live 2026-10-22: two copies of
+        one LLM in LM Studio).
         """
         from lm_optimizer.services import control_adapter as _ca
+
+        try:
+            if not await self.client.ensure_unloaded(model_id):
+                self.last_unverified_unload = model_id
+                return (
+                    False,
+                    None,
+                    None,
+                    "precheck",
+                    None,
+                    "model is still loaded after an unload attempt; refusing to "
+                    "stack a second instance",
+                )
+            self.last_unverified_unload = None
+        except Exception as e:  # noqa: BLE001 - a failed precheck must not crash the run
+            logger.warning("Pre-load unload check failed", model=model_id, error=str(e)[:160])
 
         if (
             self.gpu_via_cli
@@ -207,10 +347,16 @@ class BenchmarkService:
             return False, 0.0, f"{type(e).__name__}: {e}"
         finally:
             try:
-                if not await self.client.ensure_unloaded(model_id):
+                if await self.client.ensure_unloaded(model_id):
+                    self.last_unverified_unload = None
+                else:
+                    self.last_unverified_unload = model_id
                     logger.warning("Smoke left model loaded", model=model_id)
-            except Exception:
-                pass
+            except Exception as e:
+                self.last_unverified_unload = model_id
+                logger.warning(
+                    "Smoke unload verification failed", model=model_id, error=str(e)[:160]
+                )
 
     async def measure_throughput(
         self,
@@ -288,13 +434,22 @@ class BenchmarkService:
             return out
         finally:
             try:
-                if not await self.client.ensure_unloaded(model_id):
+                if await self.client.ensure_unloaded(model_id):
+                    self.last_unverified_unload = None
+                else:
+                    self.last_unverified_unload = model_id
                     logger.warning("Throughput probe left model loaded", model=model_id)
-            except Exception:
-                pass
+            except Exception as e:
+                self.last_unverified_unload = model_id
+                logger.warning(
+                    "Throughput unload verification failed",
+                    model=model_id, error=str(e)[:160],
+                )
 
     def create_cases_for_context(
-        self, context_length: int, style: str | None = None
+        self, 
+        context_length: int, 
+        style: str | None = None,
     ) -> list[BenchmarkCase]:
         """Create benchmark cases adapted for the given context length and style."""
         from lm_optimizer.benchmark.suite import create_benchmark_cases
@@ -306,6 +461,34 @@ class BenchmarkService:
         except (TypeError, ValueError):
             scale = 1.0
         scale = min(1.0, max(0.25, scale))
+        
+        # Determine context length for speed_only mode
+        effective_context = self.speed_context if self.speed_only and self.speed_context else context_length
+        
+        cases = create_benchmark_cases(
+            effective_context, 
+            include_categories=self.include_categories,
+            reasoning_sweep=self.reasoning_sweep
+        )
+
+        # --test / --test-only: restrict the suite to the named tests. Names
+        # are the exact case names (short_instruction, medium_reasoning,
+        # long_context, coding_task, structured_output). Unknown names are
+        # kept out with a warning so a typo cannot silently run everything.
+        names = getattr(self, "test_names", None)
+        if names:
+            wanted = [str(n).strip().lower() for n in names if str(n).strip()]
+            selected = [c for c in cases if c.name.lower() in wanted]
+            missing = sorted(set(wanted) - {c.name.lower() for c in selected})
+            if missing:
+                logger.warning("Unknown --test name(s) ignored", missing=missing)
+            if not selected:
+                # Never silently fall back to the full suite.
+                raise ValueError(
+                    f"None of the requested tests exist: {missing or names}"
+                )
+            cases = selected
+
         return [
             BenchmarkCase(
                 name=c.name,
@@ -315,7 +498,7 @@ class BenchmarkService:
                 temperature=overrides.get(c.category, c.temperature),
                 stop_sequences=c.stop_sequences,
             )
-            for c in create_benchmark_cases(context_length)
+            for c in cases
         ]
 
     async def run_benchmark(
@@ -325,12 +508,43 @@ class BenchmarkService:
         context_length: int,
         style: str | None = None,
         reasoning: str | None = None,
+        keep_loaded: bool = False,
+        assume_loaded: bool = False,
     ) -> ConfigurationResult:
         """Run full benchmark suite for a configuration."""
         cases = self.create_cases_for_context(context_length, style=style or self.style)
         return await self.run_cases(
-            model_id, load_config, context_length, cases, style=style, reasoning=reasoning
+            model_id,
+            load_config,
+            context_length,
+            cases,
+            style=style,
+            reasoning=reasoning,
+            keep_loaded=keep_loaded,
+            assume_loaded=assume_loaded,
         )
+
+    async def _already_loaded_matches(
+        self, model_id: str, load_config: LoadConfiguration
+    ) -> bool:
+        """True when the server already has this exact config loaded.
+
+        Compares only the keys we would send; server-side defaults for other
+        keys are irrelevant. Used by final validation to avoid re-loading the
+        same winner between repetitions (loads dominate slow models).
+        """
+        try:
+            instances = await self.client.get_loaded_instances()
+        except Exception:
+            return False
+        requested = load_config.to_api_params()
+        for inst in instances:
+            if inst.get("model") != model_id:
+                continue
+            echo = inst.get("config") or {}
+            if all(echo.get(k) == v for k, v in requested.items()):
+                return True
+        return False
 
     async def run_cases(
         self,
@@ -342,12 +556,18 @@ class BenchmarkService:
         warmup_repetitions: int | None = None,
         style: str | None = None,
         reasoning: str | None = None,
+        keep_loaded: bool = False,
+        assume_loaded: bool = False,
     ) -> ConfigurationResult:
         """Run an explicit case list (full suite or a recovery subset).
 
         Same load → verify → preheat → measured → unload skeleton as the
         former run_benchmark body; only the case list varies. `warmup=0`
         disables preheat chats (measured runs still execute).
+
+        `assume_loaded` skips the load when the server already reports the same
+        config; `keep_loaded` skips the trailing unload (caller must unload).
+        Both default off, so legacy behaviour is unchanged.
         """
         from uuid import uuid4
 
@@ -368,21 +588,34 @@ class BenchmarkService:
         logger.info("Starting benchmark", config_id=str(config_id), model=model_id)
 
         load_time_ms = 0.0
+        loaded_ok = False
         try:
             # Load model inside try: any failure from here on still unloads.
             from lm_optimizer.services import control_adapter as _ca
 
-            load_start = time.perf_counter()
-            ok, _ident, loaded_cfg, channel, applied, load_err = await self._channel_load(
-                model_id, load_config
-            )
-            load_time_ms = (time.perf_counter() - load_start) * 1000
+            if assume_loaded and await self._already_loaded_matches(model_id, load_config):
+                # Warm path: the exact config is already loaded, so skip the
+                # load (and the pre-load unload) and reuse the server state.
+                ok, loaded_cfg, channel, applied, load_err = (
+                    True,
+                    load_config,
+                    "warm",
+                    load_config.to_api_params(),
+                    None,
+                )
+            else:
+                load_start = time.perf_counter()
+                ok, _ident, loaded_cfg, channel, applied, load_err = await self._channel_load(
+                    model_id, load_config
+                )
+                load_time_ms = (time.perf_counter() - load_start) * 1000
 
             if not ok:
                 result.status = "failed"
                 result.error = load_err
                 result.tested_at = datetime.now()
                 return result
+            loaded_ok = True
 
             # Use actual loaded config
             actual_config = loaded_cfg or load_config
@@ -460,9 +693,25 @@ class BenchmarkService:
             result.status = "failed"
             result.error = str(e)
         finally:
-            # Always unload and verify server state
-            if not await self.client.ensure_unloaded(model_id):
-                logger.warning("Model may still be loaded", model=model_id)
+            if keep_loaded and loaded_ok:
+                # Caller keeps the winner loaded for warm validation and is
+                # responsible for the final verified unload. Not marking it
+                # dirty is correct: the model is intentionally still loaded.
+                self.last_unverified_unload = None
+            else:
+                # Always unload and verify server state; an unverified leftover
+                # flags the host dirty (the optimizer stops before its next load).
+                try:
+                    if await self.client.ensure_unloaded(model_id):
+                        self.last_unverified_unload = None
+                    else:
+                        self.last_unverified_unload = model_id
+                        logger.warning("Model may still be loaded", model=model_id)
+                except Exception as e:
+                    self.last_unverified_unload = model_id
+                    logger.warning(
+                        "Unload verification failed", model=model_id, error=str(e)[:160]
+                    )
 
         logger.info("Benchmark complete", config_id=str(config_id), status=result.status)
         return result
@@ -678,6 +927,9 @@ class BenchmarkService:
                 (prompt_tokens / (prompt_processing_ms / 1000)) if prompt_processing_ms > 0 else 0
             )
 
+            mtp = _extract_mtp_metrics(stats)
+            thermal = _collect_thermal()
+
             return BenchmarkMetrics(
                 test_name=case.name,
                 category=case.category,
@@ -694,6 +946,8 @@ class BenchmarkService:
                 output_text=output_text,
                 thinking_text=thinking_text,
                 prompt=case.prompt,
+                **mtp,
+                **thermal,
             )
 
         except Exception as e:

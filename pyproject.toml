@@ -1,6 +1,6 @@
 [project]
 name = "lm-optimizer"
-version = "1.5.0b1"
+version = "1.8.0"
 description = "Hardware-aware automatic benchmark and optimization tool for LM Studio. Finds empirically optimized runtime configurations for speed, context, memory, and quality across different hardware."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -29,6 +29,7 @@ dev = [
     "pytest>=8.1.0",
     "pytest-asyncio>=0.23.0",
     "pytest-cov>=5.0.0",
+    "pytest-xdist>=3.5.0",
     "ruff>=0.4.0",
     "mypy>=1.10.0",
     "pre-commit>=3.7.0",
@@ -63,7 +64,10 @@ strict = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-testpaths = ["lm_optimizer/tests"]
+# Both test roots must be collected: lm_optimizer/tests holds the unit
+# suite, tests/ holds the integration/tooling suite. Before this fix the
+# tests/ tree was silently skipped by the default `pytest` run.
+testpaths = ["lm_optimizer/tests", "tests"]
 python_files = "test_*.py"
 python_functions = "test_*"
 

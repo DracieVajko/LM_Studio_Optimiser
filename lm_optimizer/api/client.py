@@ -4,6 +4,7 @@ Live-verified contract (2026-09-19): flat load params, unload by instance_id,
 native /api/v1/chat with `input` + `max_output_tokens` (see services/lm_studio.py).
 """
 
+import asyncio
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -11,7 +12,7 @@ from enum import Enum
 from typing import Any, ClassVar
 
 import httpx
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from tenacity import (
     AsyncRetrying,
     retry_if_exception_type,
@@ -154,7 +155,17 @@ class LoadModelResponse(BaseModel):
     identifier: str | None = None
     error: str | None = None
     load_config: LoadConfig | None = None
+    # Service-style alias; kept in sync with ``load_config``.
+    loaded_config: LoadConfig | None = None
     echo_mismatches: dict | None = None
+
+    @model_validator(mode="after")
+    def _sync_loaded_config(self):
+        if self.loaded_config is None and self.load_config is not None:
+            self.loaded_config = self.load_config
+        if self.load_config is None and self.loaded_config is not None:
+            self.load_config = self.loaded_config
+        return self
 
 
 class UnloadModelResponse(BaseModel):
@@ -727,19 +738,19 @@ class LMStudioClient:
     async def ensure_unloaded(self, model_id: str) -> bool:
         """Unload a model and verify it is really gone (server state).
 
-        Retries once by instance id: covers stale client cache and transient
-        unload failures. Returns True only when no instance of the model
-        remains loaded.
+        Server state is authoritative: list loaded instances, unload only what
+        is really there, then re-check after a short settle delay (stale
+        inventory is a known false-positive source). Issuing an unload RPC for
+        a model the server positively reports as not loaded is skipped.
+        Returns True only when no instance of the model remains loaded.
         """
+        settle_s = 0.35
         for _ in range(2):
-            try:
-                await self.unload_model(model_id=model_id)
-            except Exception as e:
-                logger.warning("Unload attempt failed", model=model_id, error=str(e))
             try:
                 instances = await self.get_loaded_instances()
             except Exception as e:
                 logger.warning("State check failed", model=model_id, error=str(e))
+                await asyncio.sleep(settle_s)
                 continue
             leftovers = [i for i in instances if i["model"] == model_id and i["instance_id"]]
             if not leftovers:
@@ -754,6 +765,7 @@ class LMStudioClient:
                         instance=inst["instance_id"],
                         error=str(e),
                     )
+            await asyncio.sleep(settle_s)
         try:
             instances = await self.get_loaded_instances()
         except Exception:

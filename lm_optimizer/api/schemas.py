@@ -88,6 +88,9 @@ class LoadConfigSchema(BaseModel):
 class AdvancedSettingsSchema(BaseModel):
     min_context: int | None = 2048
     max_context: int | None = 32768
+    # Context for the quality suite. Default 8192 keeps the suite affordable;
+    # it is independent of max_context (which only caps the search space).
+    quality_context: int = Field(default=8192, ge=256)
     custom_contexts: list[int] = []
     min_gpu_ratio: float | None = 0.0
     max_gpu_ratio: float | None = 1.0
@@ -107,6 +110,41 @@ class AdvancedSettingsSchema(BaseModel):
     workload_type: str = "interactive"  # interactive | throughput
     selection_threshold: float = Field(default=0.05, ge=0.0, lt=1.0)
     optimize_context: bool = False  # Phase B opt-in: max-context on frozen winner
+    skip_phases: list[str] = []  # subset of: speed, quality, recovery, validation, context
+    warmup_runs: int | None = Field(default=None, ge=0, le=5)  # None = server default
+    # Granular test selection (v1.6.x): the same flags the CLI exposes.
+    speed_only: bool = False
+    quality_only: bool = False
+    reasoning_sweep: bool = False
+    mtp_test: bool = False
+    quality_lab: bool = False
+    speed_context: int | None = None
+
+    # --- Speed floor (spec §3) ---
+    min_generation_tok_s: float = Field(default=2.0, ge=0.0)
+    enforce_min_generation_speed: bool = True
+
+    # --- Preset and stage selection (spec §2, §7) ---
+    run_preset: str = "standard"  # quick, standard, thorough, custom
+    selected_stages: list[str] = []
+    max_speed_probes: int | None = Field(default=None, ge=1)
+    max_finalists: int | None = Field(default=None, ge=1)
+    benchmark_repetitions: int = Field(default=3, ge=1, le=10)
+    validation_repetitions_min: int = Field(default=2, ge=1, le=10)
+    validation_repetitions_max: int = Field(default=5, ge=1, le=10)
+    recovery_budget: int = Field(default=3, ge=0, le=20)
+
+    # --- Context strategies (spec §5) ---
+    context_strategy_modes: list[str] = []
+
+    # --- Final sandbox (spec §6) ---
+    final_sandbox_mode: str = "off"  # off, one, all, custom
+    final_sandbox_preset_ids: list[str] = []
+    final_sandbox_custom_prompts: list[dict] = []
+    sandbox_compare_baseline: bool = False
+
+    # --- Scheduled artifact test (fourth option, runs last) ---
+    artifact_test_id: str | None = None  # builtin id or "custom:<path.json>"
 
 
 class OptimizationRequest(BaseModel):
@@ -116,6 +154,13 @@ class OptimizationRequest(BaseModel):
     quality_threshold: float = Field(default=0.97, ge=0.9, le=1.0)
     advanced_settings: AdvancedSettingsSchema | None = None
     workload_type: str = "interactive"  # interactive | throughput
+
+    # --- Speed floor (spec §3) - top-level for easy access ---
+    min_generation_tok_s: float = Field(default=2.0, ge=0.0)
+    enforce_min_generation_speed: bool = True
+
+    # --- Preset (spec §2) - top-level for easy access ---
+    run_preset: str = "standard"  # quick, standard, thorough, custom
 
 
 class OptimizationRunResponse(BaseModel):
@@ -149,6 +194,39 @@ class OptimizationRunResponse(BaseModel):
     pause: dict | None = None
     config_count: int = 0
     stale: bool = False
+    # Winner metrics for history lists (server-computed from the actual
+    # validated winner; None when no validated winner exists — never a fake 0).
+    best_gen_tok_s: float | None = None
+    best_quality: float | None = None
+    best_context_length: int | None = None
+    has_validated_winner: bool = False
+    # Scheduled artifact test summary (None when not requested/run).
+    artifact_test: dict | None = None
+
+
+class StatsResponse(BaseModel):
+    """Dashboard quick-stats (documented, tested meanings).
+
+    - models_available: currently installed models eligible for text
+      optimization (embedding-only models excluded).
+    - models_total: all currently installed models (incl. embeddings).
+    - models_embedding_only: installed models that cannot be optimized.
+    - inventory_ok: False when the provider inventory could not be read
+      (distinguishes "empty" from "error"; never a silent 0).
+    - optimized_models: distinct models with a validated best configuration.
+    - runs_today: runs created today (machine local day boundary).
+    - total_runs: all runs ever recorded.
+    """
+
+    models_available: int = 0
+    models_total: int = 0
+    models_embedding_only: int = 0
+    inventory_ok: bool = True
+    inventory_error: str | None = None
+    optimized_models: int = 0
+    runs_today: int = 0
+    total_runs: int = 0
+    as_of: str
 
 
 class ConfigurationResultResponse(BaseModel):
@@ -267,3 +345,52 @@ class SandboxResponse(BaseModel):
     kind: str
     result: dict | None = None
     error: str | None = None
+
+
+class JudgeBackendSchema(str, Enum):
+    LOCAL = "local"
+    API = "api"
+    HEURISTIC = "heuristic"
+
+
+class JudgeRequest(BaseModel):
+    run_ids: list[str] = Field(default_factory=list)
+    config_ids: list[str] | None = None
+    model_ids: list[str] | None = None
+    use_case: str = "general"
+    custom_prompt: str | None = None
+    priority: str = "balanced"
+    backend: JudgeBackendSchema = JudgeBackendSchema.HEURISTIC
+    judge_model: str = "heuristic"
+    api_key: str | None = None
+    api_base: str | None = None
+    top_n_detail: int = 3
+    include_reasoning_matrix: bool = True
+    fastest_context_preset: bool = False
+    wait: bool = False
+
+
+class JudgeVerdictResponse(BaseModel):
+    judge_id: str
+    status: str  # pending | completed | failed
+    verdict: dict | None = None
+    error_message: str | None = None
+    poll_url: str | None = None
+
+
+class JudgeHistoryItem(BaseModel):
+    id: str
+    run_ids: list[str]
+    use_case: str
+    backend: str
+    judge_model: str
+    created_at: str
+    status: str
+    confidence: float | None = None
+    overall_winner_model: str | None = None
+
+
+class RestoreDefaultsRequest(BaseModel):
+    model_id: str
+    backup: str = "latest"
+    dry_run: bool = False
