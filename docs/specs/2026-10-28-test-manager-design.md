@@ -51,3 +51,15 @@ A single integrated subsystem (`lab test-manager` CLI + UI card) that:
 FreeToken: dynamic CPU-GPU co-execution, CUDA double-buffering (buffer_A/B swap), Pinned Memory for expert weights, semantic-aware KV cache.
 llama.cpp 8GB optimization: -ngl 99 (GPU attention/KV) + --n-cpu-moe 1 (CPU expert routing) achieves ~33 tok/s vs ~4 tok/s for 35B MoE.
 Both are referenced for scheduling logic; no live LLM load required for design.
+
+## XDA Article: 35B MoE on 8GB GPU (2026-10-22)
+- Source: XDA Developers (Abhinav Raj), "I changed one llama.cpp flag, and my 8GB laptop GPU now runs a 35B model faster than I can read"
+- Flag: --n-cpu-moe N (-ngl 99) peels expert tensors of first N layers to RAM; keeps Attention/KV/shared on GPU.
+- KV cache quantization: -ctk q8_0 -ctv q8_0 (8-bit KV cache) for VRAM savings.
+- Benchmark command: llama-bench -m Qwen3.6-27B-IQ4_XS.gguf -m Qwen3.6-35B-A3B-UD-IQ4_XS.gguf -ngl 99 -ncmoe 0,28 -p 512 -n 128 -r 3 -ctk q8_0 -ctv q8_0
+- Results (8GB RTX 3070 Mobile):
+  - Dense 27B IQ4_XS (14.37GiB): 38.83 prompt tok/s, 0.75 gen tok/s (no MoE speedup)
+  - MoE 35B UD-IQ4_XS (16.50GiB) 0 MoE layers: 109.66 prompt tok/s, 4.02 gen tok/s
+  - MoE 35B UD-IQ4_XS (16.50GiB) 28 MoE layers: 341.37 prompt tok/s, 32.82 gen tok/s (8x speedup)
+- Conclusion: MoE offloading makes 35B models usable on 8GB GPUs (~33 tok/s vs ~4 tok/s).
+- Relevance: confirms our -ngl 99 + --n-cpu-moe 1 recommendation for LM Studio/llama.cpp; validates KV cache quantization (q4_0/q8_0) as key VRAM saver.
