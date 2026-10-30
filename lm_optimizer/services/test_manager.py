@@ -119,4 +119,21 @@ class TestManager:
         else:
             result["assistant_available"] = use_assistant and self.can_use_assistant()
             result["assistant_used"] = result.get("assistant_available", False)
+
+        # 15-minute calm trigger: only proceed when GPU/CPU is calm for scheduling.
+        from lm_optimizer.services.gpu_monitor import should_run_tests
+        current_check = should_run_tests()
+        if current_check.get("gpu_busy") or current_check.get("cpu_busy"):
+            result["pending"] = True
+            result["pending_reason"] = "gpu_or_cpu_busy"
+            import datetime as dt
+            result["pending_timestamp_utc"] = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            result["next_check_after_15min_calm"] = True
+            if interactive:
+                result["interactive_paused"] = True
+            return result
+        else:
+            result["pending"] = False
+            result["pending_reason"] = None
+            result["pending_timestamp_utc"] = None
         return result
