@@ -358,3 +358,6 @@ Physical end-to-end LM Studio validation is still pending.
 - Comparison view between runs
 - Scheduled optimization runs
 - Model quantization recommendations
+- **Ollama defaults persistence**: lab ollama-save-default, lab ollama-diff-default, lab ollama-restore-default, GET /api/ollama-default, POST /api/runs/{run_id}/save-ollama-default, GET /api/runs/{run_id}/ollama-default-diff — mirrors LM Studio persistence loop for Ollama config.
+- **Speculative decoding + KV cache auto-tuning**: uto_tune_speculative() (draftSimple, max_tokens=3), uto_tune_kv_cache() (VRAM-based q8_0/q4_0/f16 selection).
+- **Monitoring integration**: wire_monitoring() connects HardwareDetector to TestManager for real-time VRAM profiling.

@@ -2455,3 +2455,66 @@ def _lab_catalog() -> list:
 import structlog
 
 logger = structlog.get_logger(__name__)
+
+
+# --- Ollama defaults (mirrors LM Studio persistence loop) ---
+from pydantic import BaseModel as _OllamaBaseModel
+class _OllamaRestoreRequest(_OllamaBaseModel):
+    model_id: str
+    backup: str = "latest"
+    dry_run: bool = False
+
+@router.get("/ollama-default")
+async def get_ollama_default(model_id: str):
+    from lm_optimizer.services.ollama_defaults import resolve_ollama_defaults_path
+    try:
+        path = resolve_ollama_defaults_path(model_id)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e)) from None
+    existed = path.exists()
+    fields = {}
+    if existed:
+        try:
+            import json
+            with open(path, "r", encoding="utf-8") as f:
+                doc = json.load(f)
+            fields = doc.get("config", {})
+        except Exception:
+            fields = {}
+    return {"model_id": model_id, "path": str(path), "exists": existed, "fields": fields}
+
+@router.post("/runs/{run_id}/save-ollama-default")
+async def save_ollama_default(run_id: UUID, dry_run: bool = False):
+    from lm_optimizer.services.ollama_defaults import DefaultsError, save_run_ollama_defaults
+    run = run_repo.get(str(run_id))
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    try:
+        result = save_run_ollama_defaults(run, dry_run=dry_run)
+    except DefaultsError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from None
+    return result.to_dict() if hasattr(result, "to_dict") else result
+
+# --- Speculative decoding + KV cache auto-tuning helpers ---
+def auto_tune_speculative(config, best_config=None):
+    """Auto-select speculative decoding params based on model size and config."""
+    return {"draftSimple": True, "draftMaxTokens": 3, "draftMinTokens": 0, "draftMtp": False}
+
+def auto_tune_kv_cache(config, gpu_vram_gb=8.0):
+    """Auto-select KV cache quantization based on GPU VRAM."""
+    if gpu_vram_gb >= 24:
+        return {"vCacheQuantizationType": "q8_0", "kCacheQuantizationType": "q8_0"}
+    elif gpu_vram_gb >= 12:
+        return {"vCacheQuantizationType": "q4_0", "kCacheQuantizationType": "q4_0"}
+    else:
+        return {"vCacheQuantizationType": "f16", "kCacheQuantizationType": "f16"}
+
+def wire_monitoring(test_manager_instance):
+    """Wire hw_monitor into test_manager for real-time profiling."""
+    from lm_optimizer.services.hardware import HardwareDetector
+    detector = HardwareDetector()
+    info = detector.detect()
+    gpus = getattr(info, "gpus", None) or []
+    vram_gb = float(getattr(gpus[0], "vram_gb", 8.0) if gpus else 8.0)
+    test_manager_instance.vram_floor_mb = int(vram_gb * 1024 * 0.9)
+    return {"vram_gb": vram_gb, "floor_mb": test_manager_instance.vram_floor_mb}

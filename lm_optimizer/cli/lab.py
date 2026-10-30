@@ -1324,6 +1324,72 @@ def test_manager(
     console.print(f"[dim]Cycle result: {cycle_result}[/dim]")
 
 
+@app.command("ollama-save-default")
+def ollama_save_default(
+    run_id: str = typer.Argument(..., help="Run ID with a validated winner"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+):
+    """Persist the validated winner as Ollama's per-model defaults."""
+    from lm_optimizer.database.repositories import run_repo
+    from lm_optimizer.services.ollama_defaults import DefaultsError, save_run_ollama_defaults
+    run = run_repo.get(run_id)
+    if not run:
+        console.print(f"[red]Run not found: {run_id}[/red]")
+        raise typer.Exit(1)
+    try:
+        result = save_run_ollama_defaults(run, dry_run=dry_run)
+    except DefaultsError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1) from None
+    console.print(f"Saved to {result['path']}")
+    if dry_run:
+        console.print("[yellow]Dry run[/yellow] - no changes written")
+
+
+@app.command("ollama-diff-default")
+def ollama_diff_default(
+    run_id: str = typer.Argument(..., help="Run ID with a validated winner"),
+):
+    """Show how Ollama defaults differ from a run's winner."""
+    from lm_optimizer.database.repositories import run_repo
+    from lm_optimizer.services.ollama_defaults import diff_ollama_defaults
+    run = run_repo.get(run_id)
+    if not run:
+        console.print(f"[red]Run not found: {run_id}[/red]")
+        raise typer.Exit(1)
+    best = run.get_best_config()
+    if best is None:
+        console.print(f"[red]No validated winner in run {run_id}[/red]")
+        raise typer.Exit(1)
+    config = best.config
+    model_id = getattr(getattr(run, "model", None), "id", "") or ""
+    diff = diff_ollama_defaults(model_id, config)
+    if not diff["changes"]:
+        console.print("[green]Defaults are already up to date.[/green]")
+    else:
+        for c in diff["changes"]:
+            console.print(f"{c['key']}: {c['kind']} (current={c.get('current')}, winner={c.get('winner')})")
+
+
+@app.command("ollama-restore-default")
+def ollama_restore_default(
+    model: str = typer.Argument(..., help="Model ID whose defaults to restore"),
+    backup: str = typer.Option("latest", "--backup"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+    yes: bool = typer.Option(False, "--yes", "-y"),
+):
+    """Restore Ollama defaults from a backup."""
+    from lm_optimizer.services.ollama_defaults import DefaultsError, restore_ollama_defaults
+    if not yes and not dry_run:
+        typer.confirm("Overwrite the current Ollama defaults?", abort=True)
+    try:
+        result = restore_ollama_defaults(model, backup=backup, dry_run=dry_run)
+    except DefaultsError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1) from None
+    console.print(f"Restored from {result['restored_from']} (noop={result['noop']}, dry_run={result['dry_run']})")
+
+
 @app.command("recommend")
 def recommend_model(
     model_id: str = typer.Argument(..., help="Model to recommend configs for"),
