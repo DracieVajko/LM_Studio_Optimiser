@@ -5,10 +5,10 @@ Finds empirically validated inference configurations for your hardware, model an
 not theoretical optima. Includes a model-vs-model sandbox (text / HTML / 3D-scene duels),
 transparent results with per-test outputs, and a dark-mode web UI.
 
-**Status: v1.5.2.** Pause/resume for partial successes (Web UI + CLI), AI-assisted model selection,
-speed-first search (cheap probes → quality validation on finalists → bounded causal recovery → adaptive validation),
-sandbox duels with history, Prompt/Thinking/Output transparency, OS-following dark mode, resilient Web UI.
-719 automated tests green (mock-only; live-server E2E validated on earlier suites).
+**Status: v1.9.0 (Unreleased).** Pause/resume for partial successes (Web UI + CLI), AI-assisted model selection,
+speed-first search, sandbox duels with history, Prompt/Thinking/Output transparency, OS-following dark mode, resilient Web UI.
+Persistence loop: timestamped backups (keep newest 10), diff/restore/verify for LM Studio per-model defaults; test-manager with intelligent ordering (MoE before dense, VRAM-aware, speed floor), partial results, cleanup, recommendations. All within this repo; no leaks.
+719+ automated tests green (mock-only; live-server E2E validated on earlier suites).
 
 | Platform | Status |
 |-|-|

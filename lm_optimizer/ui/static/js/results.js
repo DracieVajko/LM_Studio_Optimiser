@@ -273,6 +273,12 @@ const ResultsPage = {
                             </svg>
                             Save as LM Studio default
                         </button>
+                        <button id="load-exact-btn" class="btn btn-outline" title="Apply the exact winning configuration to LM Studio (same as save-default, immediate load)">
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path>
+                            </svg>
+                            Load with exact config
+                        </button>
                         <button id="export-btn" class="btn btn-outline">
                             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4-4m4 4V4"></path>
@@ -1198,6 +1204,30 @@ const ResultsPage = {
         const saveDefaultBtn = document.getElementById('save-default-btn');
         if (saveDefaultBtn) {
             saveDefaultBtn.addEventListener('click', () => this.saveLmStudioDefault());
+        }
+
+        // Load with exact winning config (applies exact best config, not defaults)
+        const loadExactBtn = document.getElementById('load-exact-btn');
+        if (loadExactBtn) {
+            loadExactBtn.addEventListener('click', async () => {
+                const bestConfig = this.state.run?.best_config;
+                if (!bestConfig || !this.state.run) {
+                    UI.showToast('No winning config to apply', 'error');
+                    return;
+                }
+                UI.showLoading('Applying exact winning config...');
+                try {
+                    await API.applyConfiguration({
+                        model_id: this.state.run.model?.id || '',
+                        config: bestConfig,
+                    });
+                    UI.hideLoading();
+                    UI.showToast('Exact winning config applied successfully', 'success');
+                } catch (err) {
+                    UI.hideLoading();
+                    UI.showToast(err.message || 'Failed to apply exact config', 'error');
+                }
+            });
         }
 
         // Export
